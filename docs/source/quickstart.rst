@@ -37,7 +37,12 @@ Here's a complete minimal simulation:
     sim.deploySwarmGrid()
     sim.run()
 
-For a comprehensive feature demonstration and guided tour, see :ref:`example-scripts`.
+For more complete examples, see the provided scripts in ``scripts/``:
+
+- **example.py** — Quick verification and basic workflow reference
+- **demo.py** — Interactive tutorial with detailed explanations
+
+See :ref:`example-scripts` below for details on running these scripts.
 
 Basic Workflow
 --------------

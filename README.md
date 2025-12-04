@@ -173,6 +173,30 @@ Test your installation:
 python -c "import munetauvsim as mn; print(f'muNet-AUVsim v{mn.__version__} loaded successfully')"
 ```
 
+Verify everything works by running the quick-start example:
+
+```sh
+cd munet-auvsim
+python scripts/example.py
+```
+
+Expected output:
+
+- Simulation runs for ~60 seconds
+- Simulation progress printed to console
+- Output files created in `outputs/example/Example_YYMMDD-HHMMSS` directory:
+  - Simulation log file
+  - 3D trajectory animation (GIF)
+  - Simulation data file (pickle)
+
+If the script runs without errors, your installation is verified and ready to use.
+
+For a more detailed interactive experience, try the tutorial script:
+
+```sh
+python scripts/demo.py
+```
+
 **Windows users:** If you see an error related to `aquanet_lib`, this is expected. AquaNet is Linux-only. The core simulation framework will work correctly with muNet communication.
 
 ## Documentation
@@ -397,7 +421,8 @@ munet-auvsim/
 |   └── make.bat                # Build commands (Windows)
 ├── outputs/                    # Generated output files
 ├── scripts/                    # User simulation scripts
-│   └── demo.py                 # Usage and API demonstration
+│   ├── demo.py                 # Usage and API demonstration
+│   └── example.py              # Basic example script
 ├── CITATION.cff                # Metadata for academic referencing
 ├── CONTRIBUTING.md             # Contribution guidelines
 ├── LICENSE                     # MIT License
