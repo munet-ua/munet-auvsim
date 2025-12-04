@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "muNet-AUVsim"
+abstract: "Multi-Agent Autonomous Underwater Vehicle Simulator"
+authors:
+  - family-names: "Crawford"
+    given-names: "JP"
+    orcid: "https://orcid.org/0009-0007-5646-5244" 
+    affiliation: "University of Alabama"
+version: "0.1.0-beta"
+date-released: "2025-12-04"
+license: "MIT"
+repository-code: "https://github.com/munet-ua/munet-auvsim"
+keywords:
+  - autonomous underwater vehicles
+  - multi-agent systems
+  - simulation
+  - swarm robotics

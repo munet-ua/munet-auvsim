@@ -398,6 +398,7 @@ munet-auvsim/
 ├── outputs/                    # Generated output files
 ├── scripts/                    # User simulation scripts
 │   └── demo.py                 # Usage and API demonstration
+├── CITATION.cff                # Metadata for academic referencing
 ├── CONTRIBUTING.md             # Contribution guidelines
 ├── LICENSE                     # MIT License
 ├── README.md                   # This file
@@ -691,8 +692,8 @@ file for details.
 
 ### Authors
 
-- **JP Crawford**  
-  [jpcrawford](https://github.com/jpcrawford)
+- **JP Crawford** -- *Primary developer and maintainer*  
+  [@jpcrawford](https://github.com/jpcrawford)
 
   - Restructured and extended single-vehicle dynamics and design into a
     multi-agent AUV swarm simulation framework.
@@ -711,7 +712,7 @@ file for details.
 
 ### Contributors
 
-- **Michael Qin** - *Developed the 'Pollution' object for representing a static
+- **Michael Qin** -- *Developed the 'Pollution' object for representing a static
   Gaussian plume dispersion*  
   [Michael](https://munet-gitlab.eng.ua.edu/Michael)
 
