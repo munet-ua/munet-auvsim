@@ -1,0 +1,7 @@
+#.gitignore
+munetauvsim/aquanet_lib/tmp/*
+munetauvsim/aquanet_lib/__pycache__/
+__pycache__/
+outputs/
+docs/build/
+docs/source/api/generated/

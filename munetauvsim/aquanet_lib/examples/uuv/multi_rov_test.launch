@@ -1,0 +1,81 @@
+<launch>
+  <arg name="use_gazebo" default="false"/>
+
+  <include file="$(find uuv_gazebo_worlds)/launch/ocean_waves.launch">
+      <arg name="gui" value="false"/>
+  </include>
+
+  <include file="$(find eca_a9_description)/launch/upload_eca_a9.launch">
+    <arg name="mode" value="default"/>
+    <arg name="x" value="30"/>
+    <arg name="y" value="20"/>
+    <arg name="z" value="-21"/>
+    <arg name="namespace" value="rov1"/>
+    <arg name="use_ned_frame" value="false"/>
+  </include>
+
+  <include file="$(find eca_a9_description)/launch/upload_eca_a9.launch">
+    <arg name="mode" value="default"/>
+    <arg name="x" value="20"/>
+    <arg name="y" value="30"/>
+    <arg name="z" value="-21"/>
+    <arg name="namespace" value="rov2"/>
+    <arg name="use_ned_frame" value="false"/>
+  </include>
+  <include file="$(find eca_a9_description)/launch/upload_eca_a9.launch">
+    <arg name="mode" value="default"/>
+    <arg name="x" value="40"/>
+    <arg name="y" value="30"/>
+    <arg name="z" value="-21"/>
+    <arg name="namespace" value="rov3"/>
+    <arg name="use_ned_frame" value="false"/>
+  </include>
+
+  <include file="$(find eca_a9_description)/launch/upload_eca_a9.launch">
+    <arg name="mode" value="default"/>
+    <arg name="x" value="10"/>
+    <arg name="y" value="40"/>
+    <arg name="z" value="-21"/>
+    <arg name="namespace" value="rov4"/>
+    <arg name="use_ned_frame" value="false"/>
+  </include>
+  <include file="$(find eca_a9_description)/launch/upload_eca_a9.launch">
+    <arg name="mode" value="default"/>
+    <arg name="x" value="50"/>
+    <arg name="y" value="40"/>
+    <arg name="z" value="-21"/>
+    <arg name="namespace" value="rov5"/>
+    <arg name="use_ned_frame" value="false"/>
+  </include>
+
+
+  <include file="$(find uuv_plume_simulator)/launch/start_plume_server.launch">
+    <arg name="current_velocity_topic" value="/hydrodynamics/current_velocity"/>
+  </include>what are .rviz files
+
+  <include file="$(find multi_auv_sim)/launch/eca_a9_geometric_traj_control.launch">
+    <arg name="uuv_name" value="rov1"/>
+    <arg name="idle_radius" value="10"/>
+  </include>
+
+  <include file="$(find multi_auv_sim)/launch/eca_a9_geometric_traj_control.launch">
+    <arg name="uuv_name" value="rov2"/>
+    <arg name="idle_radius" value="10"/>
+  </include>
+  <include file="$(find multi_auv_sim)/launch/eca_a9_geometric_traj_control.launch">
+    <arg name="uuv_name" value="rov3"/>
+    <arg name="idle_radius" value="10"/>
+  </include>
+  <include file="$(find multi_auv_sim)/launch/eca_a9_geometric_traj_control.launch">
+    <arg name="uuv_name" value="rov4"/>
+    <arg name="idle_radius" value="10"/>
+  </include>
+
+  <include file="$(find multi_auv_sim)/launch/eca_a9_geometric_traj_control.launch">
+    <arg name="uuv_name" value="rov5"/>
+    <arg name="idle_radius" value="10"/>
+  </include>
+
+  <node name="rviz_ptuuvsim" pkg="rviz" type="rviz" output="screen" args="-d $(find multi_auv_sim)/rviz/fiveecaa9bkp.rviz"/>
+
+</launch>

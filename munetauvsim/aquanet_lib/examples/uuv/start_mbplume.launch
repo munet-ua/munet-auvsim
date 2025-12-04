@@ -1,0 +1,20 @@
+<!-- Parts copied from start_demo_turbulent_plume.launch
+	 in package: uuv_plume_simulator. Full filepath below:
+	 catkin_ws/src/uuv_plume_simulator/uuv_plume_simulator/launch/start_demo_turbulent_plume.launch
+-->
+
+<launch>
+  <!-- Load turbulent plume -->
+  <node name="turbplume" pkg="multi_auv_sim" type="turbulent_plume" output="screen"/>
+
+  <!-- Set current velocity -->
+  <node name="currvel" pkg="multi_auv_sim" type="set_currvel" output="screen"/>
+
+  <!-- Start plume tracing code -->
+  <node name="CPT_BBP" pkg="multi_auv_sim" type="leader1.py" output="screen"/>
+  <node name="NODE2" pkg="multi_auv_sim" type="node2.py" output="screen"/>
+  <node name="NODE3" pkg="multi_auv_sim" type="node3.py" output="screen"/>
+  <node name="NODE4" pkg="multi_auv_sim" type="node4.py" output="screen"/>
+  <node name="NODE5" pkg="multi_auv_sim" type="node5.py" output="screen"/>
+
+</launch>
