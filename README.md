@@ -220,7 +220,7 @@ You can also build the documentation from source if you wish to experiment, prev
 2. **Install Sphinx and theme:**
 
     ```sh
-    pip instal sphinx sphinx-copybutton sphinx-rtd-theme
+    pip install sphinx sphinx-copybutton sphinx-rtd-theme
     ```
 
 3. **Build Documentation:**
