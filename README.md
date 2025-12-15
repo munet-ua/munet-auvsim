@@ -267,7 +267,7 @@ You can also build the documentation from source if you wish to experiment, prev
 
 4. **View Documentation:**
 
-    Open munet-auvsim/docs/build/html/index.html in your browser.
+    Open `munet-auvsim/docs/build/html/index.html` in your browser.
 
 The Sphinx configuration and source files are provided in the `docs/` directory, excluding the built HTML.
 
@@ -737,7 +737,7 @@ file for details.
 
 ### Contributors
 
-- **Michael Qin** -- *Developed the 'Pollution' object for representing a static
+- **Gang Qin** -- *Developed the 'Pollution' object for representing a static
   Gaussian plume dispersion*  
   [Michael](https://munet-gitlab.eng.ua.edu/Michael)
 
@@ -766,7 +766,7 @@ If you use muNet-AUVsim in your research, please cite:
 
 ```bibtex
 @software{munet_auvsim,
-  author = {Crawford, JP and Song, Aijun},
+  author = {Crawford, JP and Qin, Gang and Song, Aijun},
   title = {muNet-AUVsim: Multi-Agent AUV Simulation Framework},
   year = {2025},
   version = {0.1.0-beta},
