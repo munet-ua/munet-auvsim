@@ -2494,6 +2494,7 @@ class Floor:
       - Coherent: Nearby points have similar values
       - Multi-scale: Octaves add detail at different frequencies
       - Deterministic: Same seed produces identical terrain
+      - Flexible evaluation: Supports both point-wise and vectorized queries
     
     - **Style Characteristics:**
 
@@ -2990,6 +2991,13 @@ class Floor:
         -------
         z : float
             Depth value at (x,y) in meters.
+            
+        Notes
+        -----
+        Uses array indexing to retrieve pre-generated depth values. The
+        underlying Perlin noise generator supports single-point evaluation,
+        enabling future implementations to compute depth on-demand rather than
+        pre-generating the entire depth map.
 
         Examples
         --------
@@ -3484,6 +3492,7 @@ class PerlinNoise:
     This implementation prioritizes simplicity and integration over features:
 
     - 2D only (sufficient for ocean floor depth maps)
+    - Supports both single-point and array-based evaluation for flexibility
     - No tiling/seamless wrapping (may be introduced at later stage)
     - No 3D/4D (future extension possible for volumetric environments)
     - No arbitrary dimensions (square arrays only for simplicity)
@@ -3981,29 +3990,35 @@ class PerlinNoise:
         return self._normalize(noise)
 
     #--------------------------------------------------------------------------
-    def _perlin2D(self, x:NPFltArr, y:NPFltArr)->NPFltArr:
+    def _perlin2D(self, 
+                  x:Union[Number, NPFltArr], 
+                  y:Union[Number, NPFltArr],
+                  )->NPFltArr:
         """
-        Compute 2D Perlin noise at specified coordinate arrays.
+        Compute 2D Perlin noise at specified coordinates.
     
         Core Perlin noise algorithm that uses permutation table to select
         gradient vectors, computes dot products with coordinate offsets, and
         interpolates results using smooth fade functions. Single-octave
-        implementation.
+        implementation. Accepts both scalar coordinates and array inputs.
         
 
         Parameters
         ----------
-        x : ndarray, shape (size, size)
-            X-coordinate meshgrid scaled by frequency.
-        y : ndarray, shape (size, size)
-            Y-coordinate meshgrid scaled by frequency.
+        x : float or ndarray
+            X-coordinate(s) scaled by frequency. Can be a single scalar value
+            or an array (typically meshgrid of shape (size, size)).
+        y : float or ndarray
+            Y-coordinate(s) scaled by frequency. Can be a single scalar value
+            or an array (typically meshgrid of shape (size, size)).
             
 
         Returns
         -------
-        noise : ndarray, shape (size, size)
-            Raw Perlin noise values (not normalized). Range varies but typically
-            [-1, 1] before normalization.
+        noise : float or ndarray
+            Raw Perlin noise values (not normalized). Return type matches input:
+            scalar inputs return scalar output, array inputs return array output.
+            Range varies but typically [-1, 1] before normalization.
             
 
         Notes
@@ -4079,6 +4094,14 @@ class PerlinNoise:
         - No explicit loops over grid cells
         - Efficient memory access patterns
         
+        **Scalar vs Array Inputs:**
+
+        Method accepts both scalar and array coordinates:
+
+        - Scalar inputs (x=float, y=float): Returns single noise value
+        - Array inputs (x=ndarray, y=ndarray): Returns noise array matching input shape
+        - Useful for both single-point queries and full map generation
+        
 
         See Also
         --------
@@ -4090,7 +4113,14 @@ class PerlinNoise:
 
         Examples
         --------
-        Typical usage (called by _gen_perlin):
+        ### Single point query (scalar inputs):
+        
+        >>> pn = PerlinNoise(size=100, seed=42)
+        >>> noise_value = pn._perlin2D(5.3, 7.8)
+        >>> print(f"Noise at (5.3, 7.8): {noise_value:.3f}")
+        Noise at (5.3, 7.8): -0.134
+        
+        ### Array-based generation (typical usage):
         
         >>> pn = PerlinNoise(size=100, seed=42)
         >>> # Create coordinate meshgrid
@@ -4101,6 +4131,10 @@ class PerlinNoise:
         >>> print(noise.shape)
         (100, 100)
         """
+        # Convert scalar inputs to numpy arrays
+        x = np.asarray(x)
+        y = np.asarray(y)
+        # Grid cell corners and smooth interpolation weights
         xi, yi = x.astype(int)%255, y.astype(int)%255 # Coordinates of top left
         xf, yf = x-x.astype(int), y-y.astype(int)     # Internal coordinates
         u, v = self._fade(xf), self._fade(yf)         # Fade factors
@@ -4208,7 +4242,11 @@ class PerlinNoise:
         return (6 * t**5) - (15 * t**4) + (10 * t**3)
     
     #--------------------------------------------------------------------------
-    def _gradient(self, h:int, xf:NPFltArr, yf:NPFltArr)->NPFltArr:
+    def _gradient(self, 
+                  h:Union[int, NPIntArr], 
+                  xf:Union[Number, NPFltArr], 
+                  yf:Union[Number, NPFltArr],
+                  )->NPFltArr:
         """
         Select gradient vector from hash and compute dot product with offset.
     
@@ -4222,19 +4260,22 @@ class PerlinNoise:
         ----------
         h : int or ndarray of int
             Hash value(s) from permutation table: h = p[p[xi] + yi]. Used to
-            select gradient vector via modulo operation.
-        xf : ndarray
+            select gradient vector via modulo operation. Can be single integer
+            or array of hash values.
+        xf : float or ndarray
             X-offset from left edge of grid cell, range [0, 1). Represents
-            fractional position within cell.
-        yf : ndarray
-            Y-offset from top edge of grid cell, range [0, 1).
+            fractional position within cell. Can be scalar or array.
+        yf : float or ndarray
+            Y-offset from top edge of grid cell, range [0, 1). Can be scalar
+            or array.
         
         
         Returns
         -------
-        dot_product : ndarray
-            Dot product of selected gradient with (xf, yf) offset vector. Values
-            typically in range [-1, 1] before interpolation.
+        dot_product : float or ndarray
+            Dot product of selected gradient with (xf, yf) offset vector. Return
+            type matches input: scalar inputs return scalar, array inputs return
+            array. Values typically in range [-1, 1] before interpolation.
             
         
         Notes
@@ -4308,7 +4349,7 @@ class PerlinNoise:
             
         Examples
         --------
-        ### Single gradient selection:
+        ### Single gradient selection (scalar inputs):
         
         >>> pn = PerlinNoise(size=100, seed=42)
         >>> h = 7  # Example hash value
@@ -4317,7 +4358,7 @@ class PerlinNoise:
         >>> print(f"Gradient index: {h % 4}, Dot product: {dot:.3f}")
         Gradient index: 3, Dot product: -0.300
         
-        ### Vectorized gradient computation:
+        ### Vectorized gradient computation (array inputs):
         
         >>> h_array = np.array([0, 1, 2, 3])
         >>> xf_array = np.full(4, 0.5)
@@ -4328,7 +4369,14 @@ class PerlinNoise:
         """
         vectors = np.array([[0, 1], [0, -1], [1, 0], [-1, 0]])
         g = vectors[h % 4]
-        return (g[:, :, 0] * xf) + (g[:, :, 1] * yf)
+        
+        # Handle scalar and array inputs
+        if g.ndim == 1:
+            # Scalar case: g is shape (2,)
+            return (g[0] * xf) + (g[1] * yf)
+        else:
+            # Array case: g is shape (..., 2)
+            return (g[..., 0] * xf) + (g[..., 1] * yf)
     
     #--------------------------------------------------------------------------
     def _lerp(self, a:NPFltArr, b:NPFltArr, x:NPFltArr)->NPFltArr:
