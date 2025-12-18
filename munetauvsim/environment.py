@@ -2436,7 +2436,7 @@ class Floor:
         Coordinates [x, y] where (0, 0) maps to floor array center.
     style : str, default='linear'
         How Perlin noise is stretched over z_range, determining terrain
-        characteristics. Current development only supports linear style.
+        characteristics.
     seed : int, default=0
         PRNG seed for Perlin noise generation. Same seed produces
         identical terrain. seed=0 is valid and reproducible.
@@ -2457,7 +2457,7 @@ class Floor:
     seed : int
         PRNG seed used for generation.
     style : str
-        Terrain style identifier.
+        Terrain generation style.
     depth : ndarray, shape (size, size)
         2D array of floor depths in meters.
     perlin : PerlinNoise
@@ -2474,8 +2474,8 @@ class Floor:
         Sample depth at grid of points.
     sample_region(x_bounds, y_bounds) :
         Sample complete subregion of depth map.
-    standard_map(noise, z, z_range) :
-        Create a depth map from 2D noise array using linear scaling.
+    create_map(style, kwargs) :
+        Create a depth map from 2D array using specified style.
     xy2Index(x, y) :
         Convert END coordinates (x, y) to array indices [i, j].
     display2D(z, dispType, path) :
@@ -2496,16 +2496,17 @@ class Floor:
       - Deterministic: Same seed produces identical terrain
       - Flexible evaluation: Supports both point-wise and vectorized queries
     
-    - **Style Characteristics:**
+    - **Style Strategy:**
 
-      Currently, only linear scaling is available, stretching the Perlin noise
-      over z_range and adding the depth offset:
-
-        depth = perlin_noise * z_range + z
-
-      Future development can expand the options to generate more varied terrain.
-      Options to consider include: exponential, bimodal, sigmoid, and terraced
-      scaling to generate chasms, plateaus, shelves, and more features.
+      Floor uses a strategy pattern to select depth mapping algorithms. The
+      `style` parameter determines which mapping function is applied:
+      
+      - 'linear': Linear stretch over z range
+      - 'sigmoid': Smooth transitions via sigmoid function
+      - 'shelf': Asymmetric scaling for shelf-like features
+      
+      Future styles can be added by implementing new `_map*()` methods and
+      registering in `_styleStrategies` dictionary.
 
     **Coordinate System:**
 
@@ -2619,7 +2620,21 @@ class Floor:
     
     >>> floor.display2D()
     >>> floor.display3D()
-    
+
+    ### Different terrain styles:
+
+    >>> # Linear (default)
+    >>> floor = Floor(z=100, z_range=30)
+    >>>
+    >>> # Sigmoid
+    >>> floor_sigmoid = Floor(z=100, z_range=30, style='sigmoid')
+    >>> # Customized sigmoid
+    >>> sigmoid_map = floor_sigmoid.create_map(k=10.0)
+    >>>
+    >>> # Shelf, updated from style
+    >>> floor.style = 'shelf'          # regenerates depth with default k
+    >>> # Customize and save to depth
+    >>> floor.depth = floor.create_map(k=5.0) 
 
     See Also
     --------
@@ -2633,7 +2648,6 @@ class Floor:
     --------
     - Large size values (>5000) may cause memory issues and slow generation
     - Queries outside floor bounds wrap around the array (check before using)
-    - Floor assumes flat water surface at z=0 (no waves or surface variation)
     - Depth array is generated at initialization (modification requires
       regeneration)
     """
@@ -2716,15 +2730,16 @@ class Floor:
             If True: seed stored in self.seed after generation.
         style : str, default='linear'
             Terrain generation style (how Perlin noise maps to depth).
-            Currently only 'linear' supported:
+            Available styles supported:
 
-            - 'linear': depth = perlin_noise * z_range + z
+            - 'linear': linear scaling across z_range
+            - 'sigmoid': smooth s-curve transitions
+            - 'shelf': asymmetric scaling 
 
             Future styles possible:
 
             - 'exponential': For canyons/trenches
             - 'bimodal': For plateaus and valleys
-            - 'sigmoid': For smooth transitions
             - 'terraced': For step-like formations
 
             Invalid style triggers warning and fallback to default.
@@ -2778,11 +2793,16 @@ class Floor:
           Relies on default PerlinNoise parameters for scale, octaves, and
           persistence. This generates normalized noise array in [0, 1].
         
-        3. **Style Method Assignment:**
+        3. **Style Strategy Assignment:**
 
-          Based on style parameter, assign appropriate mapping function:
+          Validates style parameter and initializes strategy dictionary:
 
-            - 'linear' -> self.create_map = self.standard_map
+          >>> self._styleStrategies = {
+          ...     'linear': self._mapLinear,
+          ...     'sigmoid': self._mapSigmoid,
+          ...     'shelf': self._mapShelf
+          ... }
+          >>> self._style = self._validateStyle(style) 
 
           Invalid style falls back to 'linear' with warning.
         
@@ -2826,16 +2846,27 @@ class Floor:
         - Takes [:new_size, :new_size] slice
         - No regeneration needed (faster)
         
-        **Style Assignment Mechanism:**
+        **Style Strategy Pattern**
+
+        The style.setter builds the strategy dictionary and if new assignment is
+        made, regenerates the depth array.
+
+        **Adding New Styles:**
+
+        1. Implement new `_map*()` method with signature:
+        `_map*(self, noise=None, z=None, z_range=None, **kwargs) -> NPFltArr`
+
+        2. Register in `style.setter`:
         
-        style.setter performs dynamic method assignment:
-        
-        >>> if style == 'linear':
-        ...     self.create_map = self.standard_map
-        >>> # Future:
-        >>> # elif style == 'exponential':
-        >>> #     self.create_map = self.exponential_map
-        
+        >>> self._styleStrategies = {
+        ...     'linear': self._mapLinear,
+        ...     'sigmoid': self._mapSigmoid,
+        ...     'shelf': self._mapShelf,
+        ...     'newstyle': self._mapNewStyle  # Add here
+        ... }
+
+        3. Update `create_map` and `_validateStyle()` docstrings with new option.
+
         **Integration with Ocean:**
         
         Ocean constructor passes parameters:
@@ -2927,7 +2958,7 @@ class Floor:
         self.origin = origin
         self.perlin = PerlinNoise(size=size, seed=seed, random=random)
         self.style = style
-        self.depth = self.create_map()  # Defined in style.setter
+        self.depth = self.create_map()
         
     ## Properties ============================================================#
     @property
@@ -2961,21 +2992,23 @@ class Floor:
     @style.setter
     def style(self, style:str)->None:
         """Set depth map scaling style and rescale depth map."""
-        s_default = 'linear'
-        # Set corresponding depth map function
-        if (style == 'linear'):
-            self.create_map = self.standard_map
-        else:
-            log.warning("'%s' is not a valid map generation style", style)
-            log.warning("Proceeding with default: '%s'.", s_default)
-            style = s_default
-            self.create_map = self.standard_map
-        # Remake depth map (Note: depth is not a managed attribute, so the
-        # inverse operation will not automatically update style attribute)
-        if (('depth' in self.__dict__) and (style != self._style)):
-            self.depth = self.create_map()
+
+        # Define available strategies
+        self._styleStrategies = {
+            'linear': self._mapLinear,
+            'sigmoid': self._mapSigmoid,
+            'shelf': self._mapShelf,
+        }
+
+        # Validate input
+        style = self._validateStyle(style)
+
         # Assign new attribute
         self._style = style
+    
+        # Regenerate depth map if already initialized         
+        if ('depth' in self.__dict__):
+            self.depth = self.create_map()
 
     ## Special Methods =======================================================#
     def __call__(self, x:Number, y:Number)->np.float64:
@@ -3155,34 +3188,31 @@ class Floor:
         return self.depth[xmin_idx:xmax_idx+1, ymin_idx:ymax_idx+1]
     
     #--------------------------------------------------------------------------
-    def standard_map(self, 
-                     noise:Optional[NPFltArr]=None, 
-                     z:Optional[Number]=None, 
-                     z_range:Optional[Number]=None,
-                     )->NPFltArr:
+    def create_map(self, style:Optional[str]=None, **kwargs)->NPFltArr:
         """
-        Create depth map from 2D noise array using linear scaling.
-    
+        Create depth map from normalized 2D noise array, scaled by style.
+
         Parameters
         ----------
-        noise : ndarray, optional
-            2D noise array normalized to [0,1]. If None, uses self.perlin.noise.
-        z : float, optional
-            Minimum depth. If None, uses self.z.
-        z_range : float, optional
-            Depth range. If None, uses self.z_range.
-            
+        style : str
+            Terrain generation style. Valid options:
+
+            - "linear" : Linear depth mapping (default)
+            - "sigmoid" : Smooth transitions
+            - "shelf" : Plateaus and ridges
+
+        kwargs : dict, optional
+            Keyword arguments to pass parameters to depth generating method.
+
         Returns
         -------
         depth : ndarray
-            Depth map = noise * z_range + z.
+            Depth map in meters with shape (size, size)
         """
 
-        n = self.perlin.noise if (noise is None) else noise
-        z = self.z if (z is None) else z
-        z_r = self.z_range if (z_range is None) else z_range
-        return (n * z_r) + z
-    
+        strategy = self.style if (style is None) else self._validateStyle(style)
+        return self._styleStrategies[strategy](**kwargs)
+
     #--------------------------------------------------------------------------
     def xy2Index(self, x:float, y:float)->List[int]:
         """
@@ -3319,6 +3349,172 @@ class Floor:
         ax.plot_surface(x, y, 0*z, alpha=0.3, color='blue')
         plt.show()
 
+    ## Helper Methods ========================================================#
+    def _validateStyle(self, style:str)->str:
+        """
+        Check if style is listed in style strategies dictionary.
+        
+        Parameters
+        ----------
+        style : str
+            Terrain generation style. Valid options:
+
+            - "linear" : Linear depth mapping (default)
+            - "sigmoid" : Smooth transitions
+            - "shelf" : Plateaus and ridges
+        
+        Returns
+        -------
+        style : str, default = "linear"
+            Validated style matching available strategy. Falls back to default
+            if input is not valid.
+        """
+
+        default = "linear"
+        if (style not in self._styleStrategies):
+            available = ", ".join(self._styleStrategies.keys())
+            msg = (f"'{style}' is not a valid terrain style. "
+                   f"Available options: {available}")
+            log.warning(msg)
+            log.warning("Proceeding with default: '%s'.", default)
+            style = default
+        
+        return style
+
+    #--------------------------------------------------------------------------
+    def _mapLinear(self,
+                   noise:Optional[NPFltArr]=None, 
+                   z:Optional[Number]=None, 
+                   z_range:Optional[Number]=None,
+                   **kwargs
+                   )->NPFltArr:
+        """
+        Linear depth mapping from 2D noise array.
+
+        Maps normalized Perlin noise [0, 1] to depth range [z, z + z_range]
+        using linear scaling: depth = noise * z_range + z
+
+        Parameters
+        ----------
+        noise : ndarray, optional
+            2D array normalized to [0, 1]. If None, uses
+            self.perlin.noise.
+        z : float, optional
+            Minimum depth in meters. If None, uses self.z.
+        z_range : float, optional
+            Depth variation range in meters. If None, uses self.z_range.
+
+        Returns
+        -------
+        depth : ndarray
+            Depth map in meters with shape (size, size)
+        """
+
+        n = self.perlin.noise if (noise is None) else noise
+        z_val = self.z if (z is None) else z
+        z_r = self.z_range if (z_range is None) else z_range
+        return (n * z_r) + z_val
+    
+    #--------------------------------------------------------------------------
+    def _mapSigmoid(self,
+                    noise:Optional[NPFltArr]=None, 
+                    z:Optional[Number]=None, 
+                    z_range:Optional[Number]=None,
+                    **kwargs
+                    )->NPFltArr:
+        """
+        Sigmoid depth mapping with smooth transitions.
+        
+        Creates smooth gradual transitions between shallow and deep regions
+        using sigmoid function.
+        
+        Formula: depth = z + z_range / (1 + exp(-k*(2*noise - 1)))
+        where k controls transition steepness (default k=5)
+        
+        Parameters
+        ----------
+        noise : ndarray, optional
+            2D noise array normalized to [0, 1]
+        z : float, optional
+            Minimum depth in meters
+        z_range : float, optional
+            Depth variation range in meters
+        
+        Returns
+        -------
+        depth : ndarray
+            Depth map with smooth sigmoid transitions
+        """
+
+        n = self.perlin.noise if (noise is None) else noise
+        z_val = self.z if (z is None) else z
+        zr = self.z_range if (z_range is None) else z_range
+        k = kwargs.get('k', 5.0)
+        
+        return z_val + zr / (1.0 + np.exp(-k * (2.0 * n - 1.0)))
+    
+    #--------------------------------------------------------------------------
+    def _mapShelf(self,
+              noise: Optional[NPFltArr] = None,
+              z: Optional[Number] = None,
+              z_range: Optional[Number] = None,
+              **kwargs
+              ) -> NPFltArr:
+        """
+        Continental shelf mapping with asymmetric depth scaling.
+        
+        Creates terrain with pronounced raised features while keeping deep areas
+        relatively flat and uniform. Transformation splits at midpoint
+        (noise=0.5). Upper half scaled with cubic expansion, and lower half with
+        compression.
+        
+        Formula:
+            For n >= 0.5 (shallow):
+                scaled = 0.5 + 2*(n - 0.5)^3
+            For n < 0.5 (deep):
+                scaled = 2*n^3
+                
+        This creates depth = z + z_range * scaled
+        
+        Parameters
+        ----------
+        noise : ndarray, optional
+            2D array normalized to [0, 1]. If None, uses self.perlin.noise.
+        z : float, optional
+            Minimum depth in meters. If None, uses self.z.
+        z_range : float, optional
+            Depth variation range in meters. If None, uses self.z_range.
+        kwargs : dict, optional
+            Optional keyword arguments:
+            
+            - k : float, asymmetry strength (default 3.0)
+        
+        Returns
+        -------
+        depth : ndarray
+            Depth map with shelf-like features
+        """
+        
+        n = self.perlin.noise if (noise is None) else noise
+        z_val = self.z if (z is None) else z
+        zr = self.z_range if (z_range is None) else z_range
+        k = kwargs.get('k', 3.0)
+        
+        # Split transformation at midpoint
+        midpoint = 0.5
+        
+        # Upper half: Expand (more variation)
+        maskUpper = n >= midpoint
+        upper = midpoint + 2.0 * ((n - midpoint) ** k)
+        
+        # Lower half: Compress (less variation)
+        lower = 2.0 * (n ** k)
+        
+        # Combine branches
+        scaled = np.where(maskUpper, upper, lower)
+        
+        return z_val + zr * scaled
+    
 ###############################################################################
 
 class PerlinNoise:
