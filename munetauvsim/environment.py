@@ -3169,12 +3169,9 @@ class Floor:
         >>> z = floor.sample_region(x_s, y_s)   # z is array (n, m)
         """
         
-        if (isinstance(x_bounds, np.ndarray)):
-            xmin, xmax = x_bounds[0], x_bounds[1]
-            ymin, ymax = y_bounds[0], y_bounds[1]
-        else:
-            xmin, xmax = x_bounds
-            ymin, ymax = y_bounds
+        # Unpack boundaries
+        xmin, xmax = x_bounds
+        ymin, ymax = y_bounds
         
         # Convert boundaries to indices
         xmin_idx, ymin_idx = self.xy2Index(xmin, ymin)
