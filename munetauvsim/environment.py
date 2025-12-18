@@ -2434,14 +2434,25 @@ class Floor:
         Generates size x size depth array.
     origin : list of float, default=[500, 500]
         Coordinates [x, y] where (0, 0) maps to floor array center.
-    style : str, default='linear'
-        How Perlin noise is stretched over z_range, determining terrain
-        characteristics.
     seed : int, default=0
         PRNG seed for Perlin noise generation. Same seed produces
         identical terrain. seed=0 is valid and reproducible.
+    random : bool, default=False
+        If True, generates random seed to generate unique terrain. Overrides
+        seed parameter and saves newly generated seed.
+    style : str, default='linear'
+        How Perlin noise is stretched over z_range, determining terrain
+        characteristics.
     **kwargs
-        Additional keyword arugments.
+        Additional optional keyword arugments.
+
+        **Perlin noise parameters**
+
+        - scale : int - Spatial frequency scale
+        - octaves : int - Number of noise layers
+        - persistence : float - Amplitude decay factor
+
+        See PerlinNoise documentation for detailed parameter descriptions.
 
           
     Attributes
@@ -2661,7 +2672,7 @@ class Floor:
                  seed:int=0,
                  random:bool=False,
                  style:str='linear',
-                 **kwargs,              # Necessary for use by Ocean class
+                 **kwargs
                  ):
         """
         Construct ocean floor with procedurally generated terrain from Perlin noise.
@@ -2726,8 +2737,8 @@ class Floor:
         random : bool, default=False
             If True, generates random seed from system entropy.
             Overrides explicit seed parameter.
+            Seed stored in self.seed after generation.
             Generates unique terrains.
-            If True: seed stored in self.seed after generation.
         style : str, default='linear'
             Terrain generation style (how Perlin noise maps to depth).
             Available styles supported:
@@ -2736,7 +2747,7 @@ class Floor:
             - 'sigmoid': smooth s-curve transitions
             - 'shelf': asymmetric scaling 
 
-            Future styles possible:
+            Possible future styles:
 
             - 'exponential': For canyons/trenches
             - 'bimodal': For plateaus and valleys
@@ -2744,7 +2755,13 @@ class Floor:
 
             Invalid style triggers warning and fallback to default.
         **kwargs
-            Additional keyword arguments.
+            Additional optional keyword arguments.
+
+            **Perlin noise parameters**
+
+            - scale : int - Spatial frequency scale (default: 300)
+            - octaves : int - Number of noise layers (default: 3)
+            - persistence : float - Amplitude decay factor (default: 0.5)
             
         Attributes
         ----------
@@ -2787,11 +2804,11 @@ class Floor:
           >>> self.perlin = PerlinNoise(
           ...     size=size,
           ...     seed=seed,
-          ...     random=random
+          ...     random=random,
+          ...     **perlinKwargs          # scale, octaves, persistence
           ... )
 
-          Relies on default PerlinNoise parameters for scale, octaves, and
-          persistence. This generates normalized noise array in [0, 1].
+          This generates normalized noise array in [0, 1].
         
         3. **Style Strategy Assignment:**
 
@@ -2882,17 +2899,6 @@ class Floor:
         >>> ocean.floor.depth.shape
         (2000, 2000)
         
-        **Default Perlin Parameters:**
-        
-        PerlinNoise created with hardcoded defaults:
-
-        - scale=300: Balanced feature size
-        - octaves=3: Natural detail level
-        - persistence=0.5: Standard amplitude decay
-        
-        Cannot currently override via kwargs (limitation).
-        Future: Pass perlin_scale, perlin_octaves, perlin_persistence.
-        
         See Also
         --------
         PerlinNoise.__init__ : Noise generation parameters and process
@@ -2919,10 +2925,13 @@ class Floor:
         ...     z_range=20,    # Varies 30-50m
         ...     size=2000,     # 2km * 2km
         ...     origin=[1000, 1000],
-        ...     seed=42
+        ...     seed=42,
+        ...     style='shelf',   # Flat low areas with steep raised regions
+        ...     scale=400,       # Broader perlin noise features
+        ...     octaves=5,       # More perlin noise detail layers
+        ...     persistence=0.6  # Rougher perlin noise terrain 
         ... )
-        >>> print(f"Min depth: {floor.depth.min():.2f} m")
-        >>> print(f"Max depth: {floor.depth.max():.2f} m")
+        >>> floor.display3D()
         
         ### Random terrain for testing:
         
@@ -2952,11 +2961,23 @@ class Floor:
         >>> print(f"Depths: {depths}")
         """
 
+        # Floor parameters
         self.z = z
         self.z_range = z_range
         self.size = size
         self.origin = origin
-        self.perlin = PerlinNoise(size=size, seed=seed, random=random)
+
+        # Perlin parameters
+        perlinKwargs = {
+            k: kwargs[k] for k in ['scale', 'octaves', 'persistence']
+            if k in kwargs
+        }
+        self.perlin = PerlinNoise(size=size, 
+                                  seed=seed, 
+                                  random=random,
+                                  **perlinKwargs)
+
+        # Generate depth array
         self.style = style
         self.depth = self.create_map()
         
@@ -3245,6 +3266,7 @@ class Floor:
         generator is built for the PerlinNoise class.
 
         **Examples:**
+        
         >>> floor = Floor(size=1000, origin=[500, 500])
         >>> # Query outside bounds
         >>> i, j = floor.xy2Index(1100, 500)  # x=1100 > size=1000
