@@ -3800,6 +3800,9 @@ class PerlinNoise:
     >>> broad = PerlinNoise(size=1000, scale=600, octaves=2)
     """
 
+    ## Class Attributes ======================================================# 
+    _GRADIENTS = np.array([[0, 1], [0, -1], [1, 0], [-1, 0]], dtype=float)
+
     ## Constructor ===========================================================#
     def __init__(self, 
                  size:int,
@@ -4075,8 +4078,7 @@ class PerlinNoise:
         """
         p = np.arange(256, dtype=int)
         self.rng.shuffle(p)
-        p = np.stack([p,p]).flatten()
-        return p
+        return np.concatenate([p, p])
 
     #--------------------------------------------------------------------------
     def _gen_perlin(self)->NPFltArr:
@@ -4214,19 +4216,15 @@ class PerlinNoise:
     
         Core Perlin noise algorithm that uses permutation table to select
         gradient vectors, computes dot products with coordinate offsets, and
-        interpolates results using smooth fade functions. Single-octave
-        implementation. Accepts both scalar coordinates and array inputs.
+        interpolates results using smooth fade functions. Accepts both scalar
+        coordinates and array inputs.
         
 
         Parameters
         ----------
-        x : float or ndarray
-            X-coordinate(s) scaled by frequency. Can be a single scalar value
+        x, y : float or ndarray
+            Coordinate(s) scaled by frequency. Can be a single scalar value
             or an array (typically meshgrid of shape (size, size)).
-        y : float or ndarray
-            Y-coordinate(s) scaled by frequency. Can be a single scalar value
-            or an array (typically meshgrid of shape (size, size)).
-            
 
         Returns
         -------
@@ -4238,52 +4236,14 @@ class PerlinNoise:
 
         Notes
         -----
-        **Algorithm Steps:**
-
-        1. **Grid Cell Identification:**
-
-            Determine integer grid coordinates (top-left corner of each cell):
-            
-            >>> xi, yi = x.astype(int) % 255, y.astype(int) % 255
-        
-        2. **Internal Coordinates:**
-
-            Compute fractional position within grid cell [0, 1):
-            
-            >>> xf = x - x.astype(int)  # Distance from left edge
-            >>> yf = y - y.astype(int)  # Distance from top edge
-        
-        3. **Fade Factors:**
-
-            Apply smoothing curve for C^2 continuity:
-            
-            >>> u = _fade(xf)  # Horizontal smoothing
-            >>> v = _fade(yf)  # Vertical smoothing
-            
-        4. **Gradient Selection and Dot Products:**
-
-            For each corner of grid cell, hash coordinates to select gradient
-            vector and compute dot product with offset:
-            
-            >>> n00 = _gradient(p[p[xi  ] + yi  ], xf  , yf  )  # Top-left
-            >>> n01 = _gradient(p[p[xi  ] + yi+1], xf  , yf-1)  # Bottom-left
-            >>> n10 = _gradient(p[p[xi+1] + yi  ], xf-1, yf  )  # Top-right
-            >>> n11 = _gradient(p[p[xi+1] + yi+1], xf-1, yf-1)  # Bottom-right
-        
-        5. **Bilinear Interpolation:**
-
-            Combine corner values using fade factors:
-            
-            >>> x1 = _lerp(n00, n10, u)  # Interpolate top edge
-            >>> x2 = _lerp(n01, n11, u)  # Interpolate bottom edge
-            >>> result = _lerp(x1, x2, v)  # Interpolate vertical
-        
-        **Coordinate Wrapping:**
-
-        Modulo 255 prevents overflow in permutation table indexing:
-
-        - Coordinates wrapped to [0, 254] range
-        - Allows seamless tiling if desired (though not implemented)
+        **Algorithm:**
+    
+        1. Grid cell identification via floor division
+        2. Internal coordinates via fractional component
+        3. Gradient selection via permutation table hashing
+        4. Dot products with corner gradients
+        5. Smooth fade function application
+        6. Bilinear interpolation of corner values
         
         **Gradient Hashing:**
 
@@ -4299,15 +4259,7 @@ class PerlinNoise:
 
         - Smooth first derivative (no visible grid artifacts)
         - Smooth second derivative (no curvature discontinuities)
-        - Better visual quality than linear or cosine interpolation
-        
-        **Vectorization:**
-
-        Entire operation vectorized via numpy broadcasting:
-
-        - All coordinates processed simultaneously
-        - No explicit loops over grid cells
-        - Efficient memory access patterns
+        - Implemented with Horner's method for polynomial evaluation
         
         **Scalar vs Array Inputs:**
 
@@ -4322,8 +4274,6 @@ class PerlinNoise:
         --------
         _fade : Smoothing function for interpolation weights
         _gradient : Gradient vector selection and dot product
-        _lerp : Linear interpolation
-        _gen_perlin : Multi-octave wrapper that calls this method
         
 
         Examples
@@ -4349,22 +4299,35 @@ class PerlinNoise:
         # Convert scalar inputs to numpy arrays
         x = np.asarray(x)
         y = np.asarray(y)
-        # Grid cell corners and smooth interpolation weights
-        xi, yi = x.astype(int)%255, y.astype(int)%255 # Coordinates of top left
-        xf, yf = x-x.astype(int), y-y.astype(int)     # Internal coordinates
-        u, v = self._fade(xf), self._fade(yf)         # Fade factors
-        # Noise components
-        """Map the internal coordinates to the permutation table to select the
-        gradient vector then perfom a dot product with the coordinate grid"""
-        n00 = self._gradient(self.p[self.p[xi    ] + yi    ], xf    , yf    )
-        n01 = self._gradient(self.p[self.p[xi    ] + yi + 1], xf    , yf - 1)
-        n10 = self._gradient(self.p[self.p[xi + 1] + yi    ], xf - 1, yf    )
-        n11 = self._gradient(self.p[self.p[xi + 1] + yi + 1], xf - 1, yf - 1)
+
+        # Grid cell coordinates
+        xi = np.floor(x).astype(int)
+        yi = np.floor(y).astype(int)
+        xf = x - xi
+        yf = y - yi
+
+        # Hash the grid corners to permutation table
+        g00 = self.p[self.p[ xi      & 255] + ( yi      & 255)]
+        g01 = self.p[self.p[ xi      & 255] + ((yi + 1) & 255)]
+        g10 = self.p[self.p[(xi + 1) & 255] + ( yi      & 255)]
+        g11 = self.p[self.p[(xi + 1) & 255] + ((yi + 1) & 255)]
+
+        # Dot product with gradients
+        n00 = self._gradient(g00, xf    , yf    )
+        n01 = self._gradient(g01, xf    , yf - 1)
+        n10 = self._gradient(g10, xf - 1, yf    )
+        n11 = self._gradient(g11, xf - 1, yf - 1)
+
+        # Fade factors
+        u = self._fade(xf)
+        v = self._fade(yf)
+
         # Combine noise components using smoothing factors
         """First combine lefts and rights, then top with bottom"""
-        x1 = self._lerp(n00, n10, u)
-        x2 = self._lerp(n01, n11, u)
-        return self._lerp(x1, x2, v)
+        x1 = n00 * (1 - u) + n10 * u
+        x2 = n01 * (1 - u) + n11 * u
+
+        return x1 * (1 - v) + x2 * v
 
     #--------------------------------------------------------------------------
     def _fade(self, t:NPFltArr)->NPFltArr:
@@ -4415,20 +4378,17 @@ class PerlinNoise:
             
                 f''(t) = 120t^3 - 180t^2 + 60t = 60t(2t - 1)(t - 1)
             
-        **Performance:**
+        **Horner's Method Implemented:**
 
-        Despite higher polynomial degree, vectorized numpy operations make this
-        very efficient:
-
-        - Single pass over array
-        - No branching or conditionals
-        - Cache-friendly memory access
+            Uses Horner's method for efficient polynomial evaluation, performing
+            multiplications instead of exponentiation. Reduces computation from
+            3 exponentiations and 2 multiplications to 6 multiplications.
+            Provides faster execution and minimized floating-point errors.
         
 
         See Also
         --------
         _perlin2D : Uses fade for interpolation weights u and v
-        _lerp : Linear interpolation using fade weights
         
 
         Examples
@@ -4454,7 +4414,7 @@ class PerlinNoise:
         >>> print(fade_t)
         [0.    0.5   1.   ]  # Smooth interpolation from 0 to 1
         """
-        return (6 * t**5) - (15 * t**4) + (10 * t**3)
+        return t * t * t * (t * (t * 6 - 15) + 10)
     
     #--------------------------------------------------------------------------
     def _gradient(self, 
@@ -4582,8 +4542,7 @@ class PerlinNoise:
         >>> print(dots)
         [ 0.5 -0.5  0.5 -0.5]  # yf, -yf, xf, -xf
         """
-        vectors = np.array([[0, 1], [0, -1], [1, 0], [-1, 0]])
-        g = vectors[h % 4]
+        g = self._GRADIENTS[h % 4]
         
         # Handle scalar and array inputs
         if g.ndim == 1:
@@ -4592,115 +4551,6 @@ class PerlinNoise:
         else:
             # Array case: g is shape (..., 2)
             return (g[..., 0] * xf) + (g[..., 1] * yf)
-    
-    #--------------------------------------------------------------------------
-    def _lerp(self, a:NPFltArr, b:NPFltArr, x:NPFltArr)->NPFltArr:
-        """
-        Linear interpolation between two values or arrays.
-    
-        Computes weighted average of a and b using interpolation parameter x.
-        Standard lerp formula: result = a + x(b - a).
-        
-
-        Parameters
-        ----------
-        a : ndarray
-            Start values. Interpolation returns a when x=0.
-        b : ndarray
-            End values. Interpolation returns b when x=1.
-        x : ndarray
-            Interpolation weight(s), typically in range [0, 1]. Usually output
-            from _fade() for smooth interpolation.
-            
-
-        Returns
-        -------
-        interpolated : ndarray
-            Linearly interpolated values between a and b. Same shape as input
-            arrays (via broadcasting).
-
-                        
-        Notes
-        -----
-        **Formula:**
-        
-            lerp(a, b, x) = a + x(b - a) = (1-x)a + xb
-        
-        - **Properties:**
-
-            - lerp(a, b, 0) = a
-            - lerp(a, b, 1) = b
-            - lerp(a, b, 0.5) = (a + b) / 2
-        
-        **Usage in Perlin Noise:**
-        
-        Called twice in bilinear interpolation sequence:
-
-        1. Interpolate between top-left and top-right corners (horizontal)
-        2. Interpolate between bottom-left and bottom-right corners (horizontal)
-        3. Interpolate between results from steps 1 and 2 (vertical)
-        
-        >>> x1 = _lerp(n00, n10, u)  # Top edge
-        >>> x2 = _lerp(n01, n11, u)  # Bottom edge
-        >>> result = _lerp(x1, x2, v)  # Final value
-        
-        **Array Broadcasting:**
-
-        Supports numpy broadcasting for efficient vectorization:
-
-        - a, b, x can be scalars or arrays
-        - Result shape determined by broadcast rules
-        - No explicit loops needed
-        
-        **Extrapolation:**
-
-        Function works for x outside [0, 1]:
-
-        - x < 0: Extrapolates beyond a
-        - x > 1: Extrapolates beyond b
-        - Typical use cases keep x ∈ [0, 1] for interpolation
-        
-
-        See Also
-        --------
-        _perlin2D : Uses lerp for bilinear interpolation
-        _fade : Generates smooth x values for interpolation
-        
-
-        Examples
-        --------
-        ### Basic interpolation:
-        
-        >>> pn = PerlinNoise(size=100)
-        >>> # Interpolate between 10 and 20
-        >>> result = pn._lerp(10, 20, 0.3)
-        >>> print(result)
-        13.0  # 10 + 0.3 * (20 - 10) = 13
-        
-        ### Array interpolation:
-        
-        >>> a = np.array([0, 10, 20])
-        >>> b = np.array([10, 20, 30])
-        >>> x = np.array([0, 0.5, 1])
-        >>> result = pn._lerp(a, b, x)
-        >>> print(result)
-        [ 0. 15. 30.]  # [a[0], midpoint, b[2]]
-        
-        Bilinear interpolation example:
-        
-        >>> # Corner values
-        >>> n00, n01, n10, n11 = 0, 10, 5, 15
-        >>> # Interpolation weights (from fade)
-        >>> u, v = 0.3, 0.7
-        >>> # Horizontal interpolation
-        >>> x1 = pn._lerp(n00, n10, u)  # Top: 1.5
-        >>> x2 = pn._lerp(n01, n11, u)  # Bottom: 11.5
-        >>> # Vertical interpolation
-        >>> final = pn._lerp(x1, x2, v)  # Result: 8.5
-        >>> print(final)
-        8.5
-        """
-        return a + x * (b - a)
     
     #--------------------------------------------------------------------------
     def _normalize(self, n:NPFltArr)->NPFltArr:
