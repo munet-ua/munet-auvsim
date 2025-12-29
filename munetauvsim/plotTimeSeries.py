@@ -707,11 +707,10 @@ def plot3D(simData:NPFltArr,
         # Sample floor depth map at grid points
         x_pts = np.linspace(x_min, x_max, x_res)
         y_pts = np.linspace(y_min, y_max, y_res)
-        floorGrid = ocean.floor.sample_grid(x_pts, y_pts)
+        floorGrid = ocean.floor.sampleGrid(x_pts, y_pts)
 
         # Create meshgrid for plotting floor surface
         x_f, y_f = np.meshgrid(x_pts, y_pts)
-        z_f = floorGrid.T
 
         # Set floor color map
         terrain_cmap = mpl.colormaps['terrain']
@@ -721,7 +720,7 @@ def plot3D(simData:NPFltArr,
 
         # Render floor surface
         floorMap = ax.plot_surface(
-            x_f, y_f, z_f,
+            x_f, y_f, floorGrid,
             cmap=custom_cmap,
             shade=True,
             edgecolor='none',

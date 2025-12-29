@@ -2460,16 +2460,18 @@ class Floor:
     -------
     __call__(x, y) :
         Floor instance is callable: query floor depth at (x, y) position. 
-    sample_points(x, y) :
+    samplePoints(x, y) :
         Sample depth values at list of points.
-    sample_grid(x, y) :
+    sampleGrid(x, y) :
         Sample depth at grid of points.
-    sample_region(x_bounds, y_bounds) :
+    sampleRegion(x, y) :
         Sample complete subregion of depth map.
-    create_map(style, kwargs) :
+    createMap(style, kwargs) :
         Create a depth map from 2D array using specified style.
     xy2Index(x, y) :
-        Convert END coordinates (x, y) to array indices [i, j].
+        Convert END coordinates (x, y) to array indices [j, i].
+    generate() :
+        Precompute and cache the full depth array.
     display2D(z, dispType, path) :
         Display a 2D image of the depth array.
     display3D(z) :
@@ -2500,6 +2502,16 @@ class Floor:
       Future styles can be added by implementing new `_map*()` methods and
       registering in `_styleStrategies` dictionary.
 
+    - **Lazy Tile-Based Generation:**
+
+      The depth array is not precomputed during construction. Instead, the 
+      floor uses lazy evaluation with tile-based caching:
+
+      - Array divided into square tiles
+      - Tiles generated on-demand when first accessed via queries
+      - Generated tiles are cached for subsequent access
+      - Full array is only built when explicitly accessed via `depth` property
+
     **Coordinate System:**
 
     Floor uses END (East-North-Down) convention:
@@ -2529,7 +2541,7 @@ class Floor:
     Queries outside [0, size] range return valid values. The indexing is allowed
     to wrap around and return values at [x mod size]. This prevents stopping a
     simulation run due to bad indexing and effectively treats the floor map as
-    though it were tiled.
+    though it were wrap-around.
     
     >>> floor = Floor(size=1000)
     >>> d = floor(1100, 500)                    # Outside bounds
@@ -2538,11 +2550,11 @@ class Floor:
     
     **Resampling:**
 
-    Changing size or seed regenerates terrain:
+    Changing size, style, or perlin instance invalidates the tile cache, 
+    causing any previously generated depth terrain to require regeneration.
     
-    >>> floor.size = 2000  # Expands area
-    >>> floor.seed = 42    # New terrain pattern
-    >>> # Both automatically regenerate depth array
+    >>> floor = Floor(size=1000)
+    >>> floor.size = 2000           # Clears cache, expands area
     
 
     Examples
@@ -2558,33 +2570,34 @@ class Floor:
     ### Custom terrain parameters:
     
     >>> floor = Floor(
-    ...     z=80,              # Shallowest at 80m
-    ...     z_range=40,        # Varies 80-120m
-    ...     size=2000,         # 2km x 2km area
-    ...     origin=[1000, 1000],
-    ...     seed=123
+    ...     z=80,                   # Shallowest at 80m
+    ...     z_range=40,             # Varies 80-120m
+    ...     size=2000,              # 2km x 2km area
+    ...     origin=[1000, 750],     # x: [-1000 ... 999], y: [-750 ... 1249]
+    ...     seed=123,               # Seed value for reproducible noise
+    ...     style='sigmoid'         # S-curve mapping from noise to depth
     ... )
     
     ### Query single point:
     
     >>> floor = Floor(randomFloor=True)
-    >>> depth = floor(250, 300)  # At (250m E, 300m N)
+    >>> depth = floor(250, 300)                 # At (250m E, 300m N)
     >>> print(f"Floor depth: {depth:.2f} m")
     
     ### Query multiple points:
     
     >>> x_coords = [0, 100, 200, 300]
     >>> y_coords = [0, 100, 200, 300]
-    >>> depths = floor.sample_points(x_coords, y_coords)
+    >>> depths = floor.samplePoints(x_coords, y_coords)
     >>> print(depths)
-    [ 95.82410046  99.48385046 100.1779558  102.04782572]  # Example values
+    [132.89879249 130.43546153 127.1800901  130.33548963]
     >>>
-    >>> depth_grid = floor.sample_grid(x_coords, y_coords)
+    >>> depth_grid = floor.sampleGrid(x_coords, y_coords)
     >>> print(depth_grid)
-    [[ 95.82410046  97.39379346 105.14764687  86.46614981]  # Example values
-     [ 88.33687983  99.48385046 105.89335857  86.24682284]
-     [ 88.67318118 100.66821609 100.1779558   93.64459247]
-     [106.17117273 100.66821609 105.8082081  102.04782572]]
+    [[132.89879249 129.99690006 130.73963137 130.51609651]
+     [131.90777505 130.43546153 129.22941748 128.60290109]
+     [132.39564569 130.67040518 127.1800901  131.69874289]
+     [130.73963137 131.23426993 129.85516039 130.33548963]]
     
     ### Visualize terrain:
     
@@ -2599,24 +2612,23 @@ class Floor:
     >>> # Sigmoid
     >>> floor_sigmoid = Floor(z=100, z_range=30, style='sigmoid')
     >>> # Customized sigmoid
-    >>> sigmoid_map = floor_sigmoid.create_map(k=10.0)
+    >>> sigmoid_map = floor_sigmoid.createMap(k=10.0)
     >>>
     >>> # Shelf, updated from style
-    >>> floor.style = 'shelf'          # regenerates depth with default k
+    >>> floor.style = 'shelf'          # resets depth with default k
     >>> # Customize and save to depth
-    >>> floor.depth = floor.create_map(k=5.0) 
+    >>> floor.depth = floor.createMap(k=5.0) 
 
     See Also
     --------
     PerlinNoise : 2D Perlin noise generator used internally
     Ocean : Container class that manages Floor instance
     navigation.OceanDepthSensor : Sensor that samples floor depth
-    Waypoint : Path planning with samplePath() integration
     
 
     Warnings
     --------
-    - Queries outside floor bounds wrap around the array (check before using)
+    - Queries outside floor bounds wrap around the array
     """
 
     ## Constructor ===========================================================#
@@ -2740,10 +2752,10 @@ class Floor:
             - scale, octaves, persistence: Generation parameters
 
         depth : ndarray, shape (size, size)
-            Final depth map in meters, computed via create_map().
-        create_map : callable
-            Dynamically assigned method based on style parameter.
-            Currently always points to self.standard_map.
+            Final depth map in meters. Only fully computed on explicit access.
+        createMap : callable
+            Dynamically assigned method based on style parameter. Default is 
+            'linear'.
             
         Notes
         -----
@@ -2764,7 +2776,7 @@ class Floor:
           ...     **perlinKwargs          # scale, octaves, persistence
           ... )
 
-          This generates normalized noise array in [0, 1].
+          This generates normalized noise array in [0, 1] on-demand.
         
         3. **Style Strategy Assignment:**
 
@@ -2779,37 +2791,30 @@ class Floor:
 
           Invalid style falls back to 'linear' with warning.
         
-        4. **Depth Map Creation:**
+        4. **Lazy Evaluation Ready:**
 
-          Call create_map() to transform Perlin noise to depth:
+          No depth values are computed during initialization. The Floor instance
+          is ready to generate and cache regions of the depth array on-demand:
 
-          >>> self.depth = self.create_map()
-          >>> # For linear: depth = perlin.noise * z_range + z
-
-          Final depth array ready for queries.
+          - Queries by `__call__()`, `samplePoints()`, `sampleGrid()`, etc.
+          - Full array accessed via `depth` property.
+          - Explicitly generated in full with `generate()` method.
         
         **Size Property Behavior:**
         
-        Changing size after initialization regenerates terrain:
+        Changing size after initialization clears cached terrain:
         
         >>> floor = Floor(size=1000, seed=42)
-        >>> floor.size = 2000  # Triggers regeneration
-        >>> # New 2000*2000 depth array with same seed
+        >>> floor.size = 2000 
+        >>> # Depth cache cleared, regenerated on-demand as queried
         
-        Expanding size extends pattern:
-
-        - Existing region matches original
-        - New regions fill with continued Perlin pattern
-        
-        Reducing size crops array:
-
-        - Takes [:new_size, :new_size] slice
-        - No regeneration needed (faster)
+        Expanding size extends existing terrain pattern seamlessly, and reducing
+        size shrinks the domain but maintains pattern in retained region.
         
         **Style Strategy Pattern**
 
-        The style.setter builds the strategy dictionary and if new assignment is
-        made, regenerates the depth array.
+        The style setter builds the strategy dictionary and if new assignment is
+        made, clears the depth array cache.
 
         **Adding New Styles:**
 
@@ -2825,27 +2830,27 @@ class Floor:
         ...     'newstyle': self._mapNewStyle  # Add here
         ... }
 
-        3. Update `create_map` and `_validateStyle()` docstrings with new option.
+        3. Update `createMap()` and `_validateStyle()` docstrings with new option.
 
         **Integration with Ocean:**
         
         Ocean constructor passes parameters:
         
         >>> ocean = Ocean(
-        ...     size=2000,
-        ...     origin=[1000, 1000],
-        ...     z=150,              # Passed to Floor as z
-        ...     z_range=25,         # Passed to Floor as z_range
-        ...     floorSeed=123,      # Passed as seed
-        ...     randomFloor=False   # Passed as random
+        ...     size=2000,              # Passed to Floor as size
+        ...     origin=[1000, 1000],    # Passed to Floor as origin
+        ...     z=150,                  # Passed to Floor as z
+        ...     z_range=25,             # Passed to Floor as z_range
+        ...     floorSeed=123,          # Passed as seed
+        ...     randomFloor=False       # Passed as random
         ... )
-        >>> ocean.floor.depth.shape
-        (2000, 2000)
+        >>> ocean.floor.size
+        2000
         
         See Also
         --------
         PerlinNoise.__init__ : Noise generation parameters and process
-        Floor.standard_map : Linear depth mapping implementation
+        Floor.createMap : Converts noise array to depth array
         Ocean.__init__ : Creates Floor with oceanographic parameters
         
         Examples
@@ -2858,19 +2863,17 @@ class Floor:
         Depth range: 125 to 135 m
         >>> print(f"Area: {floor.size} m")
         Area: 1000 m
-        >>> print(f"Array shape: {floor.depth.shape}")
-        Array shape: (1000, 1000)
         
         ### Custom shallow coastal terrain:
         
         >>> floor = env.Floor(
-        ...     z=30,          # 30m shallowest
-        ...     z_range=20,    # Varies 30-50m
-        ...     size=2000,     # 2km * 2km
+        ...     z=30,            # 30m shallowest
+        ...     z_range=20,      # Varies 30-50m
+        ...     size=2000,       # 2km * 2km
         ...     origin=[1000, 1000],
         ...     seed=42,
         ...     style='shelf',   # Flat low areas with steep raised regions
-        ...     scale=400,       # Broader perlin noise features
+        ...     scale=4000,      # Broader perlin noise features
         ...     octaves=5,       # More perlin noise detail layers
         ...     persistence=0.6  # Rougher perlin noise terrain 
         ... )
@@ -2900,7 +2903,7 @@ class Floor:
         >>> depth_at_origin = floor(0, 0)
         >>> print(f"Depth at (0, 0): {depth_at_origin:.2f} m")
         >>> # Sample multiple points
-        >>> depths = floor.sample_points([0, 100, 200], [0, 100, 200])
+        >>> depths = floor.samplePoints([0, 100, 200], [0, 100, 200])
         >>> print(f"Depths: {depths}")
         """
 
@@ -2920,11 +2923,36 @@ class Floor:
                                   random=random,
                                   **perlinKwargs)
 
-        # Generate depth array
+        # Depth array parameters
         self.style = style
-        self.depth = self.create_map()
         
     ## Properties ============================================================#
+    @property
+    def depth(self)->NPFltArr:
+        """
+        Full depth array with lazy precomputation.
+        
+        On first access, builds full array from cached/generated tiles.
+        Subsequent access returns cached array (instant).
+        
+        Notes
+        -----
+        **Simulation queries** (e.g. `floor(x,y)`) do not use this property.
+        They use tile cache directly.
+        
+        **Visualization queries** (e.g. `display3D()`) trigger this property.
+        """
+        if self._depth is None:
+            log.info(f"Computing full depth array ({self.size}x{self.size})")
+            self._depth = self._buildFullDepth()
+        return self._depth
+
+    @depth.setter
+    def depth(self, value: NPFltArr)->None:
+        """Manual depth array assignment."""
+        self._depth = value
+    
+    #--------------------------------------------------------------------------
     @property
     def size(self)->int:
         """Length of one side of floor area (m)."""
@@ -2933,18 +2961,14 @@ class Floor:
     @size.setter
     def size(self, size:int)->None:
         """Set size and recreate map with new length. Assumes same origin."""
-        if ('perlin' in self.__dict__):
-            if (size > self._size):
-                self.perlin = PerlinNoise(size=size,
-                                          scale=self.perlin.scale,
-                                          octaves=self.perlin.octaves,
-                                          persistence=self.perlin.persistence,
-                                          seed=self.perlin.seed,
-                                          random=False)
-            else:
-                self.perlin.size = size
-                self.perlin.noise = self.perlin.noise[:size,:size]
-            self.depth = self.create_map()
+        if ('_perlin' in self.__dict__):
+            # Use perlin property setter for automatic sync
+            self.perlin = PerlinNoise(size=size,
+                                      scale=self.perlin.scale,
+                                      octaves=self.perlin.octaves,
+                                      persistence=self.perlin.persistence,
+                                      seed=self.perlin.seed,
+                                      random=False)
         self._size = size
 
     #--------------------------------------------------------------------------
@@ -2955,7 +2979,7 @@ class Floor:
 
     @style.setter
     def style(self, style:str)->None:
-        """Set depth map scaling style and rescale depth map."""
+        """Set depth mapping style and invalidate depth caches."""
 
         # Define available strategies
         self._styleStrategies = {
@@ -2970,9 +2994,25 @@ class Floor:
         # Assign new attribute
         self._style = style
     
-        # Regenerate depth map if already initialized         
-        if ('depth' in self.__dict__):
-            self.depth = self.create_map()
+        # Invalidate depth caches
+        if hasattr(self, '_tiles'):
+            self._tiles.clear()
+            self._depth = None
+
+    #--------------------------------------------------------------------------
+    @property
+    def perlin(self)->'PerlinNoise':
+        """PerlinNoise generator for ocean floor terrain."""
+        return self._perlin
+    
+    @perlin.setter
+    def perlin(self, pn:'PerlinNoise')->None:
+        """Set PerlinNoise instance and synchronize tile management."""
+        self._perlin = pn
+        self._tileSize = pn._tileSize
+        # Invalidate caches
+        self._tiles = {}
+        self._depth = None
 
     ## Special Methods =======================================================#
     def __call__(self, x:Number, y:Number)->np.float64:
@@ -2991,10 +3031,9 @@ class Floor:
             
         Notes
         -----
-        Uses array indexing to retrieve pre-generated depth values. The
-        underlying Perlin noise generator supports single-point evaluation,
-        enabling future implementations to compute depth on-demand rather than
-        pre-generating the entire depth map.
+        Uses tile cache for lazy evaluation. Tiles are generated on-demand and
+        cached for efficiency. First query within a tile triggers depth array
+        generation for that region, with results cached for subsequent queries.
 
         Examples
         --------
@@ -3002,9 +3041,25 @@ class Floor:
         >>> z = floor(100,100)   # Depth value at (x=100,y=100)
         """
 
-        # Single values: default case
-        xp, yp = self.xy2Index(x, y)
-        return self.depth[xp, yp]
+        # Convert to array indices
+        col, row = self.xy2Index(x, y)
+        
+        # Clamp to valid range
+        col = int(col) % self.size
+        row = int(row) % self.size
+        
+        # Determine tile containing position
+        tileI = col // self._tileSize
+        tileJ = row // self._tileSize
+        
+        # Get cached or generate tile
+        tile = self._getTile(tileI, tileJ)
+        
+        # Index within tile
+        colLocal = col % self._tileSize
+        rowLocal = row % self._tileSize
+        
+        return np.float64(tile[rowLocal, colLocal])
     
     #--------------------------------------------------------------------------
     def __repr__(self)->str:
@@ -3033,124 +3088,283 @@ class Floor:
         )
     
     ## Methods ===============================================================#
-    def sample_points(self, 
-                      x: Union[List, np.ndarray], 
-                      y: Union[List, np.ndarray]
-                      ) -> np.ndarray:
+    def samplePoints(self, 
+                     x:Union[List, NPFltArr], 
+                     y:Union[List, NPFltArr]
+                     )->np.ndarray:
         """
         Sample floor depth at list of specific coordinate points.
+
+        Queries multiple (x,y) coordinates and returns corresponding depths.
+        Efficient for sparse point sampling. Uses tile cache.
     
         Parameters
         ----------
-        x, y : list or ndarray
-            Lists of coordinates [x_0,...,x_i], [y_0,...,y_i].
+        x : list or ndarray
+            Lists of x-coordinates [x0,...,xi].
+        y : list or ndarray
+            Lists of y-coordinates [y0,...,yi].
             
         Returns
         -------
         z : ndarray
-            1D array of depth values at each point (x_i,y_i).
+            1D array of depth values at each point (xi,yi).
 
+        Notes
+        -----
+        **Tile-Based Lookup**
+
+        Queries tile cache for each point. Tiles are generated on-demand and
+        cached for future queries.
+
+        **Out-of-Bounds Wrapping**
+
+        Coordinates outside [0, size) wrap via modulo indexing.
+        
+        >>> floor = Floor(size = 1000)
+        >>> z1 = floor(1100, 500)       # Same as floor(100, 500)
+        
         Examples
         --------
-        >>> floor = Floor()                # New default ocean floor object
-        >>> x_pts = [100, 200, 300]
-        >>> y_pts = [150, 250, 350]
-        >>> z = floor.sample_points(x_pts, y_pts)   # z is list of length 3
+        >>> floor = Floor()
+        >>> x = [100, 200, 300]
+        >>> y = [150, 250, 350]
+        >>> z = floor.samplePoints(x, y)   # z is list of length 3
         """
 
-        # Vectorized coordinate to index conversion
-        x_arr, y_arr = np.asarray(x), np.asarray(y)
-        x_l, y_l = self.depth.shape
-        x_indices = ((x_arr + self.origin[0]).astype(int) % x_l).flatten()
-        y_indices = ((y_arr + self.origin[1]).astype(int) % y_l).flatten()
+        # Convert to indices
+        x = np.asarray(x)
+        y = np.asarray(y)
+        col, row = self.xy2Index(x, y)
         
-        return self.depth[x_indices, y_indices].reshape(x_arr.shape)
+        # Determine tiles for each point
+        iTiles = col // self._tileSize
+        jTiles = row // self._tileSize
+        
+        # Collect unique tiles
+        uniqueTiles = set(zip(iTiles, jTiles))
+
+        # Compute local indices
+        colLocal = col % self._tileSize
+        rowLocal = row % self._tileSize
+
+        # Batch-process points by using mask to select points in current tile
+        result = np.empty(x.shape, dtype=np.float64)
+        
+        for tileI, tileJ in uniqueTiles:
+            tile = self._getTile(tileI, tileJ) 
+            mask = (iTiles == tileI) & (jTiles == tileJ)
+            result[mask] = tile[rowLocal[mask], colLocal[mask]]
+        
+        return result
 
     #--------------------------------------------------------------------------
-    def sample_grid(self, 
-                    x: Union[List, np.ndarray], 
-                    y: Union[List, np.ndarray]
-                    ) -> np.ndarray:
+    def sampleGrid(self, 
+                   x:Union[List, np.ndarray], 
+                   y:Union[List, np.ndarray]
+                   )->np.ndarray:
         """
         Sample floor depth at grid of coordinate points.
+
+        Queries a regular Cartesian grid of (x,y) coordinates. Returns a 2D
+        array with shape (len(y), len(x)). Optimized for uniform grids but
+        handles irregular grids.
     
         Parameters
         ----------
-        x, y : list or ndarray
-            Lists of coordinates [x_0,...,x_i], [y_0,...,y_j].
+        x : list or ndarray
+            X-coordinates [x0,...,xi] for grid point columns. Grid is formed by
+            the Cartesian product (xi, yj).
+        y : list or ndarray
+            Y-coordinates [y0,...,yj] for grid point rows. Grid is formed by the
+            Cartesian product (xi, yj).
             
         Returns
         -------
-        z : ndarray, shape (len(x), len(y))
-            2D array of depth values at each grid point (x_i,y_j).
+        z : ndarray, shape (len(y), len(x))
+            2D array of depth values at each grid point (xi,yj). 
+            z[j, i] = floor.sample(x[i], y[j]).
 
+        Notes
+        -----
+        **Cartesian Product Convention:**
+
+        For Cartesian product of x-coordinates and y-coordinates, standard 
+        numpy convention returns shape [len(y), len(x)]. This matches meshgrid
+        output with default indexing='xy'.
+
+        **Optimization Requirements:**
+
+        To leverage fast array computations, the method requires:
+
+        1. All coordinates are within floor bounds (no wrapping)
+        2. Monotonically increasing order (in sorted order)
+        3. Uniform spacing (constant differences)
+
+        If all requirements are met, a faster computation is used that
+        relies on the sampleRegion() method. If any requirement fails, a slower
+        computation is used that relies on the samplePoints() method.
+        
         Examples
         --------
-        >>> floor = Floor()             # New default ocean floor object
-        >>> x_pts = [100, 200, 300]
-        >>> y_pts = [150, 250, 350]
-        >>> z = floor.sample_grid(x_pts, y_pts)     # z is array (3,3)
+        >>> floor = Floor()
+        >>> x = [100, 200, 300]
+        >>> y = [150, 250, 350]
+        >>> z = floor.sampleGrid(x, y)     # z is array (3,3)
         """
         
-        # Create meshgrid for all combinations of x and y coordinates
-        x_arr, y_arr = np.asarray(x), np.asarray(y)
-        xx, yy = np.meshgrid(x_arr, y_arr, indexing='ij')
+        # Check for coordinates out-of-bounds
+        xArr, yArr = np.asarray(x), np.asarray(y)
+        colRaw = (xArr + self.origin[0]).astype(int)
+        rowRaw = (yArr + self.origin[1]).astype(int)
+        inBounds = (np.all((colRaw >= 0) & (colRaw < self.size)) and
+                    np.all((rowRaw >= 0) & (rowRaw < self.size)))
+
+        # Convert to indices
+        col, row = self.xy2Index(xArr, yArr)
         
-        # Vectorized coordinate to index conversion
-        x_i = ((xx + self.origin[0]).astype(int) % self.depth.shape[0])
-        y_j = ((yy + self.origin[1]).astype(int) % self.depth.shape[1])
+        # If in bounds, check if points form a uniform sampling region
+        useOptimized = False
+        if (inBounds):
+            colDiff = np.diff(col)
+            rowDiff = np.diff(row)
+            
+            colUniform = ((len(col) > 1) and 
+                          (colDiff[0] > 0) and 
+                          np.all(colDiff == colDiff[0]))
+            rowUniform = ((len(row) > 1) and 
+                          (rowDiff[0] > 0) and
+                          np.all(rowDiff == rowDiff[0]))
+            
+            useOptimized = (colUniform and rowUniform)
+
+        # If in bounds and uniform, use sampleRegion then stride the grid points
+        if (useOptimized):
+            # Get full region
+            # Add 1 since sampleRegion uses exclusive upper bounds
+            xMin, xMax = xArr[0], xArr[-1] + 1
+            yMin, yMax = yArr[0], yArr[-1] + 1
+            region = self.sampleRegion([xMin, xMax], [yMin, yMax])
+            
+            # Apply striding
+            colStride = colDiff[0] if (len(col) > 1) else 1
+            rowStride = rowDiff[0] if (len(row) > 1) else 1
+            if ((colStride > 1) or (rowStride > 1)):
+                region = region[::rowStride, ::colStride]
+            
+            return region
         
-        # Sample depths at all grid points
-        return self.depth[x_i, y_j]
+        # Else out-of-bounds or irregular grid so fall back to use samplePoints
+        else:
+            xx, yy = np.meshgrid(xArr, yArr)
+            depths = self.samplePoints(xx.flatten(), yy.flatten())
+            return depths.reshape(xx.shape)
 
     #--------------------------------------------------------------------------
-    def sample_region(self, 
-                      x_bounds: Union[List[float], np.ndarray], 
-                      y_bounds: Union[List[float], np.ndarray]
-                      ) -> np.ndarray:
+    def sampleRegion(self, 
+                     x:Union[List[float], np.ndarray], 
+                     y:Union[List[float], np.ndarray],
+                     )->np.ndarray:
         """
-        Extract depth map region within specified boundaries.
+        Extract depth map region within specified x,y coordinate boundaries.
+
+        Samples a rectangular region of the depth map defined by x-bounds and
+        y-bounds. Efficiently combines tiles from cache.
     
         Parameters
         ----------
-        x_bounds, y_bounds : list or ndarray
-            Boundary pairs [x_min,x_max], [y_min,y_max].
+        x : list of float or ndarray
+            Boundary pairs [xmin,xmax]. Defines East-West (horizontal) extent 
+            of region.
+        y : list of float or ndarray
+            Boundary pairs [ymin,ymax]. Defines North-South (vertical) extent
+            of region.
             
         Returns
         -------
         z : ndarray
             2D array of depth map region.
-            
+
         Notes
         -----
-        Endpoints inclusive. For x:[100,110], y:[100,110], returns (11,11)
-        array.
+        Upper bounds of region are excluded from returned array: x=[0, 100], 
+        y=[0, 100] returns columns 0-99 (100 columns) and rows 0-99 (100 
+        rows).
         
         Examples
         --------
-        >>> floor = Floor()       # New default ocean floor object
-        >>> x_s = [100, 200]      # n = (200-100) + 1 = 101
-        >>> y_s = [150, 250]      # m = (250-150) + 1 = 101
-        >>> z = floor.sample_region(x_s, y_s)   # z is array (n, m)
+        >>> floor = Floor()
+        >>> x = [100, 200]
+        >>> y = [150, 250]
+        >>> z = floor.sampleRegion(x, y)    # z is array (100, 100)
         """
         
         # Unpack boundaries
-        xmin, xmax = x_bounds
-        ymin, ymax = y_bounds
+        xmin, xmax = x
+        ymin, ymax = y
         
         # Convert boundaries to indices
-        xmin_idx, ymin_idx = self.xy2Index(xmin, ymin)
-        xmax_idx, ymax_idx = self.xy2Index(xmax, ymax)
+        colMin, rowMin = self.xy2Index(xmin, ymin)
+        colMax, rowMax = self.xy2Index(xmax, ymax)
         
-        # Ensure proper ordering
-        xmin_idx, xmax_idx = min(xmin_idx, xmax_idx), max(xmin_idx, xmax_idx)
-        ymin_idx, ymax_idx = min(ymin_idx, ymax_idx), max(ymin_idx, ymax_idx)
+        # Ensure proper ordering due to allowing array index wrapping
+        colMin, colMax = min(colMin, colMax), max(colMin, colMax)
+        rowMin, rowMax = min(rowMin, rowMax), max(rowMin, rowMax)
+
+        # Allocate output array
+        width = colMax - colMin
+        height = rowMax - rowMin
+        region = np.empty((height, width), dtype=np.float64)
+
+        # Determine tiles that cover requested region
+        tileIMin = colMin // self._tileSize
+        tileIMax = (colMax - 1) // self._tileSize
+        tileJMin = rowMin // self._tileSize
+        tileJMax = (rowMax - 1) // self._tileSize
         
-        # Extract region
-        return self.depth[xmin_idx:xmax_idx+1, ymin_idx:ymax_idx+1]
+        # Assemble region from tile cache
+        for tileI in range(tileIMin, tileIMax + 1):
+            for tileJ in range(tileJMin, tileJMax + 1):
+                # Get tile from cache or generate
+                tile = self._getTile(tileI, tileJ)
+
+                # Convert tile bounds to array space
+                colMinTile = tileI * self._tileSize
+                colMaxTile = min(colMinTile + self._tileSize, self.size)
+                rowMinTile = tileJ * self._tileSize
+                rowMaxTile = min(rowMinTile + self._tileSize, self.size)
+
+                # Calculate overlap between requested region and tile
+                overlapColMin = max(colMin, colMinTile)
+                overlapColMax = min(colMax, colMaxTile)
+                overlapRowMin = max(rowMin, rowMinTile)
+                overlapRowMax = min(rowMax, rowMaxTile)
+
+                # Skip if no overlap
+                if ((overlapColMin > overlapColMax) or 
+                    (overlapRowMin > overlapRowMax)):
+                    continue
+                
+                # Calculate indices in tile space
+                tColMin = overlapColMin - colMinTile
+                tColMax = overlapColMax - colMinTile
+                tRowMin = overlapRowMin - rowMinTile
+                tRowMax = overlapRowMax - rowMinTile
+                
+                # Calculate indices in region space
+                rColMin = overlapColMin - colMin
+                rColMax = overlapColMax - colMin
+                rRowMin = overlapRowMin - rowMin
+                rRowMax = overlapRowMax - rowMin
+
+                # Copy data from tile to region
+                region[rRowMin:rRowMax, rColMin:rColMax] = \
+                    tile[tRowMin:tRowMax, tColMin:tColMax]
+
+        return region
     
     #--------------------------------------------------------------------------
-    def create_map(self, style:Optional[str]=None, **kwargs)->NPFltArr:
+    def createMap(self, style:Optional[str]=None, **kwargs)->NPFltArr:
         """
         Create depth map from normalized 2D noise array, scaled by style.
 
@@ -3176,58 +3390,108 @@ class Floor:
         return self._styleStrategies[strategy](**kwargs)
 
     #--------------------------------------------------------------------------
-    def xy2Index(self, x:float, y:float)->List[int]:
+    def xy2Index(self, 
+                 x:Union[float, NPFltArr], 
+                 y:Union[float, NPFltArr],
+                 )->Tuple[Union[int, NPIntArr], Union[int, NPIntArr]]:
         """
         Transform coordinates from (x,y) to array indices.
+
+        Maps END coordinates (East, North) to array indices following [row,
+        column] convention.
     
         Parameters
         ----------
-        x, y : float
-            X, Y coordinates for depth array.
+        x : list of float or ndarray
+            X-coordinates relative to origin for depth array.
+            x = East, increases rightward
+        y : list of float or ndarray
+            Y-coordinates relative to origin for depth array.
+            y = North, increases upward
             
         Returns
         -------
-        [i,j] : list of int
-            Array indices corresponding to (x,y).
+        col, row : int or ndarray
+            Array column and row indices, ready for depth[row, col] access.
+            col = column index (0..size-1), increases East.
+            row = row index (0..size-1), increases North.
+            Type matches input. If scalar inputs: (int, int), if array inputs:
+            (ndarray, ndarray)
             
         Notes
         -----
-        **Boundary Behavior - Coordinate Wrapping**
+        **Coordinate System Convention (END):**
+
+        - x increases East (rightward in visual display)
+        - y increases North (upward in visual display)
+        - Array indexing: depth[row, col] where row == y, col == x
+
+        **Origin Mapping:**
+
+        Origin attribute of Floor instance defines where the (0,0) point of the
+        END x,y coordinates maps in the floor depth array.
+
+        >>> floor = Floor(origin=[250,900])
+        >>> col, row = floor.xy2Index(0,0)  # col = 250, row = 900
+
+        **Boundary Behavior - Coordinate Wrapping:**
         
         Queries outside the floor domain [0, size] are handled via modulo
         wrapping:
 
         - Coordinates automatically wrap around array boundaries
         - Prevents IndexError exceptions that would halt simulation
-        - Effectively treats floor map as infinitely tiled pattern
+        - Effectively treats floor map as infinitely repeating
         
         **Rationale:**
+
         Negative array indexing in Python is valid (accesses from end), making
         lower-bound violations difficult to detect compared to upper-bound
         IndexError exceptions. Rather than implement costly bounds checking or
         allowing edge indexing errors stop the entire simulations, wrapping
-        provides graceful degradation. This decision can be ammended if a
-        generator is built for the PerlinNoise class.
-
-        **Examples:**
-        
-        >>> floor = Floor(size=1000, origin=[500, 500])
-        >>> # Query outside bounds
-        >>> i, j = floor.xy2Index(1100, 500)  # x=1100 > size=1000
-        >>> # Result: i = (1100 + 500) % 1000 = 600 (wrapped)
-        >>> 
-        >>> # Equivalent queries due to wrapping:
-        >>> floor(1100, 500) == floor(100, 500)  # True
+        provides graceful degradation.
 
         **Impact on Simulation:**
+
         Wrapped coordinates may return unrealistic depth values for vehicles
         that stray far from intended operation areas. Users should validate that
         vehicle trajectories remain within expected floor domain.
         """
 
-        x_l, y_l = self.depth.shape
-        return [int(x + self.origin[0]) % x_l, int(y + self.origin[1]) % y_l]
+        col = (np.asarray(x) + self.origin[0]).astype(int) % self.size
+        row = (np.asarray(y) + self.origin[1]).astype(int) % self.size
+        
+        return col, row
 
+    #--------------------------------------------------------------------------
+    def generate(self)->None:
+        """
+        Explicitly precomputes full depth array.
+        
+        Forces generation of all tiles and caches the complete depth array.
+        Subsequent accesses to depth property or tile-based queries will use
+        cached data without generation overhead.
+        
+        Notes
+        -----
+        This method is equivalent to accessing the `depth` property but makes
+        the intent explicit. Useful for:
+        
+        - Precomputing before batch simulations
+        - Forcing generation for visualization
+        - Eliminating on-demand generation overhead
+        
+        Examples
+        --------
+        >>> floor = Floor(size=5000)
+        >>> floor.generate()    # Precompute before simulation loop
+        >>> sim.run()           # depth array already cached
+        >>> floor.display3D()   # instant visualization
+        """
+
+        # Accessing depth array triggers property getter to build full array
+        _ = self.depth
+    
     #--------------------------------------------------------------------------
     def display2D(self, 
                   z:Optional[NPFltArr]=None, 
@@ -3243,8 +3507,10 @@ class Floor:
             Depth array to display. If None, uses self.depth.
         dispType : str, default='contour'
             Display style.
-            'contour': A contour plot with labeled depth contours
-            'cloud': Simple scaling to the color map.
+
+            - 'contour': A contour plot with labeled depth contours
+            - 'cloud': Simple scaling to the color map.
+
         path : guidance.Waypoint, optional
             A waypoint object. Path described by waypoints is plotted over the
             depth map.
@@ -3253,33 +3519,39 @@ class Floor:
         if (z is None):
             z = self.depth
 
-        extent=[-self.origin[0],z.shape[0]-self.origin[0],
-                -self.origin[1],z.shape[1]-self.origin[1]]
+        # z.shape[1] is 'x' (columns), z.shape[0] is 'y' (rows)
+        extent=[-self.origin[0], z.shape[1]-self.origin[0],
+                -self.origin[1], z.shape[0]-self.origin[1]]
         plt.figure(figsize=(9,6))
+
         # Simple scaling plot
         if (dispType == "cloud"):
             p = plt.imshow(z, extent=extent, origin='lower', cmap='viridis_r')
             plt.colorbar(p).ax.invert_yaxis()
+
         # Plot with countour lines
         else:
-            plt.imshow(z, extent=extent, origin='lower', 
+            plt.imshow(z.T, extent=extent, origin='lower', 
                        cmap='viridis_r', alpha=0.5)
             plt.colorbar().ax.invert_yaxis()
-            x = np.linspace(extent[0],extent[1]-1,z.shape[0])
-            y = np.linspace(extent[2],extent[3]-1,z.shape[1])
-            contours = plt.contour(x, y, z, 10, colors='black', alpha=0.4)
+            x = np.linspace(extent[0], extent[1] - 1, z.shape[1])
+            y = np.linspace(extent[2], extent[3] - 1, z.shape[0])
+            contours = plt.contour(x, y, z.T, 10, colors='black', alpha=0.4)
             plt.clabel(contours, inline=True, fontsize=8, fmt="%.0f")
+
         # Lines at origin
-        oc = 'gray'
-        ow = 0.5
+        oc = 'gray'     # origin color
+        ow = 0.5        # origin width
         plt.axvline(x=0, linewidth=ow, color=oc)
         plt.axhline(y=0, linewidth=ow, color=oc)
+
         # Path of vehicle
         if (path is not None):
-            pmc = "red"
-            plc = "black"
-            plt.plot(path.pos.x,path.pos.y,linestyle="dotted",color=plc)
-            plt.scatter(path.pos.x,path.pos.y,marker='^',color=pmc,s=64)
+            pmc = "red"     # path marker color
+            plc = "black"   # path line color
+            plt.plot(path.pos.x, path.pos.y, linestyle="dotted", color=plc)
+            plt.scatter(path.pos.x, path.pos.y, marker='^', color=pmc, s=64)
+
         plt.show()
 
     #--------------------------------------------------------------------------
@@ -3295,6 +3567,8 @@ class Floor:
         
         if (z is None):
             z = self.depth
+        
+        # Set color map
         color = mpl.colormaps['terrain']
         new_cmap = mpl.colors.ListedColormap(color(np.linspace(0.65,0.55,256)))
         # color = mpl.colormaps['gist_earth']
@@ -3303,12 +3577,16 @@ class Floor:
         # new_cmap = mpl.colors.ListedColormap(color(np.linspace(0.7,0.9,256)))
         # color = mpl.colormaps['Wistia']
         # new_cmap = mpl.colors.ListedColormap(color(np.linspace(0.9,0.25,256)))
-        x,y = np.meshgrid(range(z.shape[0]),range(z.shape[1]))
+
+        # Plot floor
+        # z.shape[1] is 'x' (columns), z.shape[0] is 'y' (rows)
+        x, y = np.meshgrid(np.arange(z.shape[1]),np.arange(z.shape[0]))
         fig = plt.figure(figsize=(9,9))
         ax = fig.add_subplot(111, projection='3d')
         ax.set_zlim(-z.max(),0)
         ax.plot_surface(x, y, -z, alpha=0.9, cmap=new_cmap)
-        #add water surface
+        
+        # Add water surface
         ax.plot_surface(x, y, 0*z, alpha=0.3, color='blue')
         plt.show()
 
@@ -3360,8 +3638,8 @@ class Floor:
         Parameters
         ----------
         noise : ndarray, optional
-            2D array normalized to [0, 1]. If None, uses
-            self.perlin.noise.
+            2D array normalized to [0, 1]. If None, generates via 
+            perlin.evaluateRegion()
         z : float, optional
             Minimum depth in meters. If None, uses self.z.
         z_range : float, optional
@@ -3373,10 +3651,12 @@ class Floor:
             Depth map in meters with shape (size, size)
         """
 
-        n = self.perlin.noise if (noise is None) else noise
+        # Generate noise on-demand if not provided
+        if noise is None:
+            noise = self.perlin.evaluateRegion([0, self.size], [0, self.size])
         z_val = self.z if (z is None) else z
         z_r = self.z_range if (z_range is None) else z_range
-        return (n * z_r) + z_val
+        return (noise * z_r) + z_val
     
     #--------------------------------------------------------------------------
     def _mapSigmoid(self,
@@ -3397,11 +3677,16 @@ class Floor:
         Parameters
         ----------
         noise : ndarray, optional
-            2D noise array normalized to [0, 1]
+            2D noise array normalized to [0, 1]. If None, generates via 
+            perlin.evaluateRegion()
         z : float, optional
-            Minimum depth in meters
+            Minimum depth in meters. If None, uses self.z.
         z_range : float, optional
-            Depth variation range in meters
+            Depth variation range in meters.
+        kwargs : dict, optional
+            Optional keyword arguments:
+            
+            - k : float, steepness parameter (default 5.0)
         
         Returns
         -------
@@ -3409,12 +3694,14 @@ class Floor:
             Depth map with smooth sigmoid transitions
         """
 
-        n = self.perlin.noise if (noise is None) else noise
+        # Generate noise on-demand if not provided
+        if noise is None:
+            noise = self.perlin.evaluateRegion([0, self.size], [0, self.size])
         z_val = self.z if (z is None) else z
         zr = self.z_range if (z_range is None) else z_range
         k = kwargs.get('k', 5.0)
         
-        return z_val + zr / (1.0 + np.exp(-k * (2.0 * n - 1.0)))
+        return z_val + zr / (1.0 + np.exp(-k * (2.0 * noise - 1.0)))
     
     #--------------------------------------------------------------------------
     def _mapShelf(self,
@@ -3422,7 +3709,7 @@ class Floor:
               z: Optional[Number] = None,
               z_range: Optional[Number] = None,
               **kwargs
-              ) -> NPFltArr:
+              )->NPFltArr:
         """
         Continental shelf mapping with asymmetric depth scaling.
         
@@ -3442,7 +3729,8 @@ class Floor:
         Parameters
         ----------
         noise : ndarray, optional
-            2D array normalized to [0, 1]. If None, uses self.perlin.noise.
+            2D array normalized to [0, 1]. If None, generates via 
+            perlin.evaluateRegion().
         z : float, optional
             Minimum depth in meters. If None, uses self.z.
         z_range : float, optional
@@ -3458,7 +3746,9 @@ class Floor:
             Depth map with shelf-like features
         """
         
-        n = self.perlin.noise if (noise is None) else noise
+        # Generate noise on-demand if not provided
+        if noise is None:
+            noise = self.perlin.evaluateRegion([0, self.size], [0, self.size])
         z_val = self.z if (z is None) else z
         zr = self.z_range if (z_range is None) else z_range
         k = kwargs.get('k', 3.0)
@@ -3467,16 +3757,130 @@ class Floor:
         midpoint = 0.5
         
         # Upper half: Expand (more variation)
-        maskUpper = n >= midpoint
-        upper = midpoint + 2.0 * ((n - midpoint) ** k)
+        maskUpper = noise >= midpoint
+        upper = midpoint + 2.0 * ((noise - midpoint) ** k)
         
         # Lower half: Compress (less variation)
-        lower = 2.0 * (n ** k)
+        lower = 2.0 * (noise ** k)
         
         # Combine branches
         scaled = np.where(maskUpper, upper, lower)
         
         return z_val + zr * scaled
+    
+    #--------------------------------------------------------------------------
+    def _buildFullDepth(self)->NPFltArr:
+        """
+        Construct full depth array from tile cache and new tiles.
+        
+        Iterates through floor tiles, generating and caching depth tiles
+        as needed. Combines into single numpy array.
+
+        Returns
+        -------
+        depth : ndarray
+            Fully computed depth array.
+        """
+
+        depth = np.zeros((self.size, self.size), dtype=np.float64)
+        
+        nTilesI = (self.size + self._tileSize - 1) // self._tileSize
+        nTilesJ = (self.size + self._tileSize - 1) // self._tileSize
+        
+        for tileI in range(nTilesI):
+            for tileJ in range(nTilesJ):
+                # Get or generate tile
+                tile = self._getTile(tileI, tileJ)
+                
+                # Determine position in full array
+                iStart = tileI * self._tileSize
+                jStart = tileJ * self._tileSize
+                iEnd = min(iStart + self._tileSize, self.size)
+                jEnd = min(jStart + self._tileSize, self.size)
+                
+                tileHeight = jEnd - jStart
+                tileWidth = iEnd - iStart
+                
+                # Write tile to full array
+                depth[jStart:jEnd, iStart:iEnd] = tile[:tileHeight, :tileWidth]
+        
+        return depth
+    
+    #--------------------------------------------------------------------------
+    def _getTile(self, tileI:int, tileJ:int)->NPFltArr:
+        """
+        Get or generate a cached tile of the depth array.
+        
+        Parameters
+        ----------
+        tileI, tileJ : int
+            Tile grid column, row indices.
+            
+        Returns
+        -------
+        tile : ndarray, shape (tileSize, tileSize)
+            Depth values for this tile in meters.
+        
+        Notes
+        -----
+        **Tile Grid:**
+
+        The floor size is divided into a whole number of uniformly sized tiles,
+        forming a square grid. For example, a floor size of 2000 m may use a
+        tile size of 500 m, forming a grid of 4 x 4 tiles. The tile size is
+        provided by the perlin instance.
+
+        **Tile Caching:**
+
+        Tiles are cached in the tiles dictionary, with the key formed from the
+        tile grid indices: tiles[(tileI, tileJ)]. Requesting a tile that has not
+        been generated will trigger the tile to be evaluated and cached for
+        future re-use. Otherwise, subsequent access returns the cached copy
+        immediately. The tile cache is cleared when size, style, or the perlin
+        instance are changed.
+
+        See Also
+        --------
+        PerlinNoise._calcTileSize : Determines tile size from array size
+        PerlinNoise.evaluateRegion : Computes perlin noise over region
+        createMap : Applys depth mapping to convert noise to depth array
+        """
+
+        # Verify tile grid indices
+        if ((max(tileI, tileJ) >= self.size // self._tileSize) or
+            (min(tileI, tileJ) < 0)):
+            log.warning(
+                "Bad tile index: (%s, %s). Returning tile of z=%s values.", 
+                tileI, tileJ, self.z
+            )
+            
+            return np.full((self._tileSize, self._tileSize), 
+                           self.z, 
+                           dtype=np.float64)
+
+        # Check tile cache
+        key = (tileI, tileJ)
+        
+        if (key not in self._tiles):
+            # Determine tile bounds
+            iStart = tileI * self._tileSize
+            jStart = tileJ * self._tileSize
+            iEnd = min(iStart + self._tileSize, self.size)
+            jEnd = min(jStart + self._tileSize, self.size)
+            
+            # Evaluate noise region
+            noise = self.perlin.evaluateRegion(
+                [iStart, iEnd],
+                [jStart, jEnd]
+            )
+            
+            # Convert noise to depth
+            tile = self.createMap(noise=noise)
+            
+            # Cache
+            self._tiles[key] = tile
+        
+        return self._tiles[key]
     
 ###############################################################################
 
@@ -3687,7 +4091,7 @@ class PerlinNoise:
     See Also
     --------
     Floor : Uses PerlinNoise to generate ocean floor depth maps
-    Floor.standard_map : Transforms normalized noise into depth values
+    Floor.createMap : Transforms normalized noise into depth values
 
     
     References
