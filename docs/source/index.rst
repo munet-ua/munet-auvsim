@@ -3,7 +3,7 @@
 Welcome to muNet-AUVsim's documentation!
 ========================================
 
-**Version:** 0.1.0-beta
+**Version:** 0.2.0-beta
 
 **Status:** Beta Release
 

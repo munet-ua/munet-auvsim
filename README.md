@@ -1,6 +1,9 @@
 # muNet AUV Sim
 
-**Version:** 0.1.0-beta  
+[![Latest Release](https://img.shields.io/github/v/release/munet-ua/munet-auvsim?include_prereleases&sort=semver)](https://github.com/munet-ua/munet-auvsim/releases/latest)
+
+
+**Version:** 0.2.0-beta  
 **Status:** Beta Release
 
 ## Description
@@ -207,6 +210,9 @@ The full project documentation is available at:
 [GitHub Pages](https://munet-ua.github.io/munet-auvsim/)
 
 This documentation is up to date with the latest release and is the best place to start if you're new to the project or need reference information.
+
+> **What’s New:** See release notes at https://github.com/munet-ua/munet-auvsim/releases/latest
+
 
 ### Using the Documentation
 
@@ -769,7 +775,7 @@ If you use muNet-AUVsim in your research, please cite:
   author = {Crawford, JP and Qin, Gang and Song, Aijun},
   title = {muNet-AUVsim: Multi-Agent AUV Simulation Framework},
   year = {2025},
-  version = {0.1.0-beta},
+  version = {0.2.0-beta},
   url = {https://github.com/munet-ua/munet-auvsim}
 }
 ```
@@ -781,7 +787,7 @@ If you use muNet-AUVsim in your research, please cite:
 
 ## Project Status
 
-**Current Version**: 0.1.0-beta  
+**Current Version**: 0.2.0-beta  
 **Status**: Beta Release - Core features stable, API subject to refinement
 
 ### Roadmap
@@ -790,8 +796,8 @@ Short list of bug fixes and features intended for future development:
 
 **Near Term:**
 
-- [ ] **Improved Ocean Modeling** - Remove size limitations in Perlin terrain
-  generation for larger simulation areas
+- [x] **Improved Ocean Modeling** - Removed size limitations in Perlin terrain
+  generation for larger simulation areas ([shipped in 0.2.0-beta](https://github.com/munet-ua/munet-auvsim/releases/latest))
 - [ ] **Better Network Tools** - Enhanced node registration and channel
   assignment utilities for muNet
 - [ ] **Visualization Improvements** - Separate 3D plot generation from

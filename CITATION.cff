@@ -14,7 +14,7 @@ authors:
   - family-names: "Song"
     given-names: "Aijun"
     affiliation: "University of Alabama"
-version: "0.1.0-beta"
+version: "0.2.0-beta"
 date-released: "2025-12-04"
 license: "MIT"
 repository-code: "https://github.com/munet-ua/munet-auvsim"
