@@ -28,7 +28,7 @@ Quick Links
 * :ref:`modindex`
 
 Key Features
-============
+------------
 
 - **AUV dynamics modeling**: 6-DOF nonlinear vehicle dynamics based on Fossen's
   marine vehicle modeling
@@ -46,7 +46,7 @@ Key Features
   and reproducible simulations
 
 Research Applications
-=====================
+---------------------
 
 - Swarm coordination algorithms
 - Underwater acoustic communication protocols
@@ -56,10 +56,16 @@ Research Applications
 - Multi-agent underwater robotics
 
 Getting Started
-===============
+---------------
 
 For installation instructions, see :doc:`installation`.
 
 For a quick start guide, see :doc:`quickstart`.
 
 For detailed API documentation, see :doc:`api/modules`.
+
+
+Citation
+--------
+
+For guidance on citing this work, see the `README <https://github.com/munet-ua/munet-auvsim#citing-this-work>`_ and the `CITATION <https://github.com/munet-ua/munet-auvsim/blob/main/CITATION.cff>`_ file.

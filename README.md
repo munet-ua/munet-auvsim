@@ -1,7 +1,7 @@
 # muNet AUV Sim
 
 [![Latest Release](https://img.shields.io/github/v/release/munet-ua/munet-auvsim?include_prereleases&sort=semver)](https://github.com/munet-ua/munet-auvsim/releases/latest)
-
+[![DOI](https://zenodo.org/badge/1109695731.svg)](https://doi.org/10.5281/zenodo.18176580)
 
 **Version:** 0.2.0-beta  
 **Status:** Beta Release
@@ -774,11 +774,17 @@ If you use muNet-AUVsim in your research, please cite:
 @software{munet_auvsim,
   author = {Crawford, JP and Qin, Gang and Song, Aijun},
   title = {muNet-AUVsim: Multi-Agent AUV Simulation Framework},
-  year = {2025},
+  year = {2026},
   version = {0.2.0-beta},
+  doi = {10.5281/zenodo.18176581},
   url = {https://github.com/munet-ua/munet-auvsim}
 }
 ```
+
+**Or use the CFF citation file:**
+See [CITATION.cff](CITATION.cff) for standard citation formats.
+
+**DOI:** [![DOI](https://zenodo.org/badge/1109695731.svg)](https://doi.org/10.5281/zenodo.18176581)
 
 ## Contact and Support
 
