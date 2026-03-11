@@ -804,12 +804,12 @@ Short list of bug fixes and features intended for future development:
 
 - [x] **Improved Ocean Modeling** - Removed size limitations in Perlin terrain
   generation for larger simulation areas ([shipped in 0.2.0-beta](https://github.com/munet-ua/munet-auvsim/releases/latest))
+- [x] **APF Performance** - Updated APF design to use subsumption architecture with Mission, Formation, and Survival layers to improve guidance behavior ([shipped in 784e2d3](https://github.com/munet-ua/munet-auvsim/commit/784e2d3ca0f82e92e87130ef641c785f9ea46cf5))
+- [ ] **Environment Injection Refactor** - Move origination of ocean current and depth in the vehicle dynamics function from sensor models to direct simulator injection
 - [ ] **Better Network Tools** - Enhanced node registration and channel
   assignment utilities for muNet
 - [ ] **Visualization Improvements** - Separate 3D plot generation from
   animation rendering for better performance and user control
-- [ ] **APF Performance** - Investigate wave filtering in APF and errant vehicle
-  behavior
 
 ---
 ---
