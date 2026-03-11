@@ -2389,17 +2389,15 @@ class Remus100s(AUV):
     def loadTargetTracking(self,
                            target:Vehicle,
                            law:str='APF',
-                           att:str='linearCBZ',
-                           rep:str='varExp',
+                           mission:str='targetFeedforward',
+                           formation:str='targetNormPoly',
+                           survival:str='groupNormPoly',
                            )->None:
         """
-        Configure vehicle for swarm target tracking using artificial potential
-        field methods.
+        Configure vehicle for swarm target tracking.
 
         Sets up autonomous target-following behavior for swarm coordination
-        using potential field-based guidance. Configures attraction to target
-        vehicle and repulsion from obstacles/neighbors, with modular selection
-        of attraction and repulsion functions.
+        using specified guidance law. 
 
         
         Parameters
@@ -2413,18 +2411,20 @@ class Remus100s(AUV):
             - 'APF': Artificial Potential Field guidance
             - 'CB': Constant Bearing guidance
 
-        att : str
-            Attraction function type for APF guidance law:
+        mission : str
+            APF mission control component:
 
-            - 'linear': Variable linear attraction
-            - 'linearCBZ': Variable linear zone attraction
-            - 'cubic': Variable cubic attraction
+            - 'targetFeedforward': Feed-forward target vehicle velocity vector.
 
-        rep : str
-            Repulsion function type for APF guidance law:
+        formation : str
+            APF Formation keeping component:
 
-            - 'exp': Exponential repulsion
-            - 'varExp': Variable exponential repulsion
+            - 'targetNormPoly': Radial attraction and repulsion to target.
+
+        survival : str
+            APF Collision avoidance component:
+
+            - 'groupNormPoly': Repulsion from all swarm group vehicles.
 
             
         Notes
@@ -2443,12 +2443,12 @@ class Remus100s(AUV):
 
           - **APF Component Functions (if law='APF'):**
 
-            - self.GuidLaw.attraction : callable
-                Artificial potential that contributes to attraction towards
-                target.
-            - self.GuidLaw.repulsion : callable
-                Artificial potential that contributes to repulsion away from
-                neighbors.
+            - self.GuidLaw.mission : callable
+                Contributes to mission-based control velocity vector.
+            - self.GuidLaw.formation : callable
+                Artificial potential that contributes to formation keeping.
+            - self.GuidLaw.survival : callable
+                Artificial potential that contributes to collision avoidance.
 
           - **Control Autopilots:**
 
@@ -2495,22 +2495,16 @@ class Remus100s(AUV):
         - Faster depth response for dynamic target following
         - Direct 3D tracking without waypoint constraints
         - More aggressive maneuvering capability
-        
-        **Wave Filter Note:**
-
-        Current implementation does not include wave filtering for the potential
-        field gradients. In high disturbance environments, the computed velocity
-        commands may exhibit high frequency oscillations. Future versions should
-        implement filtering to reduce influence of destabilizing forces.
 
         
         See Also
         --------
         guidance.targetTrack : Main target tracking guidance function
-        guidance.velAPF : APF velocity guidance law
+        guidance.velocitySubsumptionCascadeAPF : APF guidance law
         guidance.velCB : Constant bearing velocity guidance law
-        guidance.variableLinearZoneAttractionAPF : Recommended attraction function
-        guidance.variableExpRepulsionAPF : Recommended repulsion function
+        guidance.missionTargetFeedForwardAPF : Target velociy feed-forward
+        guidance.formationTargetNormPolyAPF : Target attraction & repulsion
+        guidance.survivalGroupNormPolyAPF : Group member repulsion
         control.pitchPID : Direct pitch controller
         control.headingPID : Heading autopilot
         loadPathFollowing : Alternative guidance for waypoint following
@@ -2538,19 +2532,13 @@ class Remus100s(AUV):
         # Load Guidance Law
         ## Artificial Potential Field
         if (law == 'APF'):
-            self.GuidLaw = guid.velAPF
-            ### Attraction Function
-            if (att == 'linear'):
-                self.GuidLaw.attraction = guid.variableLinearAttractionAPF
-            elif (att == 'linearCBZ'):
-                self.GuidLaw.attraction = guid.variableLinearZoneAttractionAPF
-            elif (att == 'cubic'):
-                self.GuidLaw.attraction = guid.variableCubicAttractionAPF
-            ### Repulsion Function
-            if (rep == 'exp'):
-                self.GuidLaw.repulsion = guid.exponentialRepulsionAPF
-            elif (rep == 'varExp'):
-                self.GuidLaw.repulsion = guid.variableExpRepulsionAPF
+            self.GuidLaw = guid.velocitySubsumptionCascadeAPF
+            if (mission == 'targetFeedforward'):
+                self.GuidLaw.mission = guid.missionTargetFeedForwardAPF
+            if (formation == 'targetNormPoly'):
+                self.GuidLaw.formation = guid.formationTargetNormPolyAPF
+            if (survival == 'groupNormPoly'):
+                self.GuidLaw.survival = guid.survivalGroupNormPolyAPF
         ## Constant Bearing
         elif (law == 'CB'):
             self.GuidLaw = guid.velCB
@@ -2569,8 +2557,9 @@ class Remus100s(AUV):
         # Generate Information Parameters
         self.info.update([("Guidance System", f"Target Tracking, {law}")])
         if (law == 'APF'):
-            self.info.update([("Attraction Function", f"{att}"),
-                              ("Repulsion Function", f"{rep}")])
+            self.info.update([("Mission Function", f"{mission}"),
+                              ("Formation Function", f"{formation}"),
+                              ("Survival Function", f"{survival}")]),
         self.info.update([("Target", f"{self.target.callSign}")])
 
     #--------------------------------------------------------------------------
