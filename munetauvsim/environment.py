@@ -875,9 +875,13 @@ class Ocean:
     ## Special Methods =======================================================#
     def __repr__(self) -> str:
         """Detailed description of Ocean"""
+        
+        geometry = ""
+        if (self.floor is None):
+            geometry = f"size={self.size}, origin={self.origin}, "
         return (
-            f"{self.__class__.__name__}(\n"
-            f"name='{self.name}', "
+            f"{self.__class__.__name__}("
+            f"name='{self.name}', {geometry}"
             f"current={self.current!r}, "
             f"floor={self.floor!r}, "
             f"pollution={self.pollution!r})"
@@ -887,11 +891,18 @@ class Ocean:
     def __str__(self) -> str:
         """User friendly description of Ocean"""
 
-        components = [str(self.current)]
+        cw = 16
+        components = []
+        
         if (self.floor is not None):
-            components.append(str(self.floor))
+            floorStr = str(self.floor)
         else:
-            components.append("Floor            None\n")
+            components.append(f"{'Size:':{cw}} {self.size} m")
+            components.append(f"{'Origin:':{cw}} {self.origin}\n")
+            floorStr = "Floor            None\n"
+
+        components.extend([str(self.current), floorStr])
+
         if (self.pollution is not None):
             components.append(str(self.pollution))
 
