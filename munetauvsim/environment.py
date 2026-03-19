@@ -135,6 +135,8 @@ class Ocean:
         Descriptive name for this ocean environment instance.
     plume : list of float, default=None
         Pollution source location [x, y, z] in meters. z is depth (positive).
+    createFloor : bool, default=True
+        If False, no Floor instance is generated.
     createPlume : bool, default=False
         If True, creates a pollution plume with emission from source location.
     currentSeed : int, optional
@@ -617,30 +619,32 @@ class Ocean:
         --------
         ### Default calm ocean with pollution:
         
-        >>> import munetauvsim.environment as env
-        >>> ocean = env.Ocean(createPlume=True)
-        >>> print(ocean)
-        Ocean: Ocean
-        -------------------------------------
-        Current
-        Speed:       0.275 +/-0.055 m/s (180.0s)
-        Angle:       0.785 +/-0.140 rad (180.0s)
-        Seed:        1234567890
+        .. code-block:: pycon
 
-        Floor
-        Size:        1000 m
-        Origin:      [500, 500]
-        Depth:       125 to 135 m
-        Style:       linear
+            >>> import munetauvsim.environment as env
+            >>> ocean = env.Ocean(createPlume=True)
+            >>> print(ocean)
+            Ocean: Ocean
+            ----------------------------------------
+            Current
+            Speed:       0.275 +/-0.055 m/s (180.0s)
+            Angle:       0.785 +/-0.140 rad (180.0s)
+            Seed:        1234567890
 
-        ... (Perlin noise details)
+            Floor
+            Size:        1000 m
+            Origin:      [500, 500]
+            Depth:       125 to 135 m
+            Style:       linear
 
-        Pollution
-        Source:      (0.00, 0.00, 30.00)
-        Strength:    1.59 g/s
-        Speed:       0.28 m/s at 0.79 rad
-        Seed:        None
-        -------------------------------------
+            ... (Perlin noise details)
+
+            Pollution
+            Source:      (0.00, 0.00, 30.00)
+            Strength:    1.59 g/s
+            Speed:       0.28 m/s at 0.79 rad
+            Seed:        None
+            ----------------------------------------
 
         ### Custom environment:
         
@@ -1339,12 +1343,15 @@ class Current1D:
             This is the central value around which speed oscillates.
             
             **Float**: Exact mean speed in m/s (0.0-2.5).
+
             >>> Current1D(spd=0.75)  # Exactly 0.75 m/s mean
             
             **List [low, high]**: Random selection within range via uniform distribution.
+
             >>> Current1D(spd=[0.5, 1.0])  # Random between 0.5-1.0 m/s
             
             **String categories** (m/s ranges):
+
             - 'dead':          0.0 (no current)
             - 'typical':  0.05-0.5 (coastal/shelf currents)
             - 'moderate': 0.5-1.0  (active shelf/slope)
@@ -1361,12 +1368,15 @@ class Current1D:
             around this value (adds stochastic variation).
             
             **Float**: Exact mean amplitude deviation in m/s (0.0-1.5).
+
             >>> Current1D(spd=1.0, dSpd=0.2)  # Speed varies ~0.8-1.2 m/s
             
             **List [low, high]**: Random mean amplitude deviation from range.
+
             >>> Current1D(dSpd=[0.1, 0.3])
             
             **String categories** (m/s ranges):
+
             - 'constant':      0.0 (no variation, steady speed)
             - 'steady':   0.01-0.1 (gentle fluctuations)
             - 'varied':   0.1-0.5  (moderate variations)
@@ -1382,12 +1392,15 @@ class Current1D:
             Larger values -> slower, smoother variations.
             
             **Float**: Exact half-period in seconds.
+
             >>> Current1D(dtSpd=120.0)  # 2-minute oscillation period
             
             **List [low, high]**: Random selection of period range.
+
             >>> Current1D(dtSpd=[30, 90]) 
             
             **String categories** (second ranges):
+
             - 'calm':       600 (10-minute oscillations, very smooth)
             - 'smooth':  90-150 (1.5-2.5 minutes, gentle)
             - 'regular': 30-90  (0.5-1.5 minutes, typical)
@@ -1399,13 +1412,16 @@ class Current1D:
             This is the central bearing around which direction oscillates.
             
             **Float**: Exact mean direction in radians.
+
             >>> Current1D(ang=np.pi/2)  # North (90 deg)
             >>> Current1D(ang=0)         # East (0 deg)
             
             **List [low, high]**: Random mean direction from range.
+
             >>> Current1D(ang=[0, np.pi/4])  # East to Northeast
             
             **String categories** (radian ranges, +/- pi/8 from center):
+
             - 'east':           0 +/- pi/8 (337.5 deg to  22.5 deg)
             - 'northeast':   pi/4 +/- pi/8 ( 22.5 deg to  67.5 deg)
             - 'north':       pi/2 +/- pi/8 ( 67.5 deg to 112.5 deg)
@@ -1424,12 +1440,15 @@ class Current1D:
             Each half-period samples new amplitude from normal distribution around this value.
             
             **Float**: Exact mean angular deviation in radians (0.0-pi/2).
+
             >>> Current1D(ang=0, dAng=0.2)  # +/- 11.5 deg oscillation
             
             **List [low, high]**: Random mean amplitude selection from range.
+
             >>> Current1D(dAng=[0.1, 0.3])  # +/- 5.7 deg to +/- 17.2 deg
             
             **String categories** (radian ranges):
+
             - 'constant':           0.0 (no directional change)
             - 'steady':     0.1 - pi/18 (+/-  5.7 deg to +/-   10 deg, slight meander)
             - 'varied':   pi/18 - pi/8  (+/-   10 deg to +/- 22.5 deg, moderate swing)
@@ -1443,6 +1462,7 @@ class Current1D:
             Time for one directional oscillation from max to min.
             
             **Float**: Exact half-period in seconds.
+
             >>> Current1D(dtAng=180.0)  # 3-minute direction cycle
             
             **List [low, high]**: Random period range.
@@ -1455,7 +1475,6 @@ class Current1D:
         h : float, default=0.02
             Time step per iteration in seconds.
             Default 0.02s = 50 Hz sampling rate.
-            
             Total simulation time = nIter * h seconds.
             
         seed : int, optional
@@ -1500,6 +1519,7 @@ class Current1D:
         
         2. **Parameter Resolution:**
         For each parameter (spd, dSpd, dtSpd, ang, dAng, dtAng):
+
         a. If string: Look up in category dictionary, select random value in range.
         b. If list [low, high]: Select random value via uniform distribution.
         c. If float: Use value.
@@ -1515,8 +1535,10 @@ class Current1D:
         
         4. **RNG State Capture:**
         Before each time series generation, store RNG state:
+
         - _spd_rng_state: For speed reproducibility
         - _ang_rng_state: For angle reproducibility
+
         Allows resizing/resampling while maintaining pattern.
         
         5. **Time Series Generation:**
@@ -1566,6 +1588,7 @@ class Current1D:
         **Parameter Priority:**
         
         When parameters specified multiple ways:
+
         1. Property setter validation (clipping/wrapping)
         2. User explicit value (if float)
         3. Random from custom range (if list)
@@ -1574,20 +1597,24 @@ class Current1D:
         **Categorical Parameter Philosophy:**
         
         String categories enable quick prototyping without remembering exact numerical ranges:
+
         >>> current = Current1D(spd='moderate', dSpd='steady', ang='north')
         
         For precise control, use floats:
+
         >>> current = Current1D(spd=0.82, dSpd=0.15, ang=np.pi/2)
         
         **Reproducibility:**
         
         Identical seed + parameters -> identical time series:
+
         >>> c1 = Current1D(spd='typical', seed=42)
         >>> c2 = Current1D(spd='typical', seed=42)
         >>> np.array_equal(c1.speed, c2.speed)
         True
         
         But different seeds with same category -> different values:
+
         >>> c3 = Current1D(spd='typical', seed=43)
         >>> c1.v_spd != c3.v_spd  # Different mean selected
         True
@@ -1595,6 +1622,7 @@ class Current1D:
         **Property-Triggered Regeneration:**
         
         Changing n or h after initialization regenerates time series:
+
         >>> current = Current1D(nIter=10000, seed=100)
         >>> current.n = 20000  # Extends to 20000 iterations
         >>> # Uses stored RNG state to maintain pattern continuity
@@ -1602,6 +1630,7 @@ class Current1D:
         **Integration with Ocean:**
         
         Ocean passes categorical or numerical current parameters:
+        
         >>> ocean = Ocean(
         ...     spd='moderate',
         ...     dSpd='steady',
