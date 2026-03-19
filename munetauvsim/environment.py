@@ -322,6 +322,7 @@ class Ocean:
                  h:float = 0.02,
                  name="Ocean",
                  plume:Union[NPFltArr, List[float], None] = None,
+                 createFloor:bool = True,
                  createPlume:bool = False,
                  currentSeed:Optional[int] = None,
                  floorSeed:int = 0,
@@ -376,6 +377,12 @@ class Ocean:
             If None and createPlume=True, uses a default source of [0, 0, 30].
             If not None, creates Pollution regardless of createPlume (backwards
             compatible).
+        createFloor : bool, default=True
+            If True (default), creates a Floor instance with procedural
+            bathymetry from Perlin noise. If False, sets `floor` to None —
+            useful for deep-ocean scenarios or control experiments where
+            terrain is irrelevant. Floor can also be disabled post-construction
+            by setting `ocean.floor = None`.
         createPlume : bool, default=False
             If True, creates a Pollution instance with emission from the
             specified plume source location.
@@ -395,7 +402,7 @@ class Ocean:
             If randomPlume=False, plumeSeed has no effect.
         randomFloor : bool, default=False
             If True, generates random floor seed (ignores floorSeed parameter).
-            Creates unique terrain each run.
+            Creates unique terrain each run. Ignored if createFloor=False.
         randomPlume : bool, default=False
             If True, randomizes pollution u and v parameters.
             Generates random plumeSeed if plumeSeed=None.
@@ -441,10 +448,12 @@ class Ocean:
             Origin coordinates (managed property, updates floor.origin).
         current : Current1D
             Time-varying ocean current instance.
-        floor : Floor
-            Procedurally generated ocean floor instance.
-        pollution : Pollution or None 
-            Gaussian plume pollution instance. None if not requested.
+        floor : Floor or None
+            Procedurally generated ocean floor instance. None if
+            createFloor=False or disabled post-construction.
+        pollution : Pollution or None
+            Gaussian plume pollution instance. None if createPlume = False 
+            (default).
         
         Notes
         -----
@@ -693,22 +702,33 @@ class Ocean:
         self.sampleTime = h
         self.size = size
         self.origin = origin
+
+        # Current1D instance
         self.current = Current1D(nIter=N, h=h, seed=currentSeed, **kwargs)
-        self.floor = Floor(size=size,
-                           origin=origin,
-                           seed=floorSeed,
-                           random=randomFloor, 
-                           **kwargs)
+
+        # Floor instance 
+        if (createFloor):
+            self.floor = Floor(size=size,
+                               origin=origin,
+                               seed=floorSeed,
+                               random=randomFloor,
+                               **kwargs)
+        else:
+            self.floor = None
+
+        # Pollution instance
         if ((plume is not None) or (createPlume)):
             if (plume is None):
                 plume = [0, 0, 30]
 
+            oceanDepth = (self.floor.z if (self.floor is not None)
+                          else kwargs.get('z', 6000))
             self.pollution = Pollution(source=plume,
-                                    u=self.current.v_spd, 
+                                    u=self.current.v_spd,
                                     v=self.current.b_ang,
-                                    oceanSize=size, 
+                                    oceanSize=size,
                                     oceanOrigin=origin,
-                                    oceanDepth=self.floor.z,
+                                    oceanDepth=oceanDepth,
                                     seed=plumeSeed,
                                     random=randomPlume,
                                     **kwargs)
@@ -855,22 +875,23 @@ class Ocean:
     ## Special Methods =======================================================#
     def __repr__(self) -> str:
         """Detailed description of Ocean"""
-        plumeRepr = ""
-        if (self.pollution is not None):
-            plumeRepr = f"\npollution={self.pollution!r}"
-
         return (
             f"{self.__class__.__name__}(\n"
-            f"name='{self.name}'\n"
-            f"current={self.current!r}\n"
-            f"floor={self.floor!r}"
-            f"{plumeRepr})"
+            f"name='{self.name}', "
+            f"current={self.current!r}, "
+            f"floor={self.floor!r}, "
+            f"pollution={self.pollution!r})"
         )
     
     #--------------------------------------------------------------------------
     def __str__(self) -> str:
         """User friendly description of Ocean"""
-        components = [str(self.current), str(self.floor)]
+
+        components = [str(self.current)]
+        if (self.floor is not None):
+            components.append(str(self.floor))
+        else:
+            components.append("Floor            None\n")
         if (self.pollution is not None):
             components.append(str(self.pollution))
 
@@ -3091,7 +3112,7 @@ class Floor:
     def __repr__(self)->str:
         """Detailed description of Floor."""
 
-        perlin = f"{self.perlin!r}" if self._perlin else "None"
+        perlin = f"{self.perlin!r}" if (self._perlin is not None) else "None"
         return (
             f"{self.__class__.__name__}("
             f"z={self.z}, "
@@ -3107,7 +3128,8 @@ class Floor:
         """User friendly description of Floor."""
 
         cw = 16
-        perlin = f"{self.perlin}" if self._perlin else f"{'Perlin':{cw}} None"
+        perlin = (f"{self.perlin}" if (self._perlin is not None) 
+                  else f"{'Perlin':{cw}} None\n")
         return (
             f"Floor\n"
             f"{' Size:':{cw}} {self.size} m\n"
