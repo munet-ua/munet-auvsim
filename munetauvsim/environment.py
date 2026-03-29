@@ -3691,12 +3691,12 @@ class Floor:
 
         # Plot with countour lines
         else:
-            plt.imshow(z.T, extent=extent, origin='lower', 
+            plt.imshow(z, extent=extent, origin='lower',
                        cmap='viridis_r', alpha=0.5)
             plt.colorbar().ax.invert_yaxis()
             x = np.linspace(extent[0], extent[1] - 1, z.shape[1])
             y = np.linspace(extent[2], extent[3] - 1, z.shape[0])
-            contours = plt.contour(x, y, z.T, 10, colors='black', alpha=0.4)
+            contours = plt.contour(x, y, z, 10, colors='black', alpha=0.4)
             plt.clabel(contours, inline=True, fontsize=8, fmt="%.0f")
 
         # Lines at origin
@@ -3712,6 +3712,8 @@ class Floor:
             plt.plot(path.pos.x, path.pos.y, linestyle="dotted", color=plc)
             plt.scatter(path.pos.x, path.pos.y, marker='^', color=pmc, s=64)
 
+        plt.xlabel('X / East (m)')
+        plt.ylabel('Y / North (m)')
         plt.show()
 
     #--------------------------------------------------------------------------
@@ -3740,14 +3742,19 @@ class Floor:
 
         # Plot floor
         # z.shape[1] is 'x' (columns), z.shape[0] is 'y' (rows)
-        x, y = np.meshgrid(np.arange(z.shape[1]),np.arange(z.shape[0]))
+        x_coords = np.arange(z.shape[1]) - self.origin[0]
+        y_coords = np.arange(z.shape[0]) - self.origin[1]
+        x, y = np.meshgrid(x_coords, y_coords)
         fig = plt.figure(figsize=(9,9))
         ax = fig.add_subplot(111, projection='3d')
         ax.set_zlim(-z.max(),0)
         ax.plot_surface(x, y, -z, alpha=0.9, cmap=new_cmap)
-        
+
         # Add water surface
         ax.plot_surface(x, y, 0*z, alpha=0.3, color='blue')
+        ax.set_xlabel('X / East (m)')
+        ax.set_ylabel('Y / North (m)')
+        ax.set_zlabel('Z / Down (m)')
         plt.show()
 
     ## Helper Methods ========================================================#
