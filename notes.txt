@@ -1,0 +1,15 @@
+Completed
+---------------------
+Guidance file rewritten and updated
+Added New variables to vehicle to fill gaps in code
+Simulation & PTS files Done
+Vehicles updated but may need some more rewrite
+Navigation File Rewritten
+Changed How Pollution is stored (Cur pos in eta, cur concentration in concentration)
+
+ToDo
+---------------------
+Add in the rest of the information needed for PSO
+Update the current code to allow for PSO to be selected
+Trace collect data to ensure correct data
+Finish Demo.py

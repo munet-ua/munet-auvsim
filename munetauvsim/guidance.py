@@ -83,6 +83,21 @@ from munetauvsim import logger
 
 #-----------------------------------------------------------------------------#
 
+log = logger.addLog('guid')
+wmax = 0.6 # Inertia Coefficient Max
+wmin = 0.3 # Inertia Coefficient Min
+wz = 0.2 # Inertia Coefficient for Z Axis
+c1max = 1.5 # Max Value for PBest Influence
+c1min = 0.5 # Min Value for PBest Infuence
+c2max = 1.8 # Max Value for GBest Influence
+c2min = 0.2 # Min value for GBest influence
+r1max = 0.6 # Max for Randomized part of PBest
+r1min = 0.4 # Min for Randomized part of PBest
+r2max = 0.9 # Max for Randomized part of GBest
+r2min = 0.4 # Min for Randomized part of GBest
+
+#-----------------------------------------------------------------------------#
+
 # Type Aliases
 NPFltArr = NDArray[np.float64]
 
@@ -2198,3 +2213,230 @@ def targetTrack(vehicle:Vehicle)->NPFltArr:
     return np.array([delta_r, delta_s, n], float)
 
 ###############################################################################
+
+#Adding PSO System from Scratch 1/13/26
+
+def PSOAttraction(vehicle:Vehicle)->NPFltArr:
+    """
+    Returns attraction velocity vector of a vehicle using the Particle Swarm Optimization (PSO) algorithm.
+
+    Parameters
+    ----------
+    vehicle:
+        Vehicle object. Must have the listed vehicle attributes defined.
+    
+    Vehicle Attributes
+    ------------------
+    eta : [x, y, z, phi, theta, psi]
+        Vehicle position / attitude vector
+
+    Returns:
+    --------
+    NPFltArr
+        A NumPy array representing the attraction velocity vector for the vehicle.
+
+    Notes:
+    ------
+    - The PSO algorithm combines inertia, cognitive, and social components to determine the new velocity:
+        1. **Inertia** (w * v): Maintains momentum from the previous velocity.
+        2. **Cognitive Component** (c1 * r1 * (pbest - x)): Guides the vehicle towards its personal best position.
+        3. **Social Component** (c2 * r2 * (gbest - x)): Attracts the vehicle towards the global best position in the swarm.
+    - Coefficients:
+        - c1 (personal learning coefficient): Controls the influence of the personal best position.
+        - c2 (global learning coefficient): Controls the influence of the global best position.
+        - w (inertia coefficient): Balances the trade-off between exploration (high w) and exploitation (low w).
+    - Random coefficients (r1, r2) add stochasticity to prevent premature convergence.
+    --------
+    """
+
+    x = np.copy(vehicle.eta[0:3])          # Vehicle Position Vector
+    v = np.copy(vehicle.velocity[0:3])       # Vehicle Velocity Vector
+
+    r1 = r1min + (r1max - r1min) * np.random.rand(2) # random coefficients (in range [rmin-rmax))
+    r2 = r1min + (r1max - r2min) * np.random.rand(2) # random coefficients (in range [rmin-rmax))
+
+    c1 = (c1max-c1min) * ((np.copy(vehicle.simTime)-vehicle.clock)/np.copy(vehicle.simTime)) + c1min #Calculate C1
+
+    #if found source, or if in bad area compared to others, go to better location
+    if vehicle.gbest[3] > .01 or vehicle.gbest[3] > (np.copy(vehicle.pbest[3]) * 5):
+        c1 = 0 #This makes the vehicles approach more direct to the objective with 5 vehicles, 10 they all piled up
+
+    c2 = (c2min-c2max) * ((np.copy(vehicle.simTime)-vehicle.clock)/(np.copy(vehicle.simTime))) + c2max #Calculate C2
+
+    w = wmax - ((np.copy(vehicle.simTime)-vehicle.clock)/(np.copy(vehicle.simTime))) * (wmax - wmin) #Calculate w
+    #If at the source, slow down motors to preserve energy
+
+    if vehicle.pbest[3] == 0:
+        w = 1
+        c1 = 0
+
+    v[:2] = w*np.copy(v[:2]) + r1*c1*(np.copy(vehicle.pbest[:2])-np.copy(x[:2])) + r2*c2*(np.copy(vehicle.gbest[:2])-np.copy(x[:2]))
+   
+    v[2] = wz*np.copy(v[2]) + c1*(np.copy(vehicle.pbest[2])-np.copy(x[2])) + c2*(np.copy(vehicle.gbest[2])-np.copy(x[2]))
+
+    if vehicle.pbest[3] > 0.01 and vehicle.pbest[3] < 1:
+        v[:3] = v[:3] / 10
+    return v
+
+def PSORep(vehicle:Vehicle, k_rep=80.0)->NPFltArr:
+        """
+        Compute the repulsive Artificial Potential Field (APF) force
+        using inverse sqaure law to avoid collisions.
+
+        Parameters:
+        swarm  : List of SwarmAgent instances (all swarm members).
+        r_s : Safe distance threshold (repulsion activates below this).
+        k_rep  : Repulsion strength constant.
+        Returns:
+        v_r : The total repulsive force as a 3D numpy array.
+        """
+        # Vehicle Parameters
+        p = np.copy(vehicle.eta[:3]) + np.copy(vehicle.velocity[:3])*0.02        # Vehicle Position Vector
+        vehList = vehicle.group         # List of Followers in Group / Swarm
+        r_s = vehicle.r_safe            # Minimum Safe Vehicle Distance
+
+        v_r = np.zeros(3)  # Initialize repulsive force vector
+
+        for member in vehList:
+        # for member in vehicle.group:
+            if (member.id != vehicle.id):
+                p_s = member.eta[:3] + member.velocity[:3]*0.02    # Swarm Group Vehicle Position Vector
+                # Compute distance vector and magnitude
+                dist = p - p_s
+                dist_mag = np.linalg.norm(dist)
+
+                # Apply repulsive force if within the safe zone
+                if 0 < dist_mag < r_s:
+                    unit_vector = dist / dist_mag  # Direction of repulsion
+                    force_magnitude = k_rep #/ (dist_mag ** 2)  # Inverse square law
+                    v_r += force_magnitude * unit_vector  # Accumulate forces
+
+        v_r[2] = 0
+
+        return v_r
+
+###############################################################################
+
+def PSOLaw(vehicle:Vehicle)->NPFltArr:
+    """
+    Guidance law for a vhelicle using PSO. Generates attraction vector using PSO function
+    and repulsion vector using variableExpRepulsionAPF, then adds them together.
+
+    Parameters
+    ----------
+    vehicle:
+        Vehicle object. Must have the following vehicle attributes defined.
+
+    Vehicle Attributes
+    ------------------
+    GuidLaw.attraction:
+        Function used for APF attraction
+    GuidLaw.repulsion:
+        Function used for APF repulsion
+    u_max:
+        Maximum vehicle speed (m/s)  
+    """
+
+    # APF Attraction Velocity
+    v_a = vehicle.GuidLaw.attraction(vehicle)
+    
+    # APF Repulsion Velocity
+    v_r = vehicle.GuidLaw.repulsion(vehicle)
+    # if np.linalg.norm(v_a) == 0:
+    #     print('zeroed')
+    
+    # Total APF
+    v_tot = v_a + v_r
+    if vehicle.pbest[3] > .4: #If high concentration, stop
+        v_tot = [0,0,0]
+
+    # Limit to Maximum Vehicle Speed
+    u_tot = np.linalg.norm(v_tot)
+    u_max = vehicle.u_max
+    if (u_tot > u_max):
+        v_tot = u_max * (v_tot / u_tot)
+    if (u_tot == 0):
+        return np.array([0., 0., 0.])
+    
+    # APF Depth Constraints
+    v_d = depthAPF(vehicle,v_tot)
+
+    # v_d[2] = 0 # limit movement to 2D
+
+    return v_d
+
+def PSOSystem(vehicle:Vehicle)->NPFltArr:
+    """
+    Guidance system for a vehicle utilizing PSO. Calculates
+    desired velocity vectors using PSOLaw guidance law. Returns the
+    stabilizing control commands for rudder, stern, and thrust.
+
+    Parameters
+    ----------
+    vehicle:
+        Vehicle object. Must have the following vehicle attributes defined.
+
+    Vehicle Attributes
+    ------------------
+    GuidLaw:
+        Guidance law  
+    HeadingAP:
+        Heading auto pilot
+    DepthAP:
+        Depth auto pilot
+    xferU2N:
+        Function to convert speed to propeller RPM
+        
+    Notes
+    -----
+    Current development does not include a wave filter, so the vehicle is
+    subject to destabilizing forces due to ocean conditions. See Fossen
+    Handbook Ch.10 & Ch.12 lecture notes.
+    
+    #TODO: Develop a wave filter (Heading/Depth Observer / State Estimator)!
+
+    
+    //JPC 07/2023
+    """
+
+    #Ask about this later 11/13
+    # if vehicle.pbest[3] > 0.01:
+    #     vehicle.loadPathFollowing()
+    #     source = Waypoint(*vehicle.pbest[:3])
+    #     vehicle.wpt = source
+    #     v_d = vehicle.GuidLaw(vehicle, vehicle.eta, *source)
+        
+
+    # Desired Velocity Vector
+    v_d = vehicle.GuidLaw(vehicle)
+    u_d = np.linalg.norm(v_d)
+    if u_d == 0:  # If zero, opposite of current velocity to stop
+        return -vehicle.velocity
+
+    # Heading Command
+    """
+    Chi is a course angle, not a heading angle (psi). I will try feeding it 
+    into the existing algorithms, ie the heading autopilot.
+    """
+    #-------------------------------
+    chi = np.arctan2(v_d[1],v_d[0])     # This part needs a state estimator to
+    vehicle.psi_d  = chi                # filter environmental forces
+    #-------------------------------
+    delta_r = vehicle.HeadingAP(vehicle)
+
+    # Pitch Command
+    """
+    I'll try a simple approach and let the pitch angle be determined by the
+    angle from the vector components.
+    """
+    #-----------------------------------------------
+    theta = np.arcsin(-v_d[2]/u_d) if u_d !=0 else 0    # Needs state estimator
+    vehicle.theta_d = theta                             # included here
+    #-----------------------------------------------
+    delta_s = vehicle.DepthAP(vehicle)
+
+    # Propeller Command
+    n = vehicle.xferU2N(u_d)
+
+    return np.array([delta_r, delta_s, n], float)
+###################################################################

@@ -37,6 +37,9 @@ swarm = mn.vehicles.buildGroup(                # build swarm vehicles
     hasLeader=True                             # first vehicle is leader
 )
 
+for veh in swarm['vehicles']:
+        veh.simTime = sim.runTime
+
 # Leader AUV
 leader = swarm[0]                              # handle to leader vehicle
 leader.wpt = path                              # load path waypoints

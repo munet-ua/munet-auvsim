@@ -790,7 +790,7 @@ def demoPSO() -> None:
     vehicles = mn.vehicles.buildGroup(
         num = nVehicles,
         gid = gid,
-        hasLeader = False,
+        hasLeader = True,
         r_follow = r_follow,
         r_avoid = r_avoid,
         r_safe = r_safe,
@@ -814,7 +814,7 @@ def demoPSO() -> None:
     size = int(input("Size of Ocean (1k-20k) [3k]: ").strip() or 3000)
     size = max(1000, min(size, 20000))
 
-    ocean = mn.environment.Ocean.calm_ocean(size=size, origin=[0,0], randomFloor=True, plume=[0,0,30])
+    ocean = mn.environment.Ocean.calm_ocean(size=size, origin=[0,0], randomFloor=False, plume=[0,0,30], currentSeed = 250175372317383600117019498500246614406, floorSeed = 66293269997582554555345002633626320062, plumeSeed = 88277468899969806834409437733943819879)
     print("> Created calm ocean environment")
 
     l.warning("%s", ocean.pollution)
@@ -934,7 +934,7 @@ def demoPSO() -> None:
                 commChoice = 'm'
         
         if commChoice == 'm':
-            sim.loadMuNet(berType = "off")
+            sim.loadMuNet()
 
         # Run simulation
         sim.run()

@@ -389,6 +389,7 @@ NPFltArr = NDArray[np.float64]
 
 # Global Variables
 log = logger.setupComm(file=False)
+check = logger.addLog("Debug")
 
 ###############################################################################
 
@@ -3964,6 +3965,7 @@ def getMsgStruct(msgType:str)->cst.Struct:
     intType = cst.Int32ul                   # standard integer
     chrType = cst.Bytes(1)                  # b'', single character
     flgType = cst.Bytes(4)                  # b'', four characters
+    bestFltType = fltType[4]
 
     # Define Message Structures
     # REPORT  ::  37 bytes (as of 05/01/2024)
@@ -3974,6 +3976,7 @@ def getMsgStruct(msgType:str)->cst.Struct:
         "reporter_pos"      / arrFltType,
         "reporter_vel"      / arrFltType,
         "time_stamp"        / fltType,
+        "gbest"             / bestFltType,
     )
 
     # LEADER REPORT :: 57 bytes (as if 05/01/2024)
@@ -3985,6 +3988,7 @@ def getMsgStruct(msgType:str)->cst.Struct:
         "leader_next_pos"   / arrFltType,
         "leader_next_vel"   / arrFltType,
         "time_stamp"        / fltType,
+        "gbest"             / bestFltType,
     )
 
     # BROADCAST / REQUEST  ::  353 bytes with 9 Followers (as of 05/01/2024)
@@ -4208,7 +4212,7 @@ def writeReport(vehicle:Vehicle, msgType:str='REPORT')->bytes:
     Type flag enables receivers to distinguish message context but both
     parsed identically by recvReport().
     
-    **Message Payload (37 bytes):**
+    **Message Payload (53 bytes):**
 
     Uses getMsgStruct('RPRT') for message format. Contains:
 
@@ -4221,6 +4225,7 @@ def writeReport(vehicle:Vehicle, msgType:str='REPORT')->bytes:
             'reporter_pos': [x,y,z],         # 12 bytes (3x float32)
             'reporter_vel': [vx,vy,vz],      # 12 bytes (3x float32)
             'time_stamp': float,             # 4 bytes
+            'gbest': [px, py, pz, con]       # 16 bytes (4x float32)
         }
     """
 
@@ -4231,6 +4236,10 @@ def writeReport(vehicle:Vehicle, msgType:str='REPORT')->bytes:
         'RESPONSE': b'RSPN',
     }
     
+    if vehicle.gbest[3] > 1:
+            check.warning("%s: Gbest in message send over 1", vehicle.id)
+
+
     # Build Message
     rprt = getMsgStruct(msgType)
     flag = msgFlags.get(msgType.upper(), b'RPRT')
@@ -4240,6 +4249,7 @@ def writeReport(vehicle:Vehicle, msgType:str='REPORT')->bytes:
                               reporter_pos  = vehicle.eta[:3].tolist(),
                               reporter_vel  = vehicle.velocity[:3].tolist(),
                               time_stamp    = vehicle.clock,
+                              gbest         = vehicle.gbest[:4].tolist(),
                               ))
     
     return rprtMsg
@@ -4296,7 +4306,7 @@ def sendReport(vehicle:Vehicle,
     Type flag enables receivers to distinguish message context but both
     parsed identically by recvReport().
     
-    **Message Payload (37 bytes):**
+    **Message Payload (53 bytes):**
 
     .. code-block:: none
 
@@ -4307,6 +4317,7 @@ def sendReport(vehicle:Vehicle,
             'reporter_pos': [x,y,z],         # 12 bytes (3x float32)
             'reporter_vel': [vx,vy,vz],      # 12 bytes (3x float32)
             'time_stamp': float,             # 4 bytes
+            'gbest': [px,py,pz,con]          # 16 bytes (4x float32)
         }
     """
     
@@ -4356,7 +4367,8 @@ def recvReport(vehicle:Vehicle, bytesMsg:bytes)->None:
         - time_stamp                     # Last message time
         - rprtRecv = True                # Flag: report received from this cycle
         - writeEtaVelLogs(reporter)      # Append to position/velocity log
-    
+        - gbest                          #Reporter GBest
+
     **Field Validation Sequence:**
     
     Each individual message field is checked for data corruption via
@@ -4380,7 +4392,7 @@ def recvReport(vehicle:Vehicle, bytesMsg:bytes)->None:
     6. Validate reporter_pos, reporter_vel, time_stamp
     7. Update internal data model of group member if all validations pass
     """
-    
+
     try:
         # Unpack Message
         rprt = getMsgStruct('RPRT')
@@ -4411,6 +4423,18 @@ def recvReport(vehicle:Vehicle, bytesMsg:bytes)->None:
         if (vehicle.groupId != group_id):
             log.warning('%s: SKIP %s - NOT IN GROUP', vehicle.callSign, title)
             return
+        
+        msggbest = np.copy(msg.gbest[:4])
+        if (dataIsCorrupted(msggbest[:4], 'gbest')):
+            log.warning('%s: %s - CORRUPT DATA: GBEST',
+                                    vehicle.callSign, title)
+            time_stamp, ok = restoreCorrupt(vehicle, 
+                                            'gbest', 
+                                            msggbest[:4], 
+                                            id=reporter_id)
+            return
+        if (msggbest[3] > vehicle.gbest[3]):
+            vehicle.gbest[:4] = np.copy(msggbest[:4])
 
         # Find Message Sender in Group List
         isSenderFound = False
@@ -4448,11 +4472,24 @@ def recvReport(vehicle:Vehicle, bytesMsg:bytes)->None:
                                                         id=reporter_id)
                         if (not ok):
                             return
-
+                    msggbest = np.copy(msg.gbest[:4])
+                    if (dataIsCorrupted(msggbest[:4], 'gbest')):
+                        log.warning('%s: %s - CORRUPT DATA: GBEST',
+                                    vehicle.callSign, title)
+                        time_stamp, ok = restoreCorrupt(vehicle, 
+                                                        'gbest', 
+                                                        msggbest[:4], 
+                                                        id=reporter_id)
+                        if (not ok):
+                            return
+                        
                     # Update Data
                     m.eta = reporter_pos
                     m.velocity = reporter_vel
                     m.timeLastMsg = time_stamp
+                    if msggbest[3] > vehicle.gbest[3]:
+                        if vehicle.pbest[3] < msggbest[3]:
+                            vehicle.gbest[:4] = np.copy(msggbest[:4])
                     writeEtaVelLogs(m)
                     # Mark 'RPRT Received' flag to 'Yes'
                     m.rprtRecv = True
@@ -4510,6 +4547,7 @@ def writeLeaderReport(vehicle:Vehicle)->bytes:
             'leader_next_pos': [x,y,z],      # 12 bytes
             'leader_next_vel': [vx,vy,vz],   # 12 bytes
             'time_stamp': float,             # 4 bytes
+            'gbest': [px,py,pz,con]          # 16 bytes (4x float32)
         }
 
     **Next Waypoint Prediction:**
@@ -4530,6 +4568,7 @@ def writeLeaderReport(vehicle:Vehicle)->bytes:
                               leader_next_pos = vehicle.nextEta[:3].tolist(),
                               leader_next_vel = vehicle.nextVel[:3].tolist(),
                               time_stamp      = vehicle.clock,
+                              gbest           = vehicle.gbest[:4].tolist(),
                               ))
 
     return lrptMsg
@@ -4579,6 +4618,7 @@ def sendLeaderReport(vehicle:Vehicle)->None:
             'leader_next_pos': [x,y,z],      # 12 bytes
             'leader_next_vel': [vx,vy,vz],   # 12 bytes
             'time_stamp': float,             # 4 bytes
+            'gbest': [px,py,pz,con]          # 16 bytes (4x float32)
         }
     
     **Next Waypoint Prediction:**
@@ -4725,6 +4765,17 @@ def recvLeaderReport(vehicle:Vehicle, bytesMsg:bytes)->None:
                                                 time_stamp, isLeader=True)
                 if (not ok):
                     return
+                
+            msggbest = np.copy(msg.gbest[:4])
+            if (dataIsCorrupted(msggbest[:4], 'gbest')):
+                log.warning('%s: %s - CORRUPT DATA: GBEST',
+                                vehicle.callSign, title)
+                time_stamp, ok = restoreCorrupt(vehicle, 
+                                                        'gbest', 
+                                                        msggbest[:4], 
+                                                        isLeader=True)
+                if (not ok):
+                    return
 
             # Update Target Data
             vehicle.target.eta      = leader_pos
@@ -4733,6 +4784,10 @@ def recvLeaderReport(vehicle:Vehicle, bytesMsg:bytes)->None:
             vehicle.target.nextVel  = leader_next_vel
             vehicle.target.timeLastMsg = time_stamp
             vehicle.target.delayLastMsg = vehicle.clock - time_stamp
+            
+            if msggbest[3] > vehicle.gbest[3]:
+                if vehicle.pbest[3] < msggbest[3]:
+                    vehicle.gbest[:4] = np.copy(msggbest[:4])
             writeEtaVelLogs(vehicle.target)
 
         except (ValueError, TypeError) as e:
@@ -5774,6 +5829,16 @@ def dataIsCorrupted(data:Any, expType:str, **kwargs)->bool:
             history."""
             val = float(data)
             return (not (np.isfinite(val) and val >= 0 and val < 1e6))
+        elif (expType == 'gbest'):
+            try:
+                arr = np.array(data, dtype=np.float32)
+                if arr[3] > 0.2:
+                    check.warning("Over 0.2 concentration")
+                    return True
+                return ((not np.all(np.isfinite(arr))) or
+                        (np.any(np.abs(arr)) > 1E5))
+            except (ValueError, TypeError):
+                return True
         
     except Exception:
         return True

@@ -47,6 +47,8 @@ from munetauvsim import logger
 # Type Aliases
 NPFltArr = NDArray[np.float64]
 
+check = logger.addLog("Debug")
+
 ###############################################################################
 
 class Simulator:
@@ -976,7 +978,8 @@ class Simulator:
         #                        self.vehicles[i],
         #                        i*2+2)
         
-        self.plot3D()
+        #self.plot3D() Checking to see if this prevents the crashes 2/10/26 BBolding
+        self.plot2D()
 
         endTotal = round(time.time()-start)
         endPlot = round(endTotal - endData)
@@ -1102,7 +1105,58 @@ class Simulator:
                      showFloor=showFloor)
         plt.show()
         plt.close()
+    #--------------------------------------------------------------------------
+    def plot2D(self,
+               numDataPoints:Optional[int]=None,
+               FPS:Optional[int]=None,
+               gifFile:Optional[str]=None,
+               vehicles:Optional[List[veh.Vehicle]]=None,
+               figNo:Optional[int]=None,
+               traj:Optional[bool]=True,
+               pos:Optional[bool]=True,
+               waypts:Optional[bool]=False,
+               )->None:
+        """
+        Plot the simulation data in a 2D plot window and create an animated gif
+        of the simulation.
 
+        Basic wrapper for the plotTimeSeries.plot2D() function. Parameters are
+        described there.
+
+        #TODO: Ability to specify plotting for specific vehicles only
+
+
+        //JPC 07/2024
+        """
+        
+        if (numDataPoints is None):
+            numDataPoints = self.numDataPoints
+        if (FPS is None):
+            FPS = self.FPS
+        if (gifFile is None):
+            baseName = f"{self.name}_{self.initTime}_2D"  # Base name still includes '_2D'
+            outDirBase = f"{self.name}_{self.initTime}"  # Directory name excludes '_2D'
+            outDir = self._makeSaveDir(outDirBase)  # Pass the modified directory name
+            saveFile = os.path.join(outDir, baseName)  # File name still uses '_2D'
+            gifFile = f"{saveFile}.gif"  # GIF file retains '_2D'
+        if (vehicles is None):
+            vehicles = self.vehicles
+        if (figNo is None):
+            figNo = len(self.vehicles)*2 + 1
+        
+        pltTS.plot2D(self.simData,
+                     self.ocean.size,
+                     numDataPoints,
+                     FPS,
+                     gifFile,
+                     vehicles,
+                     figNo,
+                     traj=traj,
+                     pos=pos,
+                     waypts=waypts,
+                     pollution=self.ocean.pollution)
+        plt.show()
+        plt.close()
     #--------------------------------------------------------------------------
     def deployAtWpt(self, vehicle:veh.Vehicle, posOnly:bool=False)->None:
         """
@@ -1200,6 +1254,34 @@ class Simulator:
                 pass
 
     #--------------------------------------------------------------------------
+    def deployAtOrigin(self, vehicle:veh.Vehicle, depth:int, posOnly:bool=False)->None:
+        # Set Vehicle State Parameters
+        vehicle.eta[0:3] = [0,0,depth]
+        vehicle.z_f = vehicle.eta[2]
+        
+        # # Set Vehicle Attitude Parameters
+        # ## For now, only adjusting Yaw
+        # if (not posOnly):
+        #     idx = vehicle.wpt_k
+        #     if (idx > len(vehicle.wpt)-1):
+        #         idx -= 1
+        #     vehicle.eta[5] = vehicle.wpt.calcWptHeading(idx)
+        #     vehicle.psi_f = vehicle.eta[5]
+
+    def deployAtPoint(self, vehicle:veh.Vehicle, x:int, y:int, z:int, posOnly:bool=False)->None:
+        # Set Vehicle State Parameters
+        vehicle.eta[0:3] = [x,y,z]
+        vehicle.z_f = vehicle.eta[2]
+        
+        # Set Vehicle Attitude Parameters
+        ## For now, only adjusting Yaw
+        if (not posOnly):
+            idx = vehicle.wpt_k
+            if (idx > len(vehicle.wpt)-1):
+                idx -= 1
+            vehicle.eta[5] = vehicle.wpt.calcWptHeading(idx)
+            vehicle.psi_f = vehicle.eta[5]
+    #--------------------------------------------------------------------------
     def linkSwarmGroup(self)->None:
         """
         Link swarm group members on each vehicle for coordination.
@@ -1257,7 +1339,7 @@ class Simulator:
     #--------------------------------------------------------------------------
     def loadMuNet(self,
                   network:Optional[comm.MuNet]=None,
-                  episode:float=5.0,
+                  episode:float=20.0, #Conlan Slowed this to 20
                   txOffset:float=0.5,
                   vehicles:Optional[List[veh.Vehicle]]=None,
                   **kwargs,
@@ -1616,8 +1698,25 @@ class Simulator:
                 # Clock
                 v.clock = currentTime
 
+                if self.simTime[i][0] % 250 == 0:
+                    v.broadcastPosition()
+
                 # Collect Sensor Data
-                v.collectSensorData(self.ocean,i)
+                v.collectSensorData(self.ocean,self.vehicles,i)
+
+                if v.concentration > 0.01 and v.pbest[3] <= 0.01:
+                    v.findSource = v.clock #if found the source for the first time, mark it
+
+                if v.concentration > v.pbest[3]:
+                    v.pbest[0:3] = v.eta[0:3]
+                    v.pbest[3] = v.concentration
+                if v.concentration > v.gbest[3]:
+                    v.gbest[0:3] = v.eta[0:3]
+                    v.gbest[3] = v.concentration
+                    for veh in self.vehicles:
+                        if veh != v:
+                            veh.gbest[0:3] = v.eta[0:3]
+                            veh.gbest[3] = v.concentration
                 
                 # Compute Control Commands
                 u_control = v.GuidSystem(v)
@@ -1631,7 +1730,7 @@ class Simulator:
                 v.eta, v.velocity = v.Attitude(v)
             
             # Monitor vehicle contact
-            self.monitorContact()
+            #self.monitorContact() //Reduce clutter for large simulations
     
     #--------------------------------------------------------------------------
     def _simulateMuNet(self, simData:NPFltArr)->None:
@@ -1665,7 +1764,7 @@ class Simulator:
             # Simulation time
             currentTime = self.simTime[i][0]
             logger.simTime = f'{currentTime:.2f}'
-
+            
             # Advance Vehicles
             for j in range(self.nVeh):
                 v = self.vehicles[j]
@@ -1673,11 +1772,29 @@ class Simulator:
                 # Clock
                 v.clock = currentTime
 
+                if self.simTime[i][0] % 250 == 0:
+                    v.broadcastPosition()
+
                 # Transmit According to Communication Schedule
                 v.CommSched(v)
 
                 # Collect Sensor Data
-                v.collectSensorData(self.ocean,i)
+                v.collectSensorData(self.ocean,self.vehicles,i)
+
+                if v.concentration > 0.01 and v.pbest[3] <= 0.01:
+                    v.findSource = v.clock #if found the source for the first time, mark it
+                
+                if v.concentration > 0.01:
+                    check.warning('%s, CONCENTRATION OVER Normal, either source or BUG', v.concentration)
+
+                if v.concentration > v.pbest[3]:
+                    v.pbest[0:3] = v.eta[0:3]
+                    v.pbest[3] = np.copy(v.concentration)
+                if v.concentration > v.gbest[3]:
+                    v.gbest[0:3] = v.eta[0:3]
+                    v.gbest[3] = np.copy(v.concentration)
+                    if v.gbest[3] > 1:
+                        check.warning('%s, CONCENTRATION OVER Normal, either source or BUG (v.gbest)', v.concentration)
                 
                 # Compute Control Commands
                 u_control = v.GuidSystem(v)
@@ -1744,7 +1861,7 @@ class Simulator:
                 v.CommSched(v)
 
                 # Collect Sensor Data
-                v.collectSensorData(self.ocean,i)
+                v.collectSensorData(self.ocean,self.vehicles,i)
                 
                 # Compute Control Commands
                 u_control = v.GuidSystem(v)

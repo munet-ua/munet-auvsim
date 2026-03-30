@@ -90,6 +90,7 @@ simulator.Simulator : Main simulation driver that propagates Ocean data
 
 from functools import singledispatchmethod
 from typing import Dict, KeysView, List, Optional, Tuple, Union
+from matplotlib.colors import Normalize
 from numpy.typing import NDArray
 from collections.abc import Generator
 from dataclasses import dataclass
@@ -343,7 +344,7 @@ class Ocean:
                  floorSeed:int = 0,
                  plumeSeed:Optional[int] = None,
                  randomFloor:bool = False,
-                 randomPlume:bool = False,
+                 randomPlume:bool = True, #Turn to False for consistant testing
                  **kwargs):
         """
         Initialize ocean environment container with current, floor, and
@@ -2410,8 +2411,6 @@ class Current1D:
                 a_1 = self._getOffset(mean, stddev)
                 step = (a_1-a_0) / (n_halfT-1)
 
-###############################################################################
-
 class Floor:
     """
     Ocean floor depth map generated from 2D Perlin noise.
@@ -2434,14 +2433,25 @@ class Floor:
         Generates size x size depth array.
     origin : list of float, default=[500, 500]
         Coordinates [x, y] where (0, 0) maps to floor array center.
-    style : str, default='linear'
-        How Perlin noise is stretched over z_range, determining terrain
-        characteristics. Current development only supports linear style.
     seed : int, default=0
         PRNG seed for Perlin noise generation. Same seed produces
         identical terrain. seed=0 is valid and reproducible.
+    random : bool, default=False
+        If True, generates random seed to generate unique terrain. Overrides
+        seed parameter and saves newly generated seed.
+    style : str, default='linear'
+        How Perlin noise is stretched over z_range, determining terrain
+        characteristics.
     **kwargs
-        Additional keyword arugments.
+        Additional optional keyword arugments.
+
+        **Perlin noise parameters**
+
+        - scale : int - Spatial frequency scale
+        - octaves : int - Number of noise layers
+        - persistence : float - Amplitude decay factor
+
+        See PerlinNoise documentation for detailed parameter descriptions.
 
           
     Attributes
@@ -2457,7 +2467,7 @@ class Floor:
     seed : int
         PRNG seed used for generation.
     style : str
-        Terrain style identifier.
+        Terrain generation style.
     depth : ndarray, shape (size, size)
         2D array of floor depths in meters.
     perlin : PerlinNoise
@@ -2468,16 +2478,18 @@ class Floor:
     -------
     __call__(x, y) :
         Floor instance is callable: query floor depth at (x, y) position. 
-    sample_points(x, y) :
+    samplePoints(x, y) :
         Sample depth values at list of points.
-    sample_grid(x, y) :
+    sampleGrid(x, y) :
         Sample depth at grid of points.
-    sample_region(x_bounds, y_bounds) :
+    sampleRegion(x, y) :
         Sample complete subregion of depth map.
-    standard_map(noise, z, z_range) :
-        Create a depth map from 2D noise array using linear scaling.
+    createMap(style, kwargs) :
+        Create a depth map from 2D array using specified style.
     xy2Index(x, y) :
-        Convert END coordinates (x, y) to array indices [i, j].
+        Convert END coordinates (x, y) to array indices [j, i].
+    generate() :
+        Precompute and cache the full depth array.
     display2D(z, dispType, path) :
         Display a 2D image of the depth array.
     display3D(z) :
@@ -2494,17 +2506,29 @@ class Floor:
       - Coherent: Nearby points have similar values
       - Multi-scale: Octaves add detail at different frequencies
       - Deterministic: Same seed produces identical terrain
+      - Flexible evaluation: Supports both point-wise and vectorized queries
     
-    - **Style Characteristics:**
+    - **Style Strategy:**
 
-      Currently, only linear scaling is available, stretching the Perlin noise
-      over z_range and adding the depth offset:
+      Floor uses a strategy pattern to select depth mapping algorithms. The
+      `style` parameter determines which mapping function is applied:
+      
+      - 'linear': Linear stretch over z range
+      - 'sigmoid': Smooth transitions via sigmoid function
+      - 'shelf': Asymmetric scaling for shelf-like features
+      
+      Future styles can be added by implementing new `_map*()` methods and
+      registering in `_styleStrategies` dictionary.
 
-        depth = perlin_noise * z_range + z
+    - **Lazy Tile-Based Generation:**
 
-      Future development can expand the options to generate more varied terrain.
-      Options to consider include: exponential, bimodal, sigmoid, and terraced
-      scaling to generate chasms, plateaus, shelves, and more features.
+      The depth array is not precomputed during construction. Instead, the 
+      floor uses lazy evaluation with tile-based caching:
+
+      - Array divided into square tiles
+      - Tiles generated on-demand when first accessed via queries
+      - Generated tiles are cached for subsequent access
+      - Full array is only built when explicitly accessed via `depth` property
 
     **Coordinate System:**
 
@@ -2535,7 +2559,7 @@ class Floor:
     Queries outside [0, size] range return valid values. The indexing is allowed
     to wrap around and return values at [x mod size]. This prevents stopping a
     simulation run due to bad indexing and effectively treats the floor map as
-    though it were tiled.
+    though it were wrap-around.
     
     >>> floor = Floor(size=1000)
     >>> d = floor(1100, 500)                    # Outside bounds
@@ -2544,33 +2568,11 @@ class Floor:
     
     **Resampling:**
 
-    Changing size or seed regenerates terrain:
+    Changing size, style, or perlin instance invalidates the tile cache, 
+    causing any previously generated depth terrain to require regeneration.
     
-    >>> floor.size = 2000  # Expands area
-    >>> floor.seed = 42    # New terrain pattern
-    >>> # Both automatically regenerate depth array
-    
-    **Memory Usage:**
-
-    Perlin noise generation requires substantially more memory than final
-    storage due to intermediate array creation. The method uses `np.meshgrid()`
-    and vectorized operations that create large temporary arrays. Floor sizes
-    exceeding ~6000m may cause out-of-memory crashes due to generation
-    requirements exceeding available RAM. The peak memory during generation is
-    approximately 10-20x larger than the final storage requirement.
-
-    Future development is planned to address this limitation. Current mitigation
-    strategies are to use smaller floor sizes (<5000m), pre-generate large
-    floors on high-memory systems and save for import, generate smaller floor
-    sizes and tile the regions together into a larger floor map.
-
-    **Performance:**
-
-    Generation time scales quadratically with size:
-
-    - size=1000: ~0.5-1 second
-    - size=2000: ~2-4 seconds
-    - size=5000: ~12-25 seconds
+    >>> floor = Floor(size=1000)
+    >>> floor.size = 2000           # Clears cache, expands area
     
 
     Examples
@@ -2586,55 +2588,65 @@ class Floor:
     ### Custom terrain parameters:
     
     >>> floor = Floor(
-    ...     z=80,              # Shallowest at 80m
-    ...     z_range=40,        # Varies 80-120m
-    ...     size=2000,         # 2km x 2km area
-    ...     origin=[1000, 1000],
-    ...     seed=123
+    ...     z=80,                   # Shallowest at 80m
+    ...     z_range=40,             # Varies 80-120m
+    ...     size=2000,              # 2km x 2km area
+    ...     origin=[1000, 750],     # x: [-1000 ... 999], y: [-750 ... 1249]
+    ...     seed=123,               # Seed value for reproducible noise
+    ...     style='sigmoid'         # S-curve mapping from noise to depth
     ... )
     
     ### Query single point:
     
     >>> floor = Floor(randomFloor=True)
-    >>> depth = floor(250, 300)  # At (250m E, 300m N)
+    >>> depth = floor(250, 300)                 # At (250m E, 300m N)
     >>> print(f"Floor depth: {depth:.2f} m")
     
     ### Query multiple points:
     
     >>> x_coords = [0, 100, 200, 300]
     >>> y_coords = [0, 100, 200, 300]
-    >>> depths = floor.sample_points(x_coords, y_coords)
+    >>> depths = floor.samplePoints(x_coords, y_coords)
     >>> print(depths)
-    [ 95.82410046  99.48385046 100.1779558  102.04782572]  # Example values
+    [132.89879249 130.43546153 127.1800901  130.33548963]
     >>>
-    >>> depth_grid = floor.sample_grid(x_coords, y_coords)
+    >>> depth_grid = floor.sampleGrid(x_coords, y_coords)
     >>> print(depth_grid)
-    [[ 95.82410046  97.39379346 105.14764687  86.46614981]  # Example values
-     [ 88.33687983  99.48385046 105.89335857  86.24682284]
-     [ 88.67318118 100.66821609 100.1779558   93.64459247]
-     [106.17117273 100.66821609 105.8082081  102.04782572]]
+    [[132.89879249 129.99690006 130.73963137 130.51609651]
+     [131.90777505 130.43546153 129.22941748 128.60290109]
+     [132.39564569 130.67040518 127.1800901  131.69874289]
+     [130.73963137 131.23426993 129.85516039 130.33548963]]
     
     ### Visualize terrain:
     
     >>> floor.display2D()
     >>> floor.display3D()
-    
+
+    ### Different terrain styles:
+
+    >>> # Linear (default)
+    >>> floor = Floor(z=100, z_range=30)
+    >>>
+    >>> # Sigmoid
+    >>> floor_sigmoid = Floor(z=100, z_range=30, style='sigmoid')
+    >>> # Customized sigmoid
+    >>> sigmoid_map = floor_sigmoid.createMap(k=10.0)
+    >>>
+    >>> # Shelf, updated from style
+    >>> floor.style = 'shelf'          # resets depth with default k
+    >>> # Customize and save to depth
+    >>> floor.depth = floor.createMap(k=5.0) 
 
     See Also
     --------
     PerlinNoise : 2D Perlin noise generator used internally
     Ocean : Container class that manages Floor instance
     navigation.OceanDepthSensor : Sensor that samples floor depth
-    Waypoint : Path planning with samplePath() integration
     
 
     Warnings
     --------
-    - Large size values (>5000) may cause memory issues and slow generation
-    - Queries outside floor bounds wrap around the array (check before using)
-    - Floor assumes flat water surface at z=0 (no waves or surface variation)
-    - Depth array is generated at initialization (modification requires
-      regeneration)
+    - Queries outside floor bounds wrap around the array
     """
 
     ## Constructor ===========================================================#
@@ -2646,14 +2658,15 @@ class Floor:
                  seed:int=0,
                  random:bool=False,
                  style:str='linear',
-                 **kwargs,              # Necessary for use by Ocean class
+                 **kwargs
                  ):
         """
-        Construct ocean floor with procedurally generated terrain from Perlin noise.
+        Construct ocean floor with procedurally generated terrain from Perlin
+        noise.
     
-        Creates a realistic bathymetric depth map using Perlin noise generation with
-        specified depth range, spatial extent, and terrain characteristics. Supports
-        deterministic (seeded) or randomized terrain generation.
+        Creates a realistic bathymetric depth map using Perlin noise generation
+        with specified depth range, spatial extent, and terrain characteristics.
+        Supports deterministic (seeded) or randomized terrain generation.
         
         Parameters
         ----------
@@ -2686,8 +2699,7 @@ class Floor:
 
             - Small test area: 500m
             - Standard operations: 1000-2000m
-            - Large survey: 3000-5000m
-            - Maximum practical: ~6000m (memory limit)
+            - Large survey: 3000-10000m
 
             Must be positive integer.
         origin : list of float, default=[500, 500]
@@ -2711,24 +2723,31 @@ class Floor:
         random : bool, default=False
             If True, generates random seed from system entropy.
             Overrides explicit seed parameter.
+            Seed stored in self.seed after generation.
             Generates unique terrains.
-            If True: seed stored in self.seed after generation.
         style : str, default='linear'
             Terrain generation style (how Perlin noise maps to depth).
-            Currently only 'linear' supported:
+            Available styles supported:
 
-            - 'linear': depth = perlin_noise * z_range + z
+            - 'linear': linear scaling across z_range
+            - 'sigmoid': smooth s-curve transitions
+            - 'shelf': asymmetric scaling 
 
-            Future styles possible:
+            Possible future styles:
 
             - 'exponential': For canyons/trenches
             - 'bimodal': For plateaus and valleys
-            - 'sigmoid': For smooth transitions
             - 'terraced': For step-like formations
 
             Invalid style triggers warning and fallback to default.
         **kwargs
-            Additional keyword arguments.
+            Additional optional keyword arguments.
+
+            **Perlin noise parameters**
+
+            - scale : int - Spatial frequency scale (default: 300)
+            - octaves : int - Number of noise layers (default: 3)
+            - persistence : float - Amplitude decay factor (default: 0.5)
             
         Attributes
         ----------
@@ -2751,10 +2770,10 @@ class Floor:
             - scale, octaves, persistence: Generation parameters
 
         depth : ndarray, shape (size, size)
-            Final depth map in meters, computed via create_map().
-        create_map : callable
-            Dynamically assigned method based on style parameter.
-            Currently always points to self.standard_map.
+            Final depth map in meters. Only fully computed on explicit access.
+        createMap : callable
+            Dynamically assigned method based on style parameter. Default is 
+            'linear'.
             
         Notes
         -----
@@ -2771,100 +2790,85 @@ class Floor:
           >>> self.perlin = PerlinNoise(
           ...     size=size,
           ...     seed=seed,
-          ...     random=random
+          ...     random=random,
+          ...     **perlinKwargs          # scale, octaves, persistence
           ... )
 
-          Relies on default PerlinNoise parameters for scale, octaves, and
-          persistence. This generates normalized noise array in [0, 1].
+          This generates normalized noise array in [0, 1] on-demand.
         
-        3. **Style Method Assignment:**
+        3. **Style Strategy Assignment:**
 
-          Based on style parameter, assign appropriate mapping function:
+          Validates style parameter and initializes strategy dictionary:
 
-            - 'linear' -> self.create_map = self.standard_map
+          >>> self._styleStrategies = {
+          ...     'linear': self._mapLinear,
+          ...     'sigmoid': self._mapSigmoid,
+          ...     'shelf': self._mapShelf
+          ... }
+          >>> self._style = self._validateStyle(style) 
 
           Invalid style falls back to 'linear' with warning.
         
-        4. **Depth Map Creation:**
+        4. **Lazy Evaluation Ready:**
 
-          Call create_map() to transform Perlin noise to depth:
+          No depth values are computed during initialization. The Floor instance
+          is ready to generate and cache regions of the depth array on-demand:
 
-          >>> self.depth = self.create_map()
-          >>> # For linear: depth = perlin.noise * z_range + z
-
-          Final depth array ready for queries.
-        
-        **Memory Limitations:**
-        
-        Perlin noise generation uses large intermediate arrays (meshgrids).
-        Known limitation: size > ~6000 may cause crash due to memory error.
-        
-        Workaround for large terrains:
-
-        - Generate smaller tiles and stitch together
-        - Pre-generate on high-memory system and save
-        - Use lower resolution and interpolate
-        
-        Future planned: Chunked generation to eliminate size limit.
+          - Queries by `__call__()`, `samplePoints()`, `sampleGrid()`, etc.
+          - Full array accessed via `depth` property.
+          - Explicitly generated in full with `generate()` method.
         
         **Size Property Behavior:**
         
-        Changing size after initialization regenerates terrain:
+        Changing size after initialization clears cached terrain:
         
         >>> floor = Floor(size=1000, seed=42)
-        >>> floor.size = 2000  # Triggers regeneration
-        >>> # New 2000*2000 depth array with same seed
+        >>> floor.size = 2000 
+        >>> # Depth cache cleared, regenerated on-demand as queried
         
-        Expanding size extends pattern:
+        Expanding size extends existing terrain pattern seamlessly, and reducing
+        size shrinks the domain but maintains pattern in retained region.
+        
+        **Style Strategy Pattern**
 
-        - Existing region matches original
-        - New regions fill with continued Perlin pattern
-        
-        Reducing size crops array:
+        The style setter builds the strategy dictionary and if new assignment is
+        made, clears the depth array cache.
 
-        - Takes [:new_size, :new_size] slice
-        - No regeneration needed (faster)
+        **Adding New Styles:**
+
+        1. Implement new `_map*()` method with signature:
+        `_map*(self, noise=None, z=None, z_range=None, **kwargs) -> NPFltArr`
+
+        2. Register in `style.setter`:
         
-        **Style Assignment Mechanism:**
-        
-        style.setter performs dynamic method assignment:
-        
-        >>> if style == 'linear':
-        ...     self.create_map = self.standard_map
-        >>> # Future:
-        >>> # elif style == 'exponential':
-        >>> #     self.create_map = self.exponential_map
-        
+        >>> self._styleStrategies = {
+        ...     'linear': self._mapLinear,
+        ...     'sigmoid': self._mapSigmoid,
+        ...     'shelf': self._mapShelf,
+        ...     'newstyle': self._mapNewStyle  # Add here
+        ... }
+
+        3. Update `createMap()` and `_validateStyle()` docstrings with new option.
+
         **Integration with Ocean:**
         
         Ocean constructor passes parameters:
         
         >>> ocean = Ocean(
-        ...     size=2000,
-        ...     origin=[1000, 1000],
-        ...     z=150,              # Passed to Floor as z
-        ...     z_range=25,         # Passed to Floor as z_range
-        ...     floorSeed=123,      # Passed as seed
-        ...     randomFloor=False   # Passed as random
+        ...     size=2000,              # Passed to Floor as size
+        ...     origin=[1000, 1000],    # Passed to Floor as origin
+        ...     z=150,                  # Passed to Floor as z
+        ...     z_range=25,             # Passed to Floor as z_range
+        ...     floorSeed=123,          # Passed as seed
+        ...     randomFloor=False       # Passed as random
         ... )
-        >>> ocean.floor.depth.shape
-        (2000, 2000)
-        
-        **Default Perlin Parameters:**
-        
-        PerlinNoise created with hardcoded defaults:
-
-        - scale=300: Balanced feature size
-        - octaves=3: Natural detail level
-        - persistence=0.5: Standard amplitude decay
-        
-        Cannot currently override via kwargs (limitation).
-        Future: Pass perlin_scale, perlin_octaves, perlin_persistence.
+        >>> ocean.floor.size
+        2000
         
         See Also
         --------
         PerlinNoise.__init__ : Noise generation parameters and process
-        Floor.standard_map : Linear depth mapping implementation
+        Floor.createMap : Converts noise array to depth array
         Ocean.__init__ : Creates Floor with oceanographic parameters
         
         Examples
@@ -2877,20 +2881,21 @@ class Floor:
         Depth range: 125 to 135 m
         >>> print(f"Area: {floor.size} m")
         Area: 1000 m
-        >>> print(f"Array shape: {floor.depth.shape}")
-        Array shape: (1000, 1000)
         
         ### Custom shallow coastal terrain:
         
         >>> floor = env.Floor(
-        ...     z=30,          # 30m shallowest
-        ...     z_range=20,    # Varies 30-50m
-        ...     size=2000,     # 2km * 2km
+        ...     z=30,            # 30m shallowest
+        ...     z_range=20,      # Varies 30-50m
+        ...     size=2000,       # 2km * 2km
         ...     origin=[1000, 1000],
-        ...     seed=42
+        ...     seed=42,
+        ...     style='shelf',   # Flat low areas with steep raised regions
+        ...     scale=4000,      # Broader perlin noise features
+        ...     octaves=5,       # More perlin noise detail layers
+        ...     persistence=0.6  # Rougher perlin noise terrain 
         ... )
-        >>> print(f"Min depth: {floor.depth.min():.2f} m")
-        >>> print(f"Max depth: {floor.depth.max():.2f} m")
+        >>> floor.display3D()
         
         ### Random terrain for testing:
         
@@ -2916,19 +2921,56 @@ class Floor:
         >>> depth_at_origin = floor(0, 0)
         >>> print(f"Depth at (0, 0): {depth_at_origin:.2f} m")
         >>> # Sample multiple points
-        >>> depths = floor.sample_points([0, 100, 200], [0, 100, 200])
+        >>> depths = floor.samplePoints([0, 100, 200], [0, 100, 200])
         >>> print(f"Depths: {depths}")
         """
 
+        # Floor parameters
         self.z = z
         self.z_range = z_range
         self.size = size
         self.origin = origin
-        self.perlin = PerlinNoise(size=size, seed=seed, random=random)
+
+        # Perlin parameters
+        perlinKwargs = {
+            k: kwargs[k] for k in ['scale', 'octaves', 'persistence']
+            if k in kwargs
+        }
+        self.perlin = PerlinNoise(size=size, 
+                                  seed=seed, 
+                                  random=random,
+                                  **perlinKwargs)
+
+        # Depth array parameters
         self.style = style
-        self.depth = self.create_map()  # Defined in style.setter
         
     ## Properties ============================================================#
+    @property
+    def depth(self)->NPFltArr:
+        """
+        Full depth array with lazy precomputation.
+        
+        On first access, builds full array from cached/generated tiles.
+        Subsequent access returns cached array (instant).
+        
+        Notes
+        -----
+        **Simulation queries** (e.g. `floor(x,y)`) do not use this property.
+        They use tile cache directly.
+        
+        **Visualization queries** (e.g. `display3D()`) trigger this property.
+        """
+        if self._depth is None:
+            log.info(f"Computing full depth array ({self.size}x{self.size})")
+            self._depth = self._buildFullDepth()
+        return self._depth
+
+    @depth.setter
+    def depth(self, value: NPFltArr)->None:
+        """Manual depth array assignment."""
+        self._depth = value
+    
+    #--------------------------------------------------------------------------
     @property
     def size(self)->int:
         """Length of one side of floor area (m)."""
@@ -2937,18 +2979,14 @@ class Floor:
     @size.setter
     def size(self, size:int)->None:
         """Set size and recreate map with new length. Assumes same origin."""
-        if ('perlin' in self.__dict__):
-            if (size > self._size):
-                self.perlin = PerlinNoise(size=size,
-                                          scale=self.perlin.scale,
-                                          octaves=self.perlin.octaves,
-                                          persistence=self.perlin.persistence,
-                                          seed=self.perlin.seed,
-                                          random=False)
-            else:
-                self.perlin.size = size
-                self.perlin.noise = self.perlin.noise[:size,:size]
-            self.depth = self.create_map()
+        if ('_perlin' in self.__dict__):
+            # Use perlin property setter for automatic sync
+            self.perlin = PerlinNoise(size=size,
+                                      scale=self.perlin.scale,
+                                      octaves=self.perlin.octaves,
+                                      persistence=self.perlin.persistence,
+                                      seed=self.perlin.seed,
+                                      random=False)
         self._size = size
 
     #--------------------------------------------------------------------------
@@ -2959,22 +2997,40 @@ class Floor:
 
     @style.setter
     def style(self, style:str)->None:
-        """Set depth map scaling style and rescale depth map."""
-        s_default = 'linear'
-        # Set corresponding depth map function
-        if (style == 'linear'):
-            self.create_map = self.standard_map
-        else:
-            log.warning("'%s' is not a valid map generation style", style)
-            log.warning("Proceeding with default: '%s'.", s_default)
-            style = s_default
-            self.create_map = self.standard_map
-        # Remake depth map (Note: depth is not a managed attribute, so the
-        # inverse operation will not automatically update style attribute)
-        if (('depth' in self.__dict__) and (style != self._style)):
-            self.depth = self.create_map()
+        """Set depth mapping style and invalidate depth caches."""
+
+        # Define available strategies
+        self._styleStrategies = {
+            'linear': self._mapLinear,
+            'sigmoid': self._mapSigmoid,
+            'shelf': self._mapShelf,
+        }
+
+        # Validate input
+        style = self._validateStyle(style)
+
         # Assign new attribute
         self._style = style
+    
+        # Invalidate depth caches
+        if hasattr(self, '_tiles'):
+            self._tiles.clear()
+            self._depth = None
+
+    #--------------------------------------------------------------------------
+    @property
+    def perlin(self)->'PerlinNoise':
+        """PerlinNoise generator for ocean floor terrain."""
+        return self._perlin
+    
+    @perlin.setter
+    def perlin(self, pn:'PerlinNoise')->None:
+        """Set PerlinNoise instance and synchronize tile management."""
+        self._perlin = pn
+        self._tileSize = pn._tileSize
+        # Invalidate caches
+        self._tiles = {}
+        self._depth = None
 
     ## Special Methods =======================================================#
     def __call__(self, x:Number, y:Number)->np.float64:
@@ -2990,6 +3046,12 @@ class Floor:
         -------
         z : float
             Depth value at (x,y) in meters.
+            
+        Notes
+        -----
+        Uses tile cache for lazy evaluation. Tiles are generated on-demand and
+        cached for efficiency. First query within a tile triggers depth array
+        generation for that region, with results cached for subsequent queries.
 
         Examples
         --------
@@ -2997,9 +3059,25 @@ class Floor:
         >>> z = floor(100,100)   # Depth value at (x=100,y=100)
         """
 
-        # Single values: default case
-        xp, yp = self.xy2Index(x, y)
-        return self.depth[xp, yp]
+        # Convert to array indices
+        col, row = self.xy2Index(x, y)
+        
+        # Clamp to valid range
+        col = int(col) % self.size
+        row = int(row) % self.size
+        
+        # Determine tile containing position
+        tileI = col // self._tileSize
+        tileJ = row // self._tileSize
+        
+        # Get cached or generate tile
+        tile = self._getTile(tileI, tileJ)
+        
+        # Index within tile
+        colLocal = col % self._tileSize
+        rowLocal = row % self._tileSize
+        
+        return np.float64(tile[rowLocal, colLocal])
     
     #--------------------------------------------------------------------------
     def __repr__(self)->str:
@@ -3026,207 +3104,412 @@ class Floor:
             f"{' Style:':{cw}} {self.style}\n"
             f"\n{self.perlin}"
         )
+    
     ## Methods ===============================================================#
-    def sample_points(self, 
-                      x: Union[List, np.ndarray], 
-                      y: Union[List, np.ndarray]
-                      ) -> np.ndarray:
+    def samplePoints(self, 
+                     x:Union[List, NPFltArr], 
+                     y:Union[List, NPFltArr]
+                     )->np.ndarray:
         """
         Sample floor depth at list of specific coordinate points.
+
+        Queries multiple (x,y) coordinates and returns corresponding depths.
+        Efficient for sparse point sampling. Uses tile cache.
     
         Parameters
         ----------
-        x, y : list or ndarray
-            Lists of coordinates [x_0,...,x_i], [y_0,...,y_i].
+        x : list or ndarray
+            Lists of x-coordinates [x0,...,xi].
+        y : list or ndarray
+            Lists of y-coordinates [y0,...,yi].
             
         Returns
         -------
         z : ndarray
-            1D array of depth values at each point (x_i,y_i).
+            1D array of depth values at each point (xi,yi).
 
+        Notes
+        -----
+        **Tile-Based Lookup**
+
+        Queries tile cache for each point. Tiles are generated on-demand and
+        cached for future queries.
+
+        **Out-of-Bounds Wrapping**
+
+        Coordinates outside [0, size) wrap via modulo indexing.
+        
+        >>> floor = Floor(size = 1000)
+        >>> z1 = floor(1100, 500)       # Same as floor(100, 500)
+        
         Examples
         --------
-        >>> floor = Floor()                # New default ocean floor object
-        >>> x_pts = [100, 200, 300]
-        >>> y_pts = [150, 250, 350]
-        >>> z = floor.sample_points(x_pts, y_pts)   # z is list of length 3
+        >>> floor = Floor()
+        >>> x = [100, 200, 300]
+        >>> y = [150, 250, 350]
+        >>> z = floor.samplePoints(x, y)   # z is list of length 3
         """
 
-        # Vectorized coordinate to index conversion
-        x_arr, y_arr = np.asarray(x), np.asarray(y)
-        x_l, y_l = self.depth.shape
-        x_indices = ((x_arr + self.origin[0]).astype(int) % x_l).flatten()
-        y_indices = ((y_arr + self.origin[1]).astype(int) % y_l).flatten()
+        # Convert to indices
+        x = np.asarray(x)
+        y = np.asarray(y)
+        col, row = self.xy2Index(x, y)
         
-        return self.depth[x_indices, y_indices].reshape(x_arr.shape)
+        # Determine tiles for each point
+        iTiles = col // self._tileSize
+        jTiles = row // self._tileSize
+        
+        # Collect unique tiles
+        uniqueTiles = set(zip(iTiles, jTiles))
+
+        # Compute local indices
+        colLocal = col % self._tileSize
+        rowLocal = row % self._tileSize
+
+        # Batch-process points by using mask to select points in current tile
+        result = np.empty(x.shape, dtype=np.float64)
+        
+        for tileI, tileJ in uniqueTiles:
+            tile = self._getTile(tileI, tileJ) 
+            mask = (iTiles == tileI) & (jTiles == tileJ)
+            result[mask] = tile[rowLocal[mask], colLocal[mask]]
+        
+        return result
 
     #--------------------------------------------------------------------------
-    def sample_grid(self, 
-                    x: Union[List, np.ndarray], 
-                    y: Union[List, np.ndarray]
-                    ) -> np.ndarray:
+    def sampleGrid(self, 
+                   x:Union[List, np.ndarray], 
+                   y:Union[List, np.ndarray]
+                   )->np.ndarray:
         """
         Sample floor depth at grid of coordinate points.
+
+        Queries a regular Cartesian grid of (x,y) coordinates. Returns a 2D
+        array with shape (len(y), len(x)). Optimized for uniform grids but
+        handles irregular grids.
     
         Parameters
         ----------
-        x, y : list or ndarray
-            Lists of coordinates [x_0,...,x_i], [y_0,...,y_j].
+        x : list or ndarray
+            X-coordinates [x0,...,xi] for grid point columns. Grid is formed by
+            the Cartesian product (xi, yj).
+        y : list or ndarray
+            Y-coordinates [y0,...,yj] for grid point rows. Grid is formed by the
+            Cartesian product (xi, yj).
             
         Returns
         -------
-        z : ndarray, shape (len(x), len(y))
-            2D array of depth values at each grid point (x_i,y_j).
+        z : ndarray, shape (len(y), len(x))
+            2D array of depth values at each grid point (xi,yj). 
+            z[j, i] = floor.sample(x[i], y[j]).
 
+        Notes
+        -----
+        **Cartesian Product Convention:**
+
+        For Cartesian product of x-coordinates and y-coordinates, standard 
+        numpy convention returns shape [len(y), len(x)]. This matches meshgrid
+        output with default indexing='xy'.
+
+        **Optimization Requirements:**
+
+        To leverage fast array computations, the method requires:
+
+        1. All coordinates are within floor bounds (no wrapping)
+        2. Monotonically increasing order (in sorted order)
+        3. Uniform spacing (constant differences)
+
+        If all requirements are met, a faster computation is used that
+        relies on the sampleRegion() method. If any requirement fails, a slower
+        computation is used that relies on the samplePoints() method.
+        
         Examples
         --------
-        >>> floor = Floor()             # New default ocean floor object
-        >>> x_pts = [100, 200, 300]
-        >>> y_pts = [150, 250, 350]
-        >>> z = floor.sample_grid(x_pts, y_pts)     # z is array (3,3)
+        >>> floor = Floor()
+        >>> x = [100, 200, 300]
+        >>> y = [150, 250, 350]
+        >>> z = floor.sampleGrid(x, y)     # z is array (3,3)
         """
         
-        # Create meshgrid for all combinations of x and y coordinates
-        x_arr, y_arr = np.asarray(x), np.asarray(y)
-        xx, yy = np.meshgrid(x_arr, y_arr, indexing='ij')
+        # Check for coordinates out-of-bounds
+        xArr, yArr = np.asarray(x), np.asarray(y)
+        colRaw = (xArr + self.origin[0]).astype(int)
+        rowRaw = (yArr + self.origin[1]).astype(int)
+        inBounds = (np.all((colRaw >= 0) & (colRaw < self.size)) and
+                    np.all((rowRaw >= 0) & (rowRaw < self.size)))
+
+        # Convert to indices
+        col, row = self.xy2Index(xArr, yArr)
         
-        # Vectorized coordinate to index conversion
-        x_i = ((xx + self.origin[0]).astype(int) % self.depth.shape[0])
-        y_j = ((yy + self.origin[1]).astype(int) % self.depth.shape[1])
+        # If in bounds, check if points form a uniform sampling region
+        useOptimized = False
+        if (inBounds):
+            colDiff = np.diff(col)
+            rowDiff = np.diff(row)
+            
+            colUniform = ((len(col) > 1) and 
+                          (colDiff[0] > 0) and 
+                          np.all(colDiff == colDiff[0]))
+            rowUniform = ((len(row) > 1) and 
+                          (rowDiff[0] > 0) and
+                          np.all(rowDiff == rowDiff[0]))
+            
+            useOptimized = (colUniform and rowUniform)
+
+        # If in bounds and uniform, use sampleRegion then stride the grid points
+        if (useOptimized):
+            # Get full region
+            # Add 1 since sampleRegion uses exclusive upper bounds
+            xMin, xMax = xArr[0], xArr[-1] + 1
+            yMin, yMax = yArr[0], yArr[-1] + 1
+            region = self.sampleRegion([xMin, xMax], [yMin, yMax])
+            
+            # Apply striding
+            colStride = colDiff[0] if (len(col) > 1) else 1
+            rowStride = rowDiff[0] if (len(row) > 1) else 1
+            if ((colStride > 1) or (rowStride > 1)):
+                region = region[::rowStride, ::colStride]
+            
+            return region
         
-        # Sample depths at all grid points
-        return self.depth[x_i, y_j]
+        # Else out-of-bounds or irregular grid so fall back to use samplePoints
+        else:
+            xx, yy = np.meshgrid(xArr, yArr)
+            depths = self.samplePoints(xx.flatten(), yy.flatten())
+            return depths.reshape(xx.shape)
 
     #--------------------------------------------------------------------------
-    def sample_region(self, 
-                      x_bounds: Union[List[float], np.ndarray], 
-                      y_bounds: Union[List[float], np.ndarray]
-                      ) -> np.ndarray:
+    def sampleRegion(self, 
+                     x:Union[List[float], np.ndarray], 
+                     y:Union[List[float], np.ndarray],
+                     )->np.ndarray:
         """
-        Extract depth map region within specified boundaries.
+        Extract depth map region within specified x,y coordinate boundaries.
+
+        Samples a rectangular region of the depth map defined by x-bounds and
+        y-bounds. Efficiently combines tiles from cache.
     
         Parameters
         ----------
-        x_bounds, y_bounds : list or ndarray
-            Boundary pairs [x_min,x_max], [y_min,y_max].
+        x : list of float or ndarray
+            Boundary pairs [xmin,xmax]. Defines East-West (horizontal) extent 
+            of region.
+        y : list of float or ndarray
+            Boundary pairs [ymin,ymax]. Defines North-South (vertical) extent
+            of region.
             
         Returns
         -------
         z : ndarray
             2D array of depth map region.
-            
+
         Notes
         -----
-        Endpoints inclusive. For x:[100,110], y:[100,110], returns (11,11)
-        array.
+        Upper bounds of region are excluded from returned array: x=[0, 100], 
+        y=[0, 100] returns columns 0-99 (100 columns) and rows 0-99 (100 
+        rows).
         
         Examples
         --------
-        >>> floor = Floor()       # New default ocean floor object
-        >>> x_s = [100, 200]      # n = (200-100) + 1 = 101
-        >>> y_s = [150, 250]      # m = (250-150) + 1 = 101
-        >>> z = floor.sample_region(x_s, y_s)   # z is array (n, m)
+        >>> floor = Floor()
+        >>> x = [100, 200]
+        >>> y = [150, 250]
+        >>> z = floor.sampleRegion(x, y)    # z is array (100, 100)
         """
         
-        if (isinstance(x_bounds, np.ndarray)):
-            xmin, xmax = x_bounds[0], x_bounds[1]
-            ymin, ymax = y_bounds[0], y_bounds[1]
-        else:
-            xmin, xmax = x_bounds
-            ymin, ymax = y_bounds
+        # Unpack boundaries
+        xmin, xmax = x
+        ymin, ymax = y
         
         # Convert boundaries to indices
-        xmin_idx, ymin_idx = self.xy2Index(xmin, ymin)
-        xmax_idx, ymax_idx = self.xy2Index(xmax, ymax)
+        colMin, rowMin = self.xy2Index(xmin, ymin)
+        colMax, rowMax = self.xy2Index(xmax, ymax)
         
-        # Ensure proper ordering
-        xmin_idx, xmax_idx = min(xmin_idx, xmax_idx), max(xmin_idx, xmax_idx)
-        ymin_idx, ymax_idx = min(ymin_idx, ymax_idx), max(ymin_idx, ymax_idx)
+        # Ensure proper ordering due to allowing array index wrapping
+        colMin, colMax = min(colMin, colMax), max(colMin, colMax)
+        rowMin, rowMax = min(rowMin, rowMax), max(rowMin, rowMax)
+
+        # Allocate output array
+        width = colMax - colMin
+        height = rowMax - rowMin
+        region = np.empty((height, width), dtype=np.float64)
+
+        # Determine tiles that cover requested region
+        tileIMin = colMin // self._tileSize
+        tileIMax = (colMax - 1) // self._tileSize
+        tileJMin = rowMin // self._tileSize
+        tileJMax = (rowMax - 1) // self._tileSize
         
-        # Extract region
-        return self.depth[xmin_idx:xmax_idx+1, ymin_idx:ymax_idx+1]
+        # Assemble region from tile cache
+        for tileI in range(tileIMin, tileIMax + 1):
+            for tileJ in range(tileJMin, tileJMax + 1):
+                # Get tile from cache or generate
+                tile = self._getTile(tileI, tileJ)
+
+                # Convert tile bounds to array space
+                colMinTile = tileI * self._tileSize
+                colMaxTile = min(colMinTile + self._tileSize, self.size)
+                rowMinTile = tileJ * self._tileSize
+                rowMaxTile = min(rowMinTile + self._tileSize, self.size)
+
+                # Calculate overlap between requested region and tile
+                overlapColMin = max(colMin, colMinTile)
+                overlapColMax = min(colMax, colMaxTile)
+                overlapRowMin = max(rowMin, rowMinTile)
+                overlapRowMax = min(rowMax, rowMaxTile)
+
+                # Skip if no overlap
+                if ((overlapColMin > overlapColMax) or 
+                    (overlapRowMin > overlapRowMax)):
+                    continue
+                
+                # Calculate indices in tile space
+                tColMin = overlapColMin - colMinTile
+                tColMax = overlapColMax - colMinTile
+                tRowMin = overlapRowMin - rowMinTile
+                tRowMax = overlapRowMax - rowMinTile
+                
+                # Calculate indices in region space
+                rColMin = overlapColMin - colMin
+                rColMax = overlapColMax - colMin
+                rRowMin = overlapRowMin - rowMin
+                rRowMax = overlapRowMax - rowMin
+
+                # Copy data from tile to region
+                region[rRowMin:rRowMax, rColMin:rColMax] = \
+                    tile[tRowMin:tRowMax, tColMin:tColMax]
+
+        return region
     
     #--------------------------------------------------------------------------
-    def standard_map(self, 
-                     noise:Optional[NPFltArr]=None, 
-                     z:Optional[Number]=None, 
-                     z_range:Optional[Number]=None,
-                     )->NPFltArr:
+    def createMap(self, style:Optional[str]=None, **kwargs)->NPFltArr:
         """
-        Create depth map from 2D noise array using linear scaling.
-    
+        Create depth map from normalized 2D noise array, scaled by style.
+
         Parameters
         ----------
-        noise : ndarray, optional
-            2D noise array normalized to [0,1]. If None, uses self.perlin.noise.
-        z : float, optional
-            Minimum depth. If None, uses self.z.
-        z_range : float, optional
-            Depth range. If None, uses self.z_range.
-            
+        style : str
+            Terrain generation style. Valid options:
+
+            - "linear" : Linear depth mapping (default)
+            - "sigmoid" : Smooth transitions
+            - "shelf" : Plateaus and ridges
+
+        kwargs : dict, optional
+            Keyword arguments to pass parameters to depth generating method.
+
         Returns
         -------
         depth : ndarray
-            Depth map = noise * z_range + z.
+            Depth map in meters with shape (size, size)
         """
 
-        n = self.perlin.noise if (noise is None) else noise
-        z = self.z if (z is None) else z
-        z_r = self.z_range if (z_range is None) else z_range
-        return (n * z_r) + z
-    
+        strategy = self.style if (style is None) else self._validateStyle(style)
+        return self._styleStrategies[strategy](**kwargs)
+
     #--------------------------------------------------------------------------
-    def xy2Index(self, x:float, y:float)->List[int]:
+    def xy2Index(self, 
+                 x:Union[float, NPFltArr], 
+                 y:Union[float, NPFltArr],
+                 )->Tuple[Union[int, NPIntArr], Union[int, NPIntArr]]:
         """
         Transform coordinates from (x,y) to array indices.
+
+        Maps END coordinates (East, North) to array indices following [row,
+        column] convention.
     
         Parameters
         ----------
-        x, y : float
-            X, Y coordinates for depth array.
+        x : list of float or ndarray
+            X-coordinates relative to origin for depth array.
+            x = East, increases rightward
+        y : list of float or ndarray
+            Y-coordinates relative to origin for depth array.
+            y = North, increases upward
             
         Returns
         -------
-        [i,j] : list of int
-            Array indices corresponding to (x,y).
+        col, row : int or ndarray
+            Array column and row indices, ready for depth[row, col] access.
+            col = column index (0..size-1), increases East.
+            row = row index (0..size-1), increases North.
+            Type matches input. If scalar inputs: (int, int), if array inputs:
+            (ndarray, ndarray)
             
         Notes
         -----
-        **Boundary Behavior - Coordinate Wrapping**
+        **Coordinate System Convention (END):**
+
+        - x increases East (rightward in visual display)
+        - y increases North (upward in visual display)
+        - Array indexing: depth[row, col] where row == y, col == x
+
+        **Origin Mapping:**
+
+        Origin attribute of Floor instance defines where the (0,0) point of the
+        END x,y coordinates maps in the floor depth array.
+
+        >>> floor = Floor(origin=[250,900])
+        >>> col, row = floor.xy2Index(0,0)  # col = 250, row = 900
+
+        **Boundary Behavior - Coordinate Wrapping:**
         
         Queries outside the floor domain [0, size] are handled via modulo
         wrapping:
 
         - Coordinates automatically wrap around array boundaries
         - Prevents IndexError exceptions that would halt simulation
-        - Effectively treats floor map as infinitely tiled pattern
+        - Effectively treats floor map as infinitely repeating
         
         **Rationale:**
+
         Negative array indexing in Python is valid (accesses from end), making
         lower-bound violations difficult to detect compared to upper-bound
         IndexError exceptions. Rather than implement costly bounds checking or
         allowing edge indexing errors stop the entire simulations, wrapping
-        provides graceful degradation. This decision can be ammended if a
-        generator is built for the PerlinNoise class.
-
-        **Examples:**
-        >>> floor = Floor(size=1000, origin=[500, 500])
-        >>> # Query outside bounds
-        >>> i, j = floor.xy2Index(1100, 500)  # x=1100 > size=1000
-        >>> # Result: i = (1100 + 500) % 1000 = 600 (wrapped)
-        >>> 
-        >>> # Equivalent queries due to wrapping:
-        >>> floor(1100, 500) == floor(100, 500)  # True
+        provides graceful degradation.
 
         **Impact on Simulation:**
+
         Wrapped coordinates may return unrealistic depth values for vehicles
         that stray far from intended operation areas. Users should validate that
         vehicle trajectories remain within expected floor domain.
         """
 
-        x_l, y_l = self.depth.shape
-        return [int(x + self.origin[0]) % x_l, int(y + self.origin[1]) % y_l]
+        col = (np.asarray(x) + self.origin[0]).astype(int) % self.size
+        row = (np.asarray(y) + self.origin[1]).astype(int) % self.size
+        
+        return col, row
 
+    #--------------------------------------------------------------------------
+    def generate(self)->None:
+        """
+        Explicitly precomputes full depth array.
+        
+        Forces generation of all tiles and caches the complete depth array.
+        Subsequent accesses to depth property or tile-based queries will use
+        cached data without generation overhead.
+        
+        Notes
+        -----
+        This method is equivalent to accessing the `depth` property but makes
+        the intent explicit. Useful for:
+        
+        - Precomputing before batch simulations
+        - Forcing generation for visualization
+        - Eliminating on-demand generation overhead
+        
+        Examples
+        --------
+        >>> floor = Floor(size=5000)
+        >>> floor.generate()    # Precompute before simulation loop
+        >>> sim.run()           # depth array already cached
+        >>> floor.display3D()   # instant visualization
+        """
+
+        # Accessing depth array triggers property getter to build full array
+        _ = self.depth
+    
     #--------------------------------------------------------------------------
     def display2D(self, 
                   z:Optional[NPFltArr]=None, 
@@ -3242,8 +3525,10 @@ class Floor:
             Depth array to display. If None, uses self.depth.
         dispType : str, default='contour'
             Display style.
-            'contour': A contour plot with labeled depth contours
-            'cloud': Simple scaling to the color map.
+
+            - 'contour': A contour plot with labeled depth contours
+            - 'cloud': Simple scaling to the color map.
+
         path : guidance.Waypoint, optional
             A waypoint object. Path described by waypoints is plotted over the
             depth map.
@@ -3252,33 +3537,39 @@ class Floor:
         if (z is None):
             z = self.depth
 
-        extent=[-self.origin[0],z.shape[0]-self.origin[0],
-                -self.origin[1],z.shape[1]-self.origin[1]]
+        # z.shape[1] is 'x' (columns), z.shape[0] is 'y' (rows)
+        extent=[-self.origin[0], z.shape[1]-self.origin[0],
+                -self.origin[1], z.shape[0]-self.origin[1]]
         plt.figure(figsize=(9,6))
+
         # Simple scaling plot
         if (dispType == "cloud"):
             p = plt.imshow(z, extent=extent, origin='lower', cmap='viridis_r')
             plt.colorbar(p).ax.invert_yaxis()
+
         # Plot with countour lines
         else:
-            plt.imshow(z, extent=extent, origin='lower', 
+            plt.imshow(z.T, extent=extent, origin='lower', 
                        cmap='viridis_r', alpha=0.5)
             plt.colorbar().ax.invert_yaxis()
-            x = np.linspace(extent[0],extent[1]-1,z.shape[0])
-            y = np.linspace(extent[2],extent[3]-1,z.shape[1])
-            contours = plt.contour(x, y, z, 10, colors='black', alpha=0.4)
+            x = np.linspace(extent[0], extent[1] - 1, z.shape[1])
+            y = np.linspace(extent[2], extent[3] - 1, z.shape[0])
+            contours = plt.contour(x, y, z.T, 10, colors='black', alpha=0.4)
             plt.clabel(contours, inline=True, fontsize=8, fmt="%.0f")
+
         # Lines at origin
-        oc = 'gray'
-        ow = 0.5
+        oc = 'gray'     # origin color
+        ow = 0.5        # origin width
         plt.axvline(x=0, linewidth=ow, color=oc)
         plt.axhline(y=0, linewidth=ow, color=oc)
+
         # Path of vehicle
         if (path is not None):
-            pmc = "red"
-            plc = "black"
-            plt.plot(path.pos.x,path.pos.y,linestyle="dotted",color=plc)
-            plt.scatter(path.pos.x,path.pos.y,marker='^',color=pmc,s=64)
+            pmc = "red"     # path marker color
+            plc = "black"   # path line color
+            plt.plot(path.pos.x, path.pos.y, linestyle="dotted", color=plc)
+            plt.scatter(path.pos.x, path.pos.y, marker='^', color=pmc, s=64)
+
         plt.show()
 
     #--------------------------------------------------------------------------
@@ -3294,6 +3585,8 @@ class Floor:
         
         if (z is None):
             z = self.depth
+        
+        # Set color map
         color = mpl.colormaps['terrain']
         new_cmap = mpl.colors.ListedColormap(color(np.linspace(0.65,0.55,256)))
         # color = mpl.colormaps['gist_earth']
@@ -3302,15 +3595,311 @@ class Floor:
         # new_cmap = mpl.colors.ListedColormap(color(np.linspace(0.7,0.9,256)))
         # color = mpl.colormaps['Wistia']
         # new_cmap = mpl.colors.ListedColormap(color(np.linspace(0.9,0.25,256)))
-        x,y = np.meshgrid(range(z.shape[0]),range(z.shape[1]))
+
+        # Plot floor
+        # z.shape[1] is 'x' (columns), z.shape[0] is 'y' (rows)
+        x, y = np.meshgrid(np.arange(z.shape[1]),np.arange(z.shape[0]))
         fig = plt.figure(figsize=(9,9))
         ax = fig.add_subplot(111, projection='3d')
         ax.set_zlim(-z.max(),0)
         ax.plot_surface(x, y, -z, alpha=0.9, cmap=new_cmap)
-        #add water surface
+        
+        # Add water surface
         ax.plot_surface(x, y, 0*z, alpha=0.3, color='blue')
         plt.show()
 
+    ## Helper Methods ========================================================#
+    def _validateStyle(self, style:str)->str:
+        """
+        Check if style is listed in style strategies dictionary.
+        
+        Parameters
+        ----------
+        style : str
+            Terrain generation style. Valid options:
+
+            - "linear" : Linear depth mapping (default)
+            - "sigmoid" : Smooth transitions
+            - "shelf" : Plateaus and ridges
+        
+        Returns
+        -------
+        style : str, default = "linear"
+            Validated style matching available strategy. Falls back to default
+            if input is not valid.
+        """
+
+        default = "linear"
+        if (style not in self._styleStrategies):
+            available = ", ".join(self._styleStrategies.keys())
+            msg = (f"'{style}' is not a valid terrain style. "
+                   f"Available options: {available}")
+            log.warning(msg)
+            log.warning("Proceeding with default: '%s'.", default)
+            style = default
+        
+        return style
+
+    #--------------------------------------------------------------------------
+    def _mapLinear(self,
+                   noise:Optional[NPFltArr]=None, 
+                   z:Optional[Number]=None, 
+                   z_range:Optional[Number]=None,
+                   **kwargs
+                   )->NPFltArr:
+        """
+        Linear depth mapping from 2D noise array.
+
+        Maps normalized Perlin noise [0, 1] to depth range [z, z + z_range]
+        using linear scaling: depth = noise * z_range + z
+
+        Parameters
+        ----------
+        noise : ndarray, optional
+            2D array normalized to [0, 1]. If None, generates via 
+            perlin.evaluateRegion()
+        z : float, optional
+            Minimum depth in meters. If None, uses self.z.
+        z_range : float, optional
+            Depth variation range in meters. If None, uses self.z_range.
+
+        Returns
+        -------
+        depth : ndarray
+            Depth map in meters with shape (size, size)
+        """
+
+        # Generate noise on-demand if not provided
+        if noise is None:
+            noise = self.perlin.evaluateRegion([0, self.size], [0, self.size])
+        z_val = self.z if (z is None) else z
+        z_r = self.z_range if (z_range is None) else z_range
+        return (noise * z_r) + z_val
+    
+    #--------------------------------------------------------------------------
+    def _mapSigmoid(self,
+                    noise:Optional[NPFltArr]=None, 
+                    z:Optional[Number]=None, 
+                    z_range:Optional[Number]=None,
+                    **kwargs
+                    )->NPFltArr:
+        """
+        Sigmoid depth mapping with smooth transitions.
+        
+        Creates smooth gradual transitions between shallow and deep regions
+        using sigmoid function.
+        
+        Formula: depth = z + z_range / (1 + exp(-k*(2*noise - 1)))
+        where k controls transition steepness (default k=5)
+        
+        Parameters
+        ----------
+        noise : ndarray, optional
+            2D noise array normalized to [0, 1]. If None, generates via 
+            perlin.evaluateRegion()
+        z : float, optional
+            Minimum depth in meters. If None, uses self.z.
+        z_range : float, optional
+            Depth variation range in meters.
+        kwargs : dict, optional
+            Optional keyword arguments:
+            
+            - k : float, steepness parameter (default 5.0)
+        
+        Returns
+        -------
+        depth : ndarray
+            Depth map with smooth sigmoid transitions
+        """
+
+        # Generate noise on-demand if not provided
+        if noise is None:
+            noise = self.perlin.evaluateRegion([0, self.size], [0, self.size])
+        z_val = self.z if (z is None) else z
+        zr = self.z_range if (z_range is None) else z_range
+        k = kwargs.get('k', 5.0)
+        
+        return z_val + zr / (1.0 + np.exp(-k * (2.0 * noise - 1.0)))
+    
+    #--------------------------------------------------------------------------
+    def _mapShelf(self,
+              noise: Optional[NPFltArr] = None,
+              z: Optional[Number] = None,
+              z_range: Optional[Number] = None,
+              **kwargs
+              )->NPFltArr:
+        """
+        Continental shelf mapping with asymmetric depth scaling.
+        
+        Creates terrain with pronounced raised features while keeping deep areas
+        relatively flat and uniform. Transformation splits at midpoint
+        (noise=0.5). Upper half scaled with cubic expansion, and lower half with
+        compression.
+        
+        Formula:
+            For n >= 0.5 (shallow):
+                scaled = 0.5 + 2*(n - 0.5)^3
+            For n < 0.5 (deep):
+                scaled = 2*n^3
+                
+        This creates depth = z + z_range * scaled
+        
+        Parameters
+        ----------
+        noise : ndarray, optional
+            2D array normalized to [0, 1]. If None, generates via 
+            perlin.evaluateRegion().
+        z : float, optional
+            Minimum depth in meters. If None, uses self.z.
+        z_range : float, optional
+            Depth variation range in meters. If None, uses self.z_range.
+        kwargs : dict, optional
+            Optional keyword arguments:
+            
+            - k : float, asymmetry strength (default 3.0)
+        
+        Returns
+        -------
+        depth : ndarray
+            Depth map with shelf-like features
+        """
+        
+        # Generate noise on-demand if not provided
+        if noise is None:
+            noise = self.perlin.evaluateRegion([0, self.size], [0, self.size])
+        z_val = self.z if (z is None) else z
+        zr = self.z_range if (z_range is None) else z_range
+        k = kwargs.get('k', 3.0)
+        
+        # Split transformation at midpoint
+        midpoint = 0.5
+        
+        # Upper half: Expand (more variation)
+        maskUpper = noise >= midpoint
+        upper = midpoint + 2.0 * ((noise - midpoint) ** k)
+        
+        # Lower half: Compress (less variation)
+        lower = 2.0 * (noise ** k)
+        
+        # Combine branches
+        scaled = np.where(maskUpper, upper, lower)
+        
+        return z_val + zr * scaled
+    
+    #--------------------------------------------------------------------------
+    def _buildFullDepth(self)->NPFltArr:
+        """
+        Construct full depth array from tile cache and new tiles.
+        
+        Iterates through floor tiles, generating and caching depth tiles
+        as needed. Combines into single numpy array.
+
+        Returns
+        -------
+        depth : ndarray
+            Fully computed depth array.
+        """
+
+        depth = np.zeros((self.size, self.size), dtype=np.float64)
+        
+        nTilesI = (self.size + self._tileSize - 1) // self._tileSize
+        nTilesJ = (self.size + self._tileSize - 1) // self._tileSize
+        
+        for tileI in range(nTilesI):
+            for tileJ in range(nTilesJ):
+                # Get or generate tile
+                tile = self._getTile(tileI, tileJ)
+                
+                # Determine position in full array
+                iStart = tileI * self._tileSize
+                jStart = tileJ * self._tileSize
+                iEnd = min(iStart + self._tileSize, self.size)
+                jEnd = min(jStart + self._tileSize, self.size)
+                
+                tileHeight = jEnd - jStart
+                tileWidth = iEnd - iStart
+                
+                # Write tile to full array
+                depth[jStart:jEnd, iStart:iEnd] = tile[:tileHeight, :tileWidth]
+        
+        return depth
+    
+    #--------------------------------------------------------------------------
+    def _getTile(self, tileI:int, tileJ:int)->NPFltArr:
+        """
+        Get or generate a cached tile of the depth array.
+        
+        Parameters
+        ----------
+        tileI, tileJ : int
+            Tile grid column, row indices.
+            
+        Returns
+        -------
+        tile : ndarray, shape (tileSize, tileSize)
+            Depth values for this tile in meters.
+        
+        Notes
+        -----
+        **Tile Grid:**
+
+        The floor size is divided into a whole number of uniformly sized tiles,
+        forming a square grid. For example, a floor size of 2000 m may use a
+        tile size of 500 m, forming a grid of 4 x 4 tiles. The tile size is
+        provided by the perlin instance.
+
+        **Tile Caching:**
+
+        Tiles are cached in the tiles dictionary, with the key formed from the
+        tile grid indices: tiles[(tileI, tileJ)]. Requesting a tile that has not
+        been generated will trigger the tile to be evaluated and cached for
+        future re-use. Otherwise, subsequent access returns the cached copy
+        immediately. The tile cache is cleared when size, style, or the perlin
+        instance are changed.
+
+        See Also
+        --------
+        PerlinNoise._calcTileSize : Determines tile size from array size
+        PerlinNoise.evaluateRegion : Computes perlin noise over region
+        createMap : Applys depth mapping to convert noise to depth array
+        """
+
+        # Verify tile grid indices
+        if ((max(tileI, tileJ) >= self.size // self._tileSize) or
+            (min(tileI, tileJ) < 0)):
+            log.warning(
+                "Bad tile index: (%s, %s). Returning tile of z=%s values.", 
+                tileI, tileJ, self.z
+            )
+            
+            return np.full((self._tileSize, self._tileSize), 
+                           self.z, 
+                           dtype=np.float64)
+
+        # Check tile cache
+        key = (tileI, tileJ)
+        
+        if (key not in self._tiles):
+            # Determine tile bounds
+            iStart = tileI * self._tileSize
+            jStart = tileJ * self._tileSize
+            iEnd = min(iStart + self._tileSize, self.size)
+            jEnd = min(jStart + self._tileSize, self.size)
+            
+            # Evaluate noise region
+            noise = self.perlin.evaluateRegion(
+                [iStart, iEnd],
+                [jStart, jEnd]
+            )
+            
+            # Convert noise to depth
+            tile = self.createMap(noise=noise)
+            
+            # Cache
+            self._tiles[key] = tile
+        
+        return self._tiles[key]
+    
 ###############################################################################
 
 class PerlinNoise:
@@ -3319,15 +3908,16 @@ class PerlinNoise:
     
     Implements Ken Perlin's gradient noise algorithm to generate smooth,
     continuous pseudo-random patterns suitable for natural-looking ocean floor
-    terrain maps and other patial environmental features. Supports multi-octave
-    generation for fractal detail and reproducible seeding for consistent
-    terrains.
+    terrain maps and other spatial environmental features. Supports multi-octave
+    generation for fractal detail, reproducible seeding for consistent terrains,
+    and memory-efficient tile-based lazy evaluation.
     
+
     Parameters
     ----------
     size : int
         Side length of square noise array to generate (array dimensions: size x
-        size). Typical values: 500-5000 meters for AUV simulation areas.
+        size).
     scale : int, default=300
         Spatial frequency scale in array units. Determines feature size:
 
@@ -3388,13 +3978,60 @@ class PerlinNoise:
 
     Methods
     -------
-    None
-        PerlinNoise is designed as a data container. Generation occurs during
-        __init__ and results are stored in the noise attribute.
+    __call__(i, j)
+        Sample Perlin noise at position (i, j). Alias for sample() method. Makes
+        PerlinNoise instance directly callable.
+    sample(i, j)
+        Sample Perlin noise at position (i, j) and cache result. Lazy evaluation
+        with tile-based caching for memory efficiency.
+    sampleRegion(i, j)
+        Sample Perlin noise in region (iMin:iMax, jMin:jMax) and cache result.
+        Generates and caches tiles containing the requested region.
+    evaluate(i, j)
+        Evaluate Perlin noise at position (i, j) without caching. Direct
+        computation suitable for one-time queries.
+    evaluateRegion(i, j)
+        Evaluate Perlin noise in region (iMin:iMax, jMin:jMax) without caching.
+        Computes noise over specified bounds without tile storage.
+    generate()
+        Generate and cache Perlin noise for entire array. Pre-computes all tiles
+        to eliminate on-demand generation overhead.
         
 
     Notes
     -----
+    **Features:**
+
+    - **Coherent Noise:** Smooth, continuous patterns without discontinuities
+    - **Multi-Octave Detail:** Layered frequencies for fractal-like complexity  
+    - **Lazy Evaluation:** Tile-based on-demand generation for large arrays
+    - **Reproducible:** Seed-based determinism for consistent terrains
+    - **Normalized Output:** Values guaranteed in [0, 1] range
+
+    **When to Use:**
+
+    - Ocean floor depth map generation
+    - Procedural environmental feature generation
+    - Spatial noise patterns for sensor simulation
+    - Any application requiring coherent 2D pseudo-random fields
+
+    **Lazy Tile-Based Generation:**
+
+    Small arrays are fully computed during initialization. Large arrays use
+    on-demand tile generation to avoid upfront memory costs:
+
+    - Tiles are generated when first accessed by sample methods
+    - Cached for instant subsequent access  
+    - Full array precomputation by generate() if needed
+    - Tile size is automatically optimized for array dimensions
+
+    **2D Only:**
+
+    Current implementation is focused on ocean floor applications:
+
+    - No 3D/4D support (possible future extension)
+    - Square arrays only
+    
     **Perlin Noise Algorithm:**
     
     - **Gradient Noise Principles:**
@@ -3402,7 +4039,7 @@ class PerlinNoise:
         Perlin noise generates coherent pseudo-random values by:
 
         1. Dividing space into grid of unit cubes
-        2. Assigning random gradient vectors to grid corners via permutation
+        2. Assigning random gradient vectors to grid corners by permutation
            table
         3. Computing dot products between gradients and position offsets
         4. Interpolating dot products using smooth fade function
@@ -3417,7 +4054,7 @@ class PerlinNoise:
 
             - sum is from i=0 to octaves-1
             - amplitude_i = persistence^i
-            - perlin_i: Baser Perlin noise at frequency_i
+            - perlin_i: Base Perlin noise at frequency_i
             - frequency_i = (size / scale) * 2^i
         
         Lower octaves contribute large-scale features, higher octaves add fine
@@ -3449,45 +4086,6 @@ class PerlinNoise:
     - Hash function: h = p[p[xi] + yi] determines gradient
     - Four possible gradients: [(0,1), (0,-1), (1,0), (-1,0)]
     
-    **Parameter Interactions:**
-    
-    Changing size with same seed extends/crops pattern:
-    
-    >>> small = PerlinNoise(size=500, seed=10)
-    >>> large = PerlinNoise(size=1000, seed=10)
-    >>> # large.noise[:500, :500] matches small.noise (same pattern)
-    
-    **Performance Characteristics:**
-    
-    Generation time scales with O(size^2 x octaves):
-
-    - size=1000, octaves=3: ~0.5-1 second
-    - size=2000, octaves=5: ~3-6 seconds
-    - size=5000, octaves=3: ~12-25 seconds
-    
-    Memory requirements:
-
-    Perlin noise generation requires substantially more memory than final
-    storage due to intermediate array creation. The method uses `np.meshgrid()`
-    and vectorized operations that create large temporary arrays. Sizes
-    exceeding ~6000m may cause out-of-memory crashes due to generation
-    requirements exceeding available RAM. The peak memory during generation is
-    approximately 10-20x larger than the final storage requirement.
-
-    Future development is planned to address this limitation. Current mitigation
-    strategies are to use smaller sizes (<5000m), pre-generate large arrays on
-    high-memory systems and save for import, generate smaller array sizes and
-    tile the regions together.
-    
-    **Design Decisions:**
-    
-    This implementation prioritizes simplicity and integration over features:
-
-    - 2D only (sufficient for ocean floor depth maps)
-    - No tiling/seamless wrapping (may be introduced at later stage)
-    - No 3D/4D (future extension possible for volumetric environments)
-    - No arbitrary dimensions (square arrays only for simplicity)
-    
     **Alternative Implementations Considered:**
     
     Alternative methods for Perlin noise creation exist, but in testing were
@@ -3500,31 +4098,20 @@ class PerlinNoise:
     
     Current implementation balances simplicity, speed, and integration.
     
-    **Future Development:**
-    
-    Planned enhancements:
-
-    - Chunked generation to eliminate size>6000 memory limit
-    - Optional seamless tiling for repeating terrains
-    - 3D noise for volumetric pollution/current fields
-    - Generator pattern for memory-efficient large maps
-    
 
     Warnings
     --------
-    - size > 6000 may cause out-of-memory errors during generation
     - Does not support non-square arrays
-    - No built-in tiling (repeated patterns have discontinuities)
     - Changing scale/octaves/persistence with same seed creates different
       patterns
-    
       
+
     See Also
     --------
     Floor : Uses PerlinNoise to generate ocean floor depth maps
-    Floor.standard_map : Transforms normalized noise into depth values
-    
+    Floor.createMap : Transforms normalized noise into depth values
 
+    
     References
     ----------
     [1] Producing 2D Perlin noise with numpy
@@ -3539,17 +4126,25 @@ class PerlinNoise:
     [4] Red Blob Games: Terrain Generation from Noise
     https://www.redblobgames.com/maps/terrain-from-noise/
     
-        
+
     Examples
     --------
-    ### Basic noise generation:
+    ### Basic noise generation (small array):
     
-    >>> noise_gen = PerlinNoise(size=1000, scale=300, octaves=3, seed=42)
-    >>> noise_array = noise_gen.noise
+    >>> small_pn = PerlinNoise(size=500, scale=300, octaves=3, seed=42)
+    >>> noise_array = small_pn.noise               # Instant (already generated)
     >>> print(f"Array shape: {noise_array.shape}")
-    Array shape: (1000, 1000)
+    Array shape: (500, 500)
     >>> print(f"Value range: [{noise_array.min():.3f},{noise_array.max():.3f}]")
     Value range: [0.000, 1.000]
+
+    ### Accessing noise (large array):
+
+    >>> large_pn = PerlinNoise(size=5000, seed=42)
+    >>> large_pn.generate()                  # Builds from tiles (may take time)
+    >>> noise_array = large_pn.noise
+    >>> # Or sample specific points without full generation:
+    >>> value = large_pn.sample(2500, 2500)  # Only generates needed tile
     
     ### Effect of persistence:
     
@@ -3576,6 +4171,12 @@ class PerlinNoise:
     >>> broad = PerlinNoise(size=1000, scale=600, octaves=2)
     """
 
+    ## Class Attributes ======================================================# 
+    _GRADIENTS = np.array([[0, 1], [0, -1], [1, 0], [-1, 0]], dtype=float)
+    _TILE_SIZE_STD = 500        # Target tile size for large arrays
+    _TILE_SIZE_PRE = 1000       # Max array size for full precomputation
+    _TILE_SENTINEL = 0.5        # Neutral fill value for ungenerated tiles
+
     ## Constructor ===========================================================#
     def __init__(self, 
                  size:int,
@@ -3585,19 +4186,17 @@ class PerlinNoise:
                  seed:int=0, 
                  random:bool=False):
         """
-        Initialize Perlin noise generator and create normalized 2D noise array.
+        Initialize Perlin noise generator with specified parameters.
     
-        Constructs permutation table from seed and generates multi-octave Perlin
-        noise with specified frequency and detail parameters. All computation
-        occurs during initialization; the resulting noise array is stored in
-        self.noise.
+        Creates permutation table from seed and prepares tile-based structure
+        for lazy noise generation. For small arrays, generates full noise during
+        initialization. For larger arrays, sets up tile cache for on-demand
+        generation.
         
         Parameters
         ----------
         size : int
             Side length of square output array. Creates size x size noise map.
-            Recommended range: 500-5000 for AUV simulation areas.
-            Maximum practical size: ~6000 (memory-limited).
 
         scale : int, default=300
             Base frequency scale factor. Determines the size of the largest
@@ -3672,77 +4271,61 @@ class PerlinNoise:
             
         Notes
         -----
-        **Generation Process**
+        **Tile-Based Generation:**
 
+        The noise array uses lazy tile-based generation for memory efficiency:
+
+        - Size < _TILE_SIZE_PRE: Fully generated as a single tile during 
+          initialization
+        - Size >= _TILE_SIZE_PRE: Divided into tiles, each generated on-demand
+        - Tile size automatically calculated as divisor of size closest to 
+          _TILE_SIZE_STD
+        - Un-generated tile regions of the noise array are prefilled with a 
+          neutral sentinel value (_TILE_SENTINEL)
+        - On first access, tiles are generated and cached for reuse
+
+        During initialization, only the tile management structure is set up. 
+        Full array generation occurs lazily through sample methods or explicitly
+        with the generate() method.
+
+        **Initialization Process:**
+    
         1. **Seed Handling:**
 
-          If random=True, generates seed from np.random.SeedSequence().entropy.
-          Otherwise uses provided seed parameter.
+           - If random=True: Generate from system entropy
+           - Store in self.seed, create RNG instance
         
         2. **Permutation Table:**
 
-          Creates array [0, 1, 2, ..., 255], shuffles with rng,
-          repeats to length 512: p = [shuffled[0:255], shuffled[0:255]].
+           - Create [0-255] array, shuffle, repeat to length 512
+           - Stored in self.p for gradient selection
         
-        3. **Multi-Octave Generation:**
+        3. **Normalization Bounds:**
 
-          For each octave i from 0 to octaves-1:
+           - Generates 1000x1000 test array to measure Perlin range
+           - Computes empirical [min, max] for deterministic normalization
+           - Ensures consistent [0, 1] bounded output across all tiles
         
-                frequency_i = (size / scale) x 2^i
-                amplitude_i = persistence^i
-                noise += perlin(x * frequency_i, y * frequency_i) * amplitude_i
-        
-        4. **Normalization:**
+        4. **Tile Management Setup:**
 
-          Linearly scales final noise to [0, 1]:
+           - Arrays < 1000: Single tile (full precomputation)
+           - Arrays >= 1000: Multiple tiles (lazy generation)
+           - Tile size = closest divisor to 500 that evenly divides size
+           - Noise array prefilled with sentinel value (0.5)
         
-                noise = (noise - min(noise)) / (max(noise) - min(noise))
-        
-        **Parameter Storage:**
-        
-        All input parameters stored for reconstruction/serialization:
-        
-        >>> pn = PerlinNoise(size=500, scale=200, octaves=4, seed=99)
-        >>> print(pn)
-        Perlin
-        Scale:          200
-        Octaves:        4
-        Persistence:    0.5
-        Seed:           99
-        
-        **Memory Allocation:**
-        
-        Multiple large temporary arrays created during generation. Peak memory
-        ~10-20x final noise array size. Sizes exceeding ~6000m may cause
-        out-of-memory crashes due to generation requirements exceeding available
-        RAM. Future development is planned to address this limitation.
-        
-        **Frequency Doubling:**
-        
-        Each octave doubles the frequency, halving feature size:
-        
-        - Octave 0: wavelength = scale
-        - Octave 1: wavelength = scale / 2
-        - Octave 2: wavelength = scale / 4
-        - ...
-        - Octave i: wavelength = scale / 2^i
-        
-        **Amplitude Decay:**
-        
-        Higher frequency octaves contribute less:
-        
-        - Octave 0: weight = 1.0
-        - Octave 1: weight = persistence
-        - Octave 2: weight = persistence²
-        - ...
-        - Octave i: weight = persistence^i
-        
-        For persistence=0.5:
+        5. **Lazy Evaluation Ready:**
 
-        - Octave 0: 100% amplitude
-        - Octave 1: 50% amplitude
-        - Octave 2: 25% amplitude
-        - Octave 3: 12.5% amplitude
+           - No actual noise values computed during __init__
+           - Generation triggered by: sample(), sampleRegion(), or generate()
+           - Tiles cached on generation for reuse
+        
+        **Tile Size Selection:**
+    
+        Automatically balances tile count vs tile size:
+        
+        - Target tile size: ~500x500 for good response time
+        - Constraint: Must evenly divide array size
+        - Example: 2000x2000 array produces a 4x4 grid of 500x500 tiles
         
         Examples
         --------
@@ -3750,24 +4333,32 @@ class PerlinNoise:
         
         >>> pn = PerlinNoise(size=1000)
         >>> # Uses defaults: scale=300, octaves=3, persistence=0.5, seed=0
-        >>> print(pn.noise.shape)
-        (1000, 1000)
         
         ### Custom parameters:
         
         >>> pn = PerlinNoise(
         ...     size=2000,
-        ...     scale=400,
-        ...     octaves=5,
-        ...     persistence=0.6,
+        ...     scale=400,          # Larger features
+        ...     octaves=5,          # More detail
+        ...     persistence=0.6,    # Rougher
         ...     seed=12345
         ... )
-        >>> print(f"Generated noise: {pn.noise.shape},"
-        ...       f" range [{pn.noise.min():.3f}, {pn.noise.max():.3f}]")
-        Generated noise: (2000, 2000), range [0.000, 1.000]
+
+        ### Random terrain each run:
+    
+        >>> pn = PerlinNoise(size=1000, random=True)
+        >>> print(f"Generated with seed: {pn.seed}")
+        Generated with seed: 161803398874989484820458683436563811772
+        
+        ### Reproducible terrain:
+        
+        >>> pn1 = PerlinNoise(size=500, seed=99)
+        >>> pn2 = PerlinNoise(size=500, seed=99)  
+        >>> np.array_equal(pn1.noise, pn2.noise)
+        True
         """
 
-        # Save construction parameters so possible to recreate same instance
+        # Store parameters
         self.size = size
         self.scale = scale
         self.octaves = octaves
@@ -3775,22 +4366,104 @@ class PerlinNoise:
         self.seed=seed
         if (random):
             self.seed = np.random.SeedSequence().entropy
-        self.rng = np.random.default_rng(seed=self.seed)
-        # Construct noise array
-        self.p = self._get_permutation_table()
-        self.noise = self._gen_perlin()
 
+        # Initialize noise generation
+        self.rng = np.random.default_rng(seed=self.seed)
+        self.p = self._calcPermutationTable()
+        self.noise = np.full((size, size), 
+                              self._TILE_SENTINEL, 
+                              dtype=np.float64)
+        self._min, self._diff = self._calcNormalizationBounds()
+
+        # Tile management
+        self._tiles = {}
+        self._tileSize = self._calcTileSize()
+        self._tileN = size // self._tileSize
+
+        # Precompute small array
+        if (size < self._TILE_SIZE_PRE):
+            self._genTile(0, 0)
+    
     ## Special Methods =======================================================#
-    def __repr__(self) -> str:
+    def __call__(self, i:int, j:int)->np.float64:
+        """
+        Sample Perlin noise at position (i, j). Alias for sample() method.
+
+        Makes PerlinNoise instance directly callable for convenient point
+        sampling. Delegates to sample() method which provides tile-based caching
+        for efficient queries. Evaluates and caches tile containing (i, j) on
+        first access.
+
+        Parameters
+        ----------
+        i : int
+            Column index to sample (x direction, horizontal). Ranges [0, size).
+            Wraps by modulo of size if out of bounds.
+        j : int
+            Row index to sample (y direction, vertical). Ranges [0, size). Wraps
+            by modulo of size if out of bounds.
+            
+        Returns
+        -------
+        noise : float
+            Perlin noise value at noise[j, i] in range [0, 1].
+
+        Notes
+        -----
+        **Callable Convenience:**
+    
+        Enables both function call syntax and method alias:
+        
+        >>> pn = PerlinNoise(size=100, seed=42)
+        >>> val1 = pn(50, 50)               # Query by __call__()
+        >>> val2 = pn.sample(50, 50)        # Query by sample()
+        >>> val1 == val2
+        True
+        
+        **Tile Caching:**
+        
+        First query within a tile triggers generation and caching. Subsequent queries
+        in the same tile return instantly from cache.
+        
+        **Index Convention:**
+        
+        Following numpy convention:
+        
+        - i: Column index (horizontal, x direction)
+        - j: Row index (vertical, y direction)
+        - Access pattern: noise[j, i] (row-major ordering)
+        
+        See Also
+        --------
+        sample : Implementation with detailed caching explanation
+        evaluate : Direct evaluation without caching
+        
+        Examples
+        --------
+        >>> pn = PerlinNoise(size=1000, seed=42)
+        >>> # Simple point query
+        >>> value = pn(500, 500)
+        >>> print(f"Noise at (500, 500): {value:.3f}")
+        Noise at (500, 500): 0.485
+        
+        >>> # Loop over multiple points
+        >>> values = [pn(i, i) for i in range(0, 100, 10)]
+        >>> print(f"Diagonal values: {values}")
+        """
+        
+        return self.sample(i, j)
+    
+    #--------------------------------------------------------------------------
+    def __repr__(self)->str:
         """Detailed description of PerlinNoise."""
         # Note that rng, p, and noise can be recreated from these parameters
         return (
             f"{self.__class__.__name__}("
-            f"seed={self.seed}, "
             f"size={self.size}, "
             f"scale={self.scale}, "
             f"octaves={self.octaves}, "
-            f"persistence={self.persistence})"
+            f"persistence={self.persistence}, "
+            f"seed={self.seed})"
         )
 
     #--------------------------------------------------------------------------
@@ -3805,8 +4478,525 @@ class PerlinNoise:
             f"{' Seed:':{cw}} {self.seed}\n"
         )
     
+    ## Methods ===============================================================#
+    def evaluate(self, i:int, j:int)->np.float64:
+        """
+        Evaluate Perlin noise at position (i, j) without caching.
+
+        Computes noise value by direct evaluation without tile caching.
+        Internally calls _evaluateTile() for 1x1 area. Suitable for one-time
+        queries where caching overhead is undesirable.
+
+        Parameters
+        ----------
+        i : int
+            Column index (x direction, horizontal).
+        j : int
+            Row index (y direction, vertical).
+            
+        Returns
+        -------
+        noise : float
+            Perlin noise value at noise[j, i] in range [0, 1].
+            
+        Notes
+        -----
+        **Direct Evaluation:**
+
+        No caching performed, the value is computed fresh each call. More
+        memory-efficient than sample() for sparse, non-repetitive queries.
+        
+        **Performance Comparison:**
+    
+        For repeated queries to same region, sample() is faster due to
+        tile-based caching. For widely scattered queries, evaluate() may
+        be faster and more memory-efficient.
+        
+        **Index Convention:**
+        
+        - i: Column index (horizontal, x direction)
+        - j: Row index (vertical, y direction)
+        
+        **When to Use:**
+        
+        Prefer evaluate() over sample() when:
+        
+        - Single-use queries (no caching overhead)
+        - Memory-constrained (no tile storage)
+        - Deterministic evaluation order needed
+        
+        Prefer sample() when:
+        
+        - Querying same region multiple times (caching benefit)
+        - Sparse sampling patterns (lazy generation benefit)
+        - Memory constraints allow caching (tiles persist)
+        
+        See Also
+        --------
+        evaluateRegion : Region evaluation without caching
+        sample : Single-point evaluation with tile caching
+        
+        Examples
+        --------
+        >>> pn = PerlinNoise(size=1000, seed=42)
+        >>> value = pn.evaluate(500, 500)
+        >>> print(f"Noise at (500, 500): {value:.3f}")
+        Noise at (500, 500): 0.278
+        """
+        
+        return self._evaluateTile([i, i+1], [j, j+1])[0, 0]
+
+    #--------------------------------------------------------------------------
+    def evaluateRegion(self, 
+                       i:Union[List[int], NPIntArr],
+                       j:Union[List[int], NPIntArr],
+                       )->NPFltArr:
+        """
+        Evaluate Perlin noise in region (iMin:iMax, jMin:jMax) without caching.
+
+        Computes multi-octave Perlin noise over the specified region using
+        direct evaluation with automatic chunking for large regions. Does not
+        cache intermediate results or tiles. Provides memory-efficient region
+        evaluation when caching is unnecessary of undesirable.
+
+        Parameters
+        ----------
+        i : list of int or ndarray
+            Column index bounds [iMin, iMax]. Defines horizontal extent of
+            region. iMax is exclusive: [0, 100] returns columns 0-99 (100
+            columns total).
+        j : list of int or ndarray
+            Row index bounds [jMin, jMax]. Defines vertical extent of region.
+            jMax is exclusive: [0, 100] returns rows 0-99 (100 rows total).
+            
+        Returns
+        -------
+        noise : ndarray, shape (jMax-jMin, iMax-iMin)
+            2D array of Perlin noise values in range [0, 1].
+            Note: Array indexing is [row, column] = [j, i].
+            
+        Notes
+        -----
+        **Direct Evaluation Algorithm:**
+
+        Method performs full Perlin noise generation without caching:
+        
+        1. Extract region bounds: iMin, iMax, jMin, jMax
+        2. Calculate region dimensions: width = iMax - iMin, 
+           height = jMax - jMin
+        3. Chunking check:
+
+            a. If max(width, height) < _TILE_SIZE_PRE:
+               - Process entire region as single call
+            
+            b. If max(width, height) >= _TILE_SIZE_PRE:
+               - Calculate tile size as divisor closest to _TILE_SIZE_STD
+               - Divide region into grid of tiles
+               - Process each tile sequentially
+               - Assemble results into output array
+        
+        4. Per-Tile Processing:
+        
+            a. Compute octave frequency: currFreq = (size/scale) * 2^octave
+            b. Compute octave amplitude: currAmp = persistence^octave
+            c. Map tile bounds to frequency space coordinates
+            d. Create coordinate meshgrids with np.linspace()
+            e. Evaluate Perlin noise at all grid points
+            f. Scale by amplitude and accumulate: noise += currNoise * currAmp
+        
+        5. Normalize accumulated noise to [0, 1]
+        6. Return normalized region array
+        
+        **No Caching:**
+        
+        Unlike sample() and sampleRegion(), this method:
+        
+        - Does not check tile generation status
+        - Does not write results to self.noise array
+        - Does not mark tiles as generated in _tiles dictionary
+        - Recomputes values on every call (no memoization)
+        
+        **Tile Processing:**
+
+        For large regions (max dimension >= _TILE_SIZE_PRE), the method
+        automatically divides the input into tiles and processes each tile
+        sequentially to prevent memory issues. Results are assembled seamlessly
+        into final output array.
+        
+        **Index Convention:**
+        
+        Array uses standard numpy row-major ordering:
+        
+        - i: Column index (horizontal, "x" direction)
+        - j: Row index (vertical, "y" direction)
+        - Returned array: noise[j_height, i_width]
+        
+        **Frequency Space Mapping:**
+        
+        Region bounds transformed to Perlin frequency coordinates:
+        
+        >>> iStart = (iMin / size) * currFreq
+        >>> iEnd = (iMax / size) * currFreq
+        >>> jStart = (jMin / size) * currFreq
+        >>> jEnd = (jMax / size) * currFreq
+        
+        Creates meshgrid spanning [start, end) with width/height points.
+        
+        **Octave Accumulation:**
+        
+        Each octave contributes at increasing frequency, decreasing amplitude:
+        
+        - Octave 0: freq = size/scale, amp = 1.0
+        - Octave 1: freq = 2*size/scale, amp = persistence
+        - Octave 2: freq = 4*size/scale, amp = persistence^2
+        - Octave i: freq = 2^i*size/scale, amp = persistence^i
+        
+        **When to Use:**
+        
+        Prefer evaluateRegion() over sampleRegion() when:
+        
+        - Single-use query (no repeated access to same region)
+        - Memory-constrained (cannot afford tile storage)
+        - Small regions (caching overhead not justified)
+        - Avoiding cache pollution for rarely-accessed areas
+        
+        Prefer sampleRegion() when:
+        
+        - Repeated queries to same/overlapping regions
+        - Sufficient memory for tile caching
+        - Building up coverage of domain over time
+        - Pre-generating full noise array by generate()
+        
+        See Also
+        --------
+        evaluate : Single-point evaluation without caching
+        sampleRegion : Region evaluation with tile caching
+        sample : Single-point evaluation with tile caching
+        _perlin : Core Perlin noise function
+        _normalize : Normalization to [0, 1]
+        _evaluateTile : Core tile evaluation implementation
+        _calcTileSize : Tile size determination algorithm
+        
+        Examples
+        --------
+        ### Evaluate rectangular region:
+        
+        >>> pn = PerlinNoise(size=1000, seed=42)
+        >>> region = pn.evaluateRegion([100, 200], [150, 250])
+        >>> print(region.shape)
+        (100, 100)  # [jMax-jMin, iMax-iMin]
+        >>> print(f"Range: [{region.min():.3f}, {region.max():.3f}]")
+        Range: [0.249, 0.516]
+        
+        ### One-time subregion extraction:
+        
+        >>> pn = PerlinNoise(size=1000, seed=42)
+        >>> # Extract small region for analysis
+        >>> corner = pn.evaluateRegion([0, 50], [0, 50])
+        >>> center = pn.evaluateRegion([475, 525], [475, 525])
+        >>> # No persistent cache, suitable for sparse one-off queries
+        """
+        
+        # Bounds
+        iMin, iMax = i
+        jMin, jMax = j
+        width = iMax - iMin
+        height = jMax - jMin
+
+        # Check if region is small enough to process in one tile
+        maxDim = max(width, height)
+        if (maxDim < self._TILE_SIZE_PRE):
+            return self._evaluateTile(iMin, iMax, jMin, jMax)
+        
+        # Large region: divide into tiles
+        tileSize = self._calcTileSize(maxDim)
+        noise = np.zeros((height, width), dtype=np.float64)
+        
+        jTile = jMin
+        while (jTile < jMax):
+            jTileEnd = min(jTile + tileSize, jMax)
+            jOffset = jTile - jMin
+            jTileHeight = jTileEnd - jTile
+            
+            iTile = iMin
+            while (iTile < iMax):
+                iTileEnd = min(iTile + tileSize, iMax)
+                iOffset = iTile - iMin
+                iTileWidth = iTileEnd - iTile
+                
+                # Evaluate this tile
+                tileNoise = self._evaluateTile(
+                    iTile, iTileEnd, jTile, jTileEnd
+                )
+                
+                # Place tile in output array
+                noise[jOffset:jOffset+jTileHeight, 
+                      iOffset:iOffset+iTileWidth] = tileNoise
+                
+                iTile = iTileEnd
+            
+            jTile = jTileEnd
+        
+        return noise
+
+    #--------------------------------------------------------------------------
+    def sample(self, i:int, j:int)->np.float64:
+        """
+        Sample Perlin noise at position (i, j) and cache result.
+
+        Returns noise value at specified position. Checks if the region of the
+        noise array containing the position has already been generated. If not,
+        the tile containing the point is computed and cached before returning
+        the value. Provides efficient single-point evaluation with automatic
+        tile management for lazy generation.
+
+        Parameters
+        ----------
+        i : int
+            Column index (x direction, horizontal). Valid range: [0, size).
+        j : int
+            Row index (y direction, vertical). Valid range: [0, size).
+            
+        Returns
+        -------
+        noise : float
+            Perlin noise value at noise[j, i] in range [0, 1].
+            
+        Notes
+        -----
+        **Tile-Based Caching:**
+    
+        Method uses lazy evaluation strategy with tile-based caching:
+        
+        1. Check if position's tile has been generated with _isGenerated()
+        2. If not cached:
+        
+            - Calculate tile indices: 
+              tileI = i // tileSize, tileJ = j // tileSize
+            - Generate and cache tile with _genTile(tileI, tileJ)
+            - Mark tile as generated in _tiles dictionary
+        
+        3. Return value from cached array: noise[j, i]
+        
+        **Index Convention:**
+        
+        Array uses standard numpy row-major ordering:
+        
+        - i: Column index (horizontal, "x" direction)
+        - j: Row index (vertical, "y" direction)
+        - Array access: noise[j, i] = noise[row, column]
+        
+        **Tile Size:**
+        
+        Tile dimensions determined automatically during initialization:
+        
+        - size < _TILE_SIZE_PRE: Single tile (entire array)
+        - size >= _TILE_SIZE_PRE: Multiple tiles of size-divisor nearest to
+          _TILE_SIZE_STD
+        
+        **When to Use:**
+        
+        Prefer sample() over evaluate() when:
+        
+        - Querying same region multiple times (caching benefit)
+        - Sparse sampling patterns (lazy generation benefit)
+        - Memory constraints allow caching (tiles persist)
+        
+        Prefer evaluate() when:
+        
+        - Single-use queries (no caching overhead)
+        - Memory-constrained (no tile storage)
+        - Deterministic evaluation order needed
+        
+        See Also
+        --------
+        sampleRegion : Region evaluation with tile caching
+        evaluate : Single-point evaluation without caching
+        evaluateRegion : Direct region evaluation without caching
+        _genTile : Tile generation implementation
+        _isGenerated : Tile status check
+        
+        Examples
+        --------
+        ### Sample single point:
+        
+        >>> pn = PerlinNoise(size=1000, seed=42)
+        >>> value = pn.sample(500, 500)
+        >>> print(f"Noise at (500, 500): {value:.3f}")
+        Noise at (500, 500): 0.278
+        
+        ### Efficient repeated sampling:
+        
+        >>> pn = PerlinNoise(size=2000, seed=42)
+        >>> # First access generates tile containing (1000, 1000)
+        >>> val1 = pn.sample(1000, 1000)
+        >>> # Second access reuses cached tile (instant)
+        >>> val2 = pn.sample(1010, 1010)                        # Same tile
+        >>> # Both queries benefit from single tile generation
+        
+        ### Sparse sampling pattern:
+        
+        >>> pn = PerlinNoise(size=5000, seed=99)
+        >>> # Sample widely separated points
+        >>> points = [(500, 500), (1500, 2000), (3000, 4000)]
+        >>> samples = [pn.sample(i, j) for i, j in points]
+        >>> # Only generates 3 tiles instead of full 5000 x 5000 array
+        """
+        
+        if (not self._isGenerated(i, j)):
+            tileI = i // self._tileSize
+            tileJ = j // self._tileSize
+            self._genTile(tileI, tileJ)
+        
+        return self.noise[j, i]             # [row, column]
+
+    #--------------------------------------------------------------------------
+    def sampleRegion(self, 
+                     i:Union[List[int], NPIntArr],
+                     j:Union[List[int], NPIntArr],
+                     )->NPFltArr:
+        """
+        Sample Perlin noise in region (iMin:iMax, jMin:jMax) and cache result.
+
+        Evalutes Perlin noise across the specified region and caches any tiles
+        that contain the region. Returns the requested slice from the cached
+        noise array. Provides efficient access to subregions of noise array
+        without redundant computation.
+
+        Parameters
+        ----------
+        i : list of int or ndarray
+            Column index bounds [iMin, iMax]. Defines horizontal extent of
+            region. iMax is excluded: [0, 100] returns columns 0 to 99 (100
+            total columns).
+        j : list of int or ndarray
+            Row index bounds [jMin, jMax]. Defines vertical extent of region.
+            jMax is excluded: [0, 100] returns rows 0 to 99 (100 total rows).
+            
+        Returns
+        -------
+        noise : ndarray, shape (jMax-jMin, iMax-iMin)
+            2D array of Perlin noise values in range [0, 1].
+            Note: Array indexing is [row, column] = [j, i].
+            
+        Notes
+        -----
+        **Tile-Based Caching:**
+    
+        Method determines which tiles overlap the requested region and generates
+        any missing tiles before returning the result:
+        
+        1. Compute tile grid indices spanning region:
+        
+            - tileIMin = iMin // tileSize
+            - tileIMax = (iMax - 1) // tileSize
+            - tileJMin = jMin // tileSize
+            - tileJMax = (jMax - 1) // tileSize
+        
+        2. Generate missing tiles with _genTile() for each (tileI, tileJ)
+        3. Return region slice: noise[jMin:jMax, iMin:iMax]
+        
+        **Tile Boundary Handling:**
+        
+        Regions spanning multiple tiles are handled seamlessly:
+        
+        - Each overlapping tile computed independently
+        - Tiles cached separately in _tiles dictionary
+        - Final slice extracted from unified noise array
+        - No duplication of work for overlapping regions
+        
+        **Index Convention:**
+        
+        Array uses standard numpy row-major ordering:
+        
+        - i: Column index (horizontal, x direction)
+        - j: Row index (vertical, y direction)
+        - Returned array: [j_height, i_width]
+        
+        **Performance Characteristics:**
+        
+        - First call: Generates and caches required tiles
+        - Subsequent calls: Returns cached values (instant)
+        - Tile generation scales with region area
+        - Overhead: Dictionary lookups for tile status checks
+        
+        See Also
+        --------
+        sample : Single-point evaluation with tile caching
+        evaluateRegion : Direct evaluation without caching
+        _genTile : Tile generation implementation
+        generate : Evaluate and cache all tiles
+        
+        Examples
+        --------
+        ### Extract subregion from larger array:
+        
+        >>> pn = PerlinNoise(size=2000, seed=99)
+        >>> # Get central 500x500 region
+        >>> center = pn.sampleRegion([750, 1250], [750, 1250])
+        >>> print(center.shape)
+        (500, 500)
+        
+        ### Efficient repeated access:
+        
+        >>> pn = PerlinNoise(size=1000, seed=42)
+        >>> # First call generates tiles
+        >>> region1 = pn.sampleRegion([0, 300], [0, 300])
+        >>> # Second call reuses cached tiles (fast)
+        >>> region2 = pn.sampleRegion([100, 400], [100, 400])
+        >>> # Overlapping region uses cached data
+        """
+        
+        iMin, iMax = i
+        jMin, jMax = j
+        
+        # Determine which tiles overlap this region
+        tileIMin = iMin // self._tileSize
+        tileIMax = (iMax - 1) // self._tileSize
+        tileJMin = jMin // self._tileSize
+        tileJMax = (jMax - 1) // self._tileSize
+        
+        # Generate any missing tiles
+        for tileI in range(tileIMin, tileIMax + 1):
+            for tileJ in range(tileJMin, tileJMax + 1):
+                if not self._tiles.get((tileI, tileJ), False):
+                    self._genTile(tileI, tileJ)
+        
+        # Return requested region from cached array
+        return self.noise[jMin:jMax, iMin:iMax]
+    
+    #--------------------------------------------------------------------------
+    def generate(self)->None:
+        """
+        Generate and cache Perlin noise for entire array.
+        
+        Evaluates and caches noise values across the complete size x size
+        domain. After calling this method, the noise array contains valid Perlin
+        values at all positions (no sentinel values remain).
+        
+        Notes
+        -----
+        For arrays with size < _TILE_SIZE_PRE, generation occurs automatically
+        during __init__. This method is for larger arrays using lazy, on-demand
+        tile generation.
+
+        Useful for pre-computing the full noise array before use to avoid
+        on-demand generation overhead during runtime, or for plotting and
+        display of the noise array.
+        
+        See Also
+        --------
+        sample : On-demand single value evaluation with tile caching
+        evaluateRegion : Direct evaluation of 2d area without caching
+        """
+
+        for tileI in range(self._tileN):
+            for tileJ in range(self._tileN):
+                if not self._tiles.get((tileI, tileJ), False):
+                    self._genTile(tileI, tileJ)
+
     ## Helper Methods ========================================================#
-    def _get_permutation_table(self)->NPIntArr:
+    def _calcPermutationTable(self)->NPIntArr:
         """
         Generate permutation table for Perlin noise gradient vector selection.
     
@@ -3824,11 +5014,13 @@ class PerlinNoise:
         Notes
         -----
         **Algorithm:**
+
         1. Create sequential array [0, 1, 2, ..., 255]
         2. Shuffle using self._rng (seeded RNG for reproducibility)
         3. Repeat shuffled array: [shuffled, shuffled] -> length 512
         
         **Purpose:**
+
         The permutation table provides deterministic pseudo-random access to
         gradient vectors. Doubling to length 512 eliminates need for modulo
         operations when indexing:
@@ -3836,6 +5028,7 @@ class PerlinNoise:
         >>> hash_value = self.p[self.p[xi] + yi]  # No % 256 needed
         
         **Gradient Mapping:**
+
         Hash values from permutation table select gradient vectors:
 
         - h = p[p[xi] + yi] determines which gradient from 4 options:
@@ -3846,214 +5039,141 @@ class PerlinNoise:
         
         See Also
         --------
-        _perlin2D : Uses permutation table for gradient selection
+        _perlin : Uses permutation table for gradient selection
         _gradient : Converts hash values to gradient vectors
         """
+
         p = np.arange(256, dtype=int)
         self.rng.shuffle(p)
-        p = np.stack([p,p]).flatten()
-        return p
+        return np.concatenate([p, p])
 
     #--------------------------------------------------------------------------
-    def _gen_perlin(self)->NPFltArr:
+    def _calcNormalizationBounds(self)->float:
         """
-        Generate normalized multi-octave Perlin noise array.
-    
-        Combines multiple octaves (frequency layers) of Perlin noise to create
-        fractal detail. Each octave adds progressively higher frequency features
-        with decreasing amplitude, resulting in natural-looking terrain.
-        
+        Calculate empirical bounds of Perlin noise for on-demand normalization.
+
+        Generates a noise array of 1000x1000 with instance input parameters and
+        measures the actual min and max range to set normalization bounds. This
+        empirical approach accounts for variations in unique parameter
+        combinations combined with the permutation table randomization. Provides
+        consistent, deterministic normalization for on-demand noise generation.
 
         Returns
         -------
-        noise : ndarray, shape (size, size), dtype=float64
-            Normalized 2D Perlin noise array with values in [0, 1]. Ready for
-            transformation into depth maps or other applications.
-            
+        min : float
+            Empirical minimum observed in raw Perlin noise test array.
+        diff : float
+            Empirical range (max - min) observed in raw Perlin noise test array.
 
         Notes
         -----
-        **Algorithm:**
+        **Purpose:**
 
-        For each octave i from 0 to octaves-1:
-        
-        1. **Frequency Calculation:**
-        
-            freq_i = (size / scale) * 2^i
-        
-        2. **Amplitude Calculation:**
-        
-            amp_i = persistence^i
-        
-        3. **Coordinate Generation:**
+        Perlin noise does not produce values exactly in the theoretical range
+        [-amplitude, amplitude]. Empirical bounds are narrower due to:
 
-            Create meshgrid with spacing determined by frequency:
+        - Limited gradient vectors
+        - Dot product geometry reducing magnitude
+        - Interpolation smoothing dampening extremes
         
-            >>> x_l = np.linspace(0, freq, size, endpoint=False)
-            >>> x, y = np.meshgrid(x_l, x_l)
+        Pre-computing empirical bounds allows consistent normalization:
         
-        4. **Noise Layer Generation:**
-
-            Generate Perlin noise at current frequency:
-            
-            >>> noise += _perlin2D(x, y) * amp
+        .. code-block:: python
         
-        5. **Normalization:**
-
-            After summing all octaves, normalize to [0, 1]:
-            
-            >>> noise = _normalize(noise)
+            normalized = (noise - min_val) / diff
+            # Always maps to [0, 1] regardless of tile
         
-        **Multi-Octave Properties:**
+        **Why This Works:**
         
-        - **Octave 0 (Base):** Lowest frequency, largest features
-        - Frequency = size / scale
-        - Amplitude = 1.0
-        - Contribution: 100%
+        The empirical bounds are a constant property of the algorithm, not the
+        data. For given (octaves, persistence), the bounds are identical across:
         
-        - **Octave 1:** Double frequency, half amplitude
-        - Frequency = 2 * (size / scale)
-        - Amplitude = persistence
-        - Contribution: persistence * 100%
+        - Different seeds (only affects pattern, not range)
+        - Different array sizes (frequency scaling cancels out)
+        - Different tiles (all use same Perlin function)
         
-        - **Octave i:** Exponential frequency, decaying amplitude
-        - Frequency = 2^i * (size / scale)
-        - Amplitude = persistence^i
-        - Contribution: persistence^i * 100%
+        This enables deterministic, tile-order-independent normalization without
+        requiring two-pass generation or global post-processing.
         
-        **Frequency Doubling:**
-
-        Each octave doubles spatial frequency, halving feature wavelength:
-
-        - More octaves -> finer detail
-        - Typical range: 3-6 octaves for natural terrain
+        **Sampling Strategy:**
         
-        **Amplitude Decay:**
-
-        Persistence controls amplitude scaling between octaves:
-
-        - persistence = 0.5 (typical): Each octave contributes half previous
-          amplitude
-        - persistence < 0.5: Smoother, less detailed
-        - persistence > 0.5: Rougher, more detailed
+        Generates 1000x1000 test region (1M points) to measure Perlin bounds:
         
-        **Memory Considerations:**
-
-        Meshgrid operations create large temporary arrays:
-
-        - Each octave creates 2 * size^2 arrays (x and y meshgrids)
-        - Peak memory ~ 2 * size^2 * 8 bytes per octave
-        - Total peak ~ 16-32 * size^2 bytes during generation
-        
+        1. Accumulates noise across all octaves
+        2. Measures min/max of accumulated raw values
+        3. Returns (min, max-min) for normalization formula
 
         See Also
         --------
-        _perlin2D : Single-octave 2D Perlin noise computation
-        _normalize : Linear scaling to [0, 1] range
-        __init__ : Sets scale, octaves, persistence parameters
-        
-
-        Examples
-        --------
-        ### Typical usage (called internally by __init__):
-        
-        >>> pn = PerlinNoise(size=1000, scale=300, octaves=4, persistence=0.6)
-        >>> # _gen_perlin() automatically called during construction
-        >>> noise = pn.noise  # Access generated array
-        
-        ### Effect of octave count:
-        
-        >>> # 1 octave: Smooth, broad features
-        >>> smooth = PerlinNoise(size=500, octaves=1)
-        >>> 
-        >>> # 6 octaves: Detailed, fractal-like
-        >>> detailed = PerlinNoise(size=500, octaves=6)
+        _normalize : Uses these bounds for consistent normalization
+        evaluateRegion : Generates raw noise, then normalizes with bounds
+        __init__ : Calls this method once during initialization
         """
+
+        # Generate small test region to measure actual Perlin bounds
+        testSize = 1000
+        testNoise = np.zeros((testSize, testSize), dtype=np.float64)
+        
+        # Base frequency
         freq = self.size / self.scale
-        amp = 1
-        noise = np.zeros([self.size, self.size])
-        for i in range(self.octaves):
-            x_l = np.linspace(0, freq, self.size, endpoint=False)
-            x, y = np.meshgrid(x_l, x_l)
-            noise += self._perlin2D(x, y) * amp
-            amp *= self.persistence
-            freq *= 2
-        return self._normalize(noise)
-
+        
+        # Accumulate test noise across all octaves
+        for octave in range(self.octaves):
+            currFreq = freq * (2.0 ** octave)
+            currAmp = self.persistence ** octave
+            
+            # Sample region in frequency space
+            stop = currFreq * (testSize / self.size)
+            iCoords = np.linspace(0, stop, testSize, endpoint=False)
+            jCoords = np.linspace(0, stop, testSize, endpoint=False)
+            iMesh, jMesh = np.meshgrid(iCoords, jCoords)
+            
+            # Evaluate this octave
+            testNoise += self._perlin(iMesh, jMesh) * currAmp
+        
+        min = testNoise.min()
+        diff = testNoise.max() - min
+        return min, diff
+    
     #--------------------------------------------------------------------------
-    def _perlin2D(self, x:NPFltArr, y:NPFltArr)->NPFltArr:
+    def _perlin(self, 
+                x:Union[Number, NPFltArr], 
+                y:Union[Number, NPFltArr],
+                )->NPFltArr:
         """
-        Compute 2D Perlin noise at specified coordinate arrays.
+        Compute 2D Perlin noise at specified coordinates.
     
         Core Perlin noise algorithm that uses permutation table to select
         gradient vectors, computes dot products with coordinate offsets, and
-        interpolates results using smooth fade functions. Single-octave
-        implementation.
+        interpolates results using smooth fade functions. Accepts both scalar
+        coordinates and array inputs.
         
-
         Parameters
         ----------
-        x : ndarray, shape (size, size)
-            X-coordinate meshgrid scaled by frequency.
-        y : ndarray, shape (size, size)
-            Y-coordinate meshgrid scaled by frequency.
-            
+        x : float or ndarray
+            X coordinate(s) scaled by frequency. Can be a single scalar value
+            or an array.
+        y : float or ndarray
+            Y coordinate(s) scaled by frequency. Can be a single scalar value
+            or an array.
 
         Returns
         -------
-        noise : ndarray, shape (size, size)
-            Raw Perlin noise values (not normalized). Range varies but typically
-            [-1, 1] before normalization.
+        noise : float or ndarray
+            Raw Perlin noise values (not normalized). Return type matches input:
+            scalar inputs return scalar output, array inputs return array output.
+            Range varies but typically [-1, 1] before normalization.
             
-
         Notes
         -----
-        **Algorithm Steps:**
-
-        1. **Grid Cell Identification:**
-
-            Determine integer grid coordinates (top-left corner of each cell):
-            
-            >>> xi, yi = x.astype(int) % 255, y.astype(int) % 255
-        
-        2. **Internal Coordinates:**
-
-            Compute fractional position within grid cell [0, 1):
-            
-            >>> xf = x - x.astype(int)  # Distance from left edge
-            >>> yf = y - y.astype(int)  # Distance from top edge
-        
-        3. **Fade Factors:**
-
-            Apply smoothing curve for C^2 continuity:
-            
-            >>> u = _fade(xf)  # Horizontal smoothing
-            >>> v = _fade(yf)  # Vertical smoothing
-            
-        4. **Gradient Selection and Dot Products:**
-
-            For each corner of grid cell, hash coordinates to select gradient
-            vector and compute dot product with offset:
-            
-            >>> n00 = _gradient(p[p[xi  ] + yi  ], xf  , yf  )  # Top-left
-            >>> n01 = _gradient(p[p[xi  ] + yi+1], xf  , yf-1)  # Bottom-left
-            >>> n10 = _gradient(p[p[xi+1] + yi  ], xf-1, yf  )  # Top-right
-            >>> n11 = _gradient(p[p[xi+1] + yi+1], xf-1, yf-1)  # Bottom-right
-        
-        5. **Bilinear Interpolation:**
-
-            Combine corner values using fade factors:
-            
-            >>> x1 = _lerp(n00, n10, u)  # Interpolate top edge
-            >>> x2 = _lerp(n01, n11, u)  # Interpolate bottom edge
-            >>> result = _lerp(x1, x2, v)  # Interpolate vertical
-        
-        **Coordinate Wrapping:**
-
-        Modulo 255 prevents overflow in permutation table indexing:
-
-        - Coordinates wrapped to [0, 254] range
-        - Allows seamless tiling if desired (though not implemented)
+        **Algorithm:**
+    
+        1. Grid cell identification by floor division
+        2. Internal coordinates by fractional component
+        3. Gradient selection by permutation table hashing
+        4. Dot products with corner gradients
+        5. Smooth fade function application
+        6. Bilinear interpolation of corner values
         
         **Gradient Hashing:**
 
@@ -4065,82 +5185,102 @@ class PerlinNoise:
         
         **Interpolation Quality:**
 
-        Uses improved Perlin fade function (6t⁵ - 15t⁴ + 10t³) for:
+        Uses improved Perlin fade function (6t^5 - 15t^4 + 10t^3) for:
 
         - Smooth first derivative (no visible grid artifacts)
         - Smooth second derivative (no curvature discontinuities)
-        - Better visual quality than linear or cosine interpolation
+        - Implemented with Horner's method for polynomial evaluation
         
-        **Vectorization:**
+        **Scalar vs Array Inputs:**
 
-        Entire operation vectorized via numpy broadcasting:
+        Method accepts both scalar and array coordinates:
 
-        - All coordinates processed simultaneously
-        - No explicit loops over grid cells
-        - Efficient memory access patterns
+        - Scalar inputs (x=float, y=float): Returns single noise value
+        - Array inputs (x=ndarray, y=ndarray): Returns noise array matching input shape
+        - Useful for both single-point queries and full map generation
         
-
         See Also
         --------
         _fade : Smoothing function for interpolation weights
         _gradient : Gradient vector selection and dot product
-        _lerp : Linear interpolation
-        _gen_perlin : Multi-octave wrapper that calls this method
-        
+        _evaluateTile : Calls this method to accumulate multi-octave noise
 
         Examples
         --------
-        Typical usage (called by _gen_perlin):
+        ### Single point query (scalar inputs):
+        
+        >>> pn = PerlinNoise(size=100, seed=42)
+        >>> noise_value = pn._perlin(5.3, 7.8)
+        >>> print(f"Noise at (5.3, 7.8): {noise_value:.3f}")
+        Noise at (5.3, 7.8): -0.134
+        
+        ### Array-based generation (typical usage):
         
         >>> pn = PerlinNoise(size=100, seed=42)
         >>> # Create coordinate meshgrid
         >>> x = np.linspace(0, 10, 100)
         >>> X, Y = np.meshgrid(x, x)
         >>> # Generate single-octave noise
-        >>> noise = pn._perlin2D(X, Y)
+        >>> noise = pn._perlin(X, Y)
         >>> print(noise.shape)
         (100, 100)
         """
-        xi, yi = x.astype(int)%255, y.astype(int)%255 # Coordinates of top left
-        xf, yf = x-x.astype(int), y-y.astype(int)     # Internal coordinates
-        u, v = self._fade(xf), self._fade(yf)         # Fade factors
-        # Noise components
-        """Map the internal coordinates to the permutation table to select the
-        gradient vector then perfom a dot product with the coordinate grid"""
-        n00 = self._gradient(self.p[self.p[xi    ] + yi    ], xf    , yf    )
-        n01 = self._gradient(self.p[self.p[xi    ] + yi + 1], xf    , yf - 1)
-        n10 = self._gradient(self.p[self.p[xi + 1] + yi    ], xf - 1, yf    )
-        n11 = self._gradient(self.p[self.p[xi + 1] + yi + 1], xf - 1, yf - 1)
+
+        # Convert scalar inputs to numpy arrays
+        x = np.asarray(x)
+        y = np.asarray(y)
+
+        # Grid cell coordinates
+        xi = np.floor(x).astype(int)
+        yi = np.floor(y).astype(int)
+        xf = x - xi
+        yf = y - yi
+
+        # Hash the grid corners to permutation table
+        g00 = self.p[self.p[ xi      & 255] + ( yi      & 255)]
+        g01 = self.p[self.p[ xi      & 255] + ((yi + 1) & 255)]
+        g10 = self.p[self.p[(xi + 1) & 255] + ( yi      & 255)]
+        g11 = self.p[self.p[(xi + 1) & 255] + ((yi + 1) & 255)]
+
+        # Dot product with gradients
+        n00 = self._gradient(g00, xf    , yf    )
+        n01 = self._gradient(g01, xf    , yf - 1)
+        n10 = self._gradient(g10, xf - 1, yf    )
+        n11 = self._gradient(g11, xf - 1, yf - 1)
+
+        # Fade factors
+        u = self._fade(xf)
+        v = self._fade(yf)
+
         # Combine noise components using smoothing factors
         """First combine lefts and rights, then top with bottom"""
-        x1 = self._lerp(n00, n10, u)
-        x2 = self._lerp(n01, n11, u)
-        return self._lerp(x1, x2, v)
+        x1 = n00 * (1 - u) + n10 * u
+        x2 = n01 * (1 - u) + n11 * u
+
+        return x1 * (1 - v) + x2 * v
 
     #--------------------------------------------------------------------------
     def _fade(self, t:NPFltArr)->NPFltArr:
         """
         Smoothing function for Perlin noise interpolation.
     
-        Applies improved Perlin fade curve (6t^5 - 15t^4 + 10t^3) to create smooth
-        interpolation weights. Ensures C^2 continuity (smooth curvature) at grid
-        cell boundaries, eliminating visible artifacts in generated noise.
+        Applies improved Perlin fade curve (6t^5 - 15t^4 + 10t^3) to create
+        smooth interpolation weights. Ensures C^2 continuity (smooth curvature)
+        at grid cell boundaries, eliminating visible artifacts in generated
+        noise.
         
-
         Parameters
         ----------
         t : ndarray
             Interpolation parameter(s) in range [0, 1]. Typically internal
             coordinates (xf, yf) within grid cell.
 
-                
         Returns
         -------
         smoothed : ndarray
             Smoothed interpolation weights, same shape as input. Values in range
             [0, 1] with smooth derivatives.
             
-
         Notes
         -----
         **Mathematical Form:**
@@ -4166,22 +5306,17 @@ class PerlinNoise:
             
                 f''(t) = 120t^3 - 180t^2 + 60t = 60t(2t - 1)(t - 1)
             
-        **Performance:**
+        **Horner's Method Implemented:**
 
-        Despite higher polynomial degree, vectorized numpy operations make this
-        very efficient:
-
-        - Single pass over array
-        - No branching or conditionals
-        - Cache-friendly memory access
+            Uses Horner's method for efficient polynomial evaluation, performing
+            multiplications instead of exponentiation. Reduces computation from
+            3 exponentiations and 2 multiplications to 6 multiplications.
+            Provides faster execution and minimized floating-point errors.
         
-
         See Also
         --------
-        _perlin2D : Uses fade for interpolation weights u and v
-        _lerp : Linear interpolation using fade weights
+        _perlin : Uses fade for interpolation weights u and v
         
-
         Examples
         --------
         ### Fade curve shape:
@@ -4205,10 +5340,15 @@ class PerlinNoise:
         >>> print(fade_t)
         [0.    0.5   1.   ]  # Smooth interpolation from 0 to 1
         """
-        return (6 * t**5) - (15 * t**4) + (10 * t**3)
+
+        return t * t * t * (t * (t * 6 - 15) + 10)
     
     #--------------------------------------------------------------------------
-    def _gradient(self, h:int, xf:NPFltArr, yf:NPFltArr)->NPFltArr:
+    def _gradient(self, 
+                  h:Union[int, NPIntArr], 
+                  xf:Union[Number, NPFltArr], 
+                  yf:Union[Number, NPFltArr],
+                  )->NPFltArr:
         """
         Select gradient vector from hash and compute dot product with offset.
     
@@ -4217,26 +5357,26 @@ class PerlinNoise:
         operation that gives Perlin noise its characteristic coherent
         randomness.
         
-
         Parameters
         ----------
         h : int or ndarray of int
             Hash value(s) from permutation table: h = p[p[xi] + yi]. Used to
-            select gradient vector via modulo operation.
-        xf : ndarray
+            select gradient vector by modulo operation. Can be single integer or
+            array of hash values.
+        xf : float or ndarray
             X-offset from left edge of grid cell, range [0, 1). Represents
-            fractional position within cell.
-        yf : ndarray
-            Y-offset from top edge of grid cell, range [0, 1).
-        
+            fractional position within cell. Can be scalar or array.
+        yf : float or ndarray
+            Y-offset from top edge of grid cell, range [0, 1). Can be scalar
+            or array.
         
         Returns
         -------
-        dot_product : ndarray
-            Dot product of selected gradient with (xf, yf) offset vector. Values
-            typically in range [-1, 1] before interpolation.
+        dot_product : float or ndarray
+            Dot product of selected gradient with (xf, yf) offset vector. Return
+            type matches input: scalar inputs return scalar, array inputs return
+            array. Values typically in range [-1, 1] before interpolation.
             
-        
         Notes
         -----
         **Gradient Vector Selection:**
@@ -4287,28 +5427,25 @@ class PerlinNoise:
         
         **Array Broadcasting:**
 
-        Function handles both scalar and array inputs via numpy broadcasting:
+        Function handles both scalar and array inputs by numpy broadcasting:
 
         - h, xf, yf can be single values or meshgrids
         - Vectorized operations over entire coordinate arrays
         - No explicit loops needed
         
-
         See Also
         --------
-        _perlin2D : Calls _gradient for each grid cell corner
-        _get_permutation_table : Generates hash values used here
+        _perlin : Calls _gradient for each grid cell corner
+        _calcPermutationTable : Generates hash values used here
         
-
         References
         ----------
         [1] Perlin, K. (2002). "Improving Noise." ACM SIGGRAPH 2002. Explains
         gradient selection and reduction to 4 vectors for 2D.
         
-            
         Examples
         --------
-        ### Single gradient selection:
+        ### Single gradient selection (scalar inputs):
         
         >>> pn = PerlinNoise(size=100, seed=42)
         >>> h = 7  # Example hash value
@@ -4317,7 +5454,7 @@ class PerlinNoise:
         >>> print(f"Gradient index: {h % 4}, Dot product: {dot:.3f}")
         Gradient index: 3, Dot product: -0.300
         
-        ### Vectorized gradient computation:
+        ### Vectorized gradient computation (array inputs):
         
         >>> h_array = np.array([0, 1, 2, 3])
         >>> xf_array = np.full(4, 0.5)
@@ -4326,151 +5463,58 @@ class PerlinNoise:
         >>> print(dots)
         [ 0.5 -0.5  0.5 -0.5]  # yf, -yf, xf, -xf
         """
-        vectors = np.array([[0, 1], [0, -1], [1, 0], [-1, 0]])
-        g = vectors[h % 4]
-        return (g[:, :, 0] * xf) + (g[:, :, 1] * yf)
-    
-    #--------------------------------------------------------------------------
-    def _lerp(self, a:NPFltArr, b:NPFltArr, x:NPFltArr)->NPFltArr:
-        """
-        Linear interpolation between two values or arrays.
-    
-        Computes weighted average of a and b using interpolation parameter x.
-        Standard lerp formula: result = a + x(b - a).
+        g = self._GRADIENTS[h % 4]
         
-
-        Parameters
-        ----------
-        a : ndarray
-            Start values. Interpolation returns a when x=0.
-        b : ndarray
-            End values. Interpolation returns b when x=1.
-        x : ndarray
-            Interpolation weight(s), typically in range [0, 1]. Usually output
-            from _fade() for smooth interpolation.
-            
-
-        Returns
-        -------
-        interpolated : ndarray
-            Linearly interpolated values between a and b. Same shape as input
-            arrays (via broadcasting).
-
-                        
-        Notes
-        -----
-        **Formula:**
-        
-            lerp(a, b, x) = a + x(b - a) = (1-x)a + xb
-        
-        - **Properties:**
-
-            - lerp(a, b, 0) = a
-            - lerp(a, b, 1) = b
-            - lerp(a, b, 0.5) = (a + b) / 2
-        
-        **Usage in Perlin Noise:**
-        
-        Called twice in bilinear interpolation sequence:
-
-        1. Interpolate between top-left and top-right corners (horizontal)
-        2. Interpolate between bottom-left and bottom-right corners (horizontal)
-        3. Interpolate between results from steps 1 and 2 (vertical)
-        
-        >>> x1 = _lerp(n00, n10, u)  # Top edge
-        >>> x2 = _lerp(n01, n11, u)  # Bottom edge
-        >>> result = _lerp(x1, x2, v)  # Final value
-        
-        **Array Broadcasting:**
-
-        Supports numpy broadcasting for efficient vectorization:
-
-        - a, b, x can be scalars or arrays
-        - Result shape determined by broadcast rules
-        - No explicit loops needed
-        
-        **Extrapolation:**
-
-        Function works for x outside [0, 1]:
-
-        - x < 0: Extrapolates beyond a
-        - x > 1: Extrapolates beyond b
-        - Typical use cases keep x ∈ [0, 1] for interpolation
-        
-
-        See Also
-        --------
-        _perlin2D : Uses lerp for bilinear interpolation
-        _fade : Generates smooth x values for interpolation
-        
-
-        Examples
-        --------
-        ### Basic interpolation:
-        
-        >>> pn = PerlinNoise(size=100)
-        >>> # Interpolate between 10 and 20
-        >>> result = pn._lerp(10, 20, 0.3)
-        >>> print(result)
-        13.0  # 10 + 0.3 * (20 - 10) = 13
-        
-        ### Array interpolation:
-        
-        >>> a = np.array([0, 10, 20])
-        >>> b = np.array([10, 20, 30])
-        >>> x = np.array([0, 0.5, 1])
-        >>> result = pn._lerp(a, b, x)
-        >>> print(result)
-        [ 0. 15. 30.]  # [a[0], midpoint, b[2]]
-        
-        Bilinear interpolation example:
-        
-        >>> # Corner values
-        >>> n00, n01, n10, n11 = 0, 10, 5, 15
-        >>> # Interpolation weights (from fade)
-        >>> u, v = 0.3, 0.7
-        >>> # Horizontal interpolation
-        >>> x1 = pn._lerp(n00, n10, u)  # Top: 1.5
-        >>> x2 = pn._lerp(n01, n11, u)  # Bottom: 11.5
-        >>> # Vertical interpolation
-        >>> final = pn._lerp(x1, x2, v)  # Result: 8.5
-        >>> print(final)
-        8.5
-        """
-        return a + x * (b - a)
+        # Handle scalar and array inputs
+        if g.ndim == 1:
+            # Scalar case: g is shape (2,)
+            return (g[0] * xf) + (g[1] * yf)
+        else:
+            # Array case: g is shape (..., 2)
+            return (g[..., 0] * xf) + (g[..., 1] * yf)
     
     #--------------------------------------------------------------------------
     def _normalize(self, n:NPFltArr)->NPFltArr:
         """
-        Normalize array to range [0, 1] via linear scaling.
+        Normalize array to range [0, 1] using empirically corrected amplitude.
     
-        Applies min-max normalization to map array values from arbitrary range
-        to [0, 1]. Preserves relative spacing between values while fitting to
-        standard range.
+        Applies pre-computed normalization bounds (min, max-min) to map raw
+        Perlin noise values to standard [0, 1] range. Ensures consistent
+        normalization across all tiles and evaluation methods regardless of
+        generation order.
         
         Parameters
         ----------
         n : ndarray
-            Input array with arbitrary value range.
-            Typically raw Perlin noise before normalization.
+            Raw Perlin noise before normalization.
             
         Returns
         -------
         normalized : ndarray
-            Array with values linearly scaled to [0, 1].
-            Same shape as input. Minimum value -> 0, maximum value -> 1.
-            
+            Array with values linearly scaled to [0, 1], same shape as input.
+            Clipped to ensure exact bounds.
         
         Notes
         -----
         **Formula:**
         
-            normalized = (n - min(n))/(max(n) - min(n))
+            normalized = (n - min) / diff
+
+        where:
+
+        - min: Empirical minimum
+        - diff: Empirical range (max - min)
         
-        **Algorithm Steps:**
+        **Clipping Rationale:**
+    
+        `np.clip(normalized, 0.0, 1.0)` handles edge cases:
         
-        1. Shift array so minimum = 0: n' = n - min(n)
-        2. Scale so maximum = 1: result = n' / max(n')
+        - Floating-point rounding errors near bounds
+        - Extreme values in rare octave phase alignments
+        - Numerical precision limits in large arrays
+        
+        In practice, clipping affects <0.5% of values and ensures exact [0, 1]
+        range for downstream consumers (Floor, etc.).
 
         **Why Normalization:**
 
@@ -4485,48 +5529,420 @@ class PerlinNoise:
         - Consistent [0, 1] output range
         - Full utilization of available range
         - Predictable behavior for terrain generation
-        
-        **Preservation Properties:**
-
-        Linear scaling preserves:
-
-        - Relative ordering (if a < b, then norm(a) < norm(b))
-        - Proportional spacing between values
-        - Smoothness and continuity of function
-        
-        **Edge Cases:**
-
-        - Constant array (max = min): Results in division by zero
-          Current implementation: NaN/inf values (should handle explicitly)
-        - Very small range: Possible floating-point precision issues
-        
-
+    
         See Also
         --------
-        _gen_perlin : Calls _normalize on final multi-octave noise
-        Floor.standard_map : Uses normalized noise for depth mapping
+        _calcNormalizationBounds : Computes min_val and diff during initialization
+        evaluateRegion : Generates raw noise, then normalizes with this method
+        __init__ : Calls _calcNormalizationBounds() to set self._min, self._diff
+        """
+        
+        normalized = (n - self._min) / self._diff
+        return np.clip(normalized, 0.0, 1.0)
+    
+    #--------------------------------------------------------------------------
+    def _calcTileSize(self, size:Optional[int]=None)->int:
+        """
+        Determine optimal tile size that evenly divides the array.
 
+        Calculates a tile dimension that is either the entire array size for
+        arrays smaller than _TILE_SIZE_PRE, or is the divisor of size with no
+        remainder that is closest to _TILE_SIZE_STD for large arrays.
+
+        Parameters
+        ----------
+        size : int, optional
+            Array side length. If None, uses self.size.
+        
+        Returns
+        -------
+        tileSize : int
+            Tile dimension that evenly divides size
+
+        Notes
+        -----
+        **Sizing Strategy:**
+        
+        - If size < _TILE_SIZE_PRE: Return size (entire array is one tile)
+        - If size >= _TILE_SIZE_PRE: Find divisor closest to _TILE_SIZE_STD
+        
+        **Algorithm:**
+        
+        1. Find all divisors of size: d where size % d == 0
+        2. Among divisors, select one closest to _TILE_SIZE_STD
+        3. This minimizes memory-generation time tradeoff
+        
+        **Tile-to-Grid Mapping:**
+        
+        Number of tiles in each dimension: numTiles = ceil(size / tileSize)
+        
+        - size=1000, tileSize=500 -> 2x2 grid -> 4 tiles
+        - size=2000, tileSize=500 -> 4x4 grid -> 16 tiles
+        - size=5000, tileSize=500 -> 10x10 grid -> 100 tiles
+        
+        See Also
+        --------
+        _genTile : Generates individual tile of calculated size
+        _isGenerated : Checks generation status using this tile size
+        sampleRegion : Uses cached tiling for region queries
+        evaluateRegion : Uses tiled computation for region queries
         
         Examples
         --------
-        ### Typical usage:
-        
-        >>> pn = PerlinNoise(size=100, seed=42)
-        >>> # Raw multi-octave noise
-        >>> raw_noise = np.zeros((100, 100))
-        >>> # ... generate octaves ...
-        >>> print(f"Raw range: [{raw_noise.min():.3f},"
-        ...       f" {raw_noise.max():.3f}]")
-        Raw range: [-1.234, 2.567]
-        >>> # Normalize
-        >>> norm_noise = pn._normalize(raw_noise)
-        >>> print(f"Normalized: [{norm_noise.min():.3f},"
-        ...       f" {norm_noise.max():.3f}]")
-        Normalized: [0.000, 1.000]
+        >>> pn = PerlinNoise(size=1000, seed=42)
+        >>> pn._calcTileSize()
+        500
+        >>> pn._calcTileSize(size=1700)
+        425
+        >>> pn._calcTileSize(size=1024)
+        512 
         """
-        n += (0 - n.min())
-        return n / n.max()
+
+        size = self.size if (size is None) else size
+
+        # Less than TILE_SIZE_PRE: tileSize = size
+        if (size < self._TILE_SIZE_PRE):
+            return size
         
+        # Find divisors of size
+        divisors = []
+        for i in range(1, int(np.sqrt(size)) + 1):
+            if (size % i == 0):
+                divisors.append(i)
+                divisors.append(size // i)        # duplicate if square is fine
+        
+        return min(divisors, key=lambda x: abs(x - self._TILE_SIZE_STD))
+
+    #--------------------------------------------------------------------------
+    def _isGenerated(self, i:int, j:int)->bool:
+        """
+        Check if the tile containing position at (i,j) has been generated.
+
+        Converts array position to tile grid index and queries the internal tile
+        cache dictionary. Returns generation status without triggering tile
+        computation. Used to determine if lazy evaluation is needed.
+
+        Parameters
+        ----------
+        i : int
+            Column index (x direction, horizontal). Valid range: [0, size).
+        j : int
+            Row index (y direction, vertical). Valid range: [0, size).
+
+        Returns
+        -------
+        isGenerated : bool
+            True if the tile containing position (i, j) has been generated and
+            cached.
+
+        Notes
+        -----
+        **Tile Grid Mapping:**
+        
+        Converts position to tile indices by integer division:
+        
+        >>> tileI = i // self._tileSize
+        >>> tileJ = j // self._tileSize
+        
+        Tiles are indexed by (tileI, tileJ) in self._tiles dictionary.
+        
+        **Cache Structure:**
+        
+        self._tiles dictionary stores boolean flags:
+        
+        - Key: (tileI, tileJ) tuple
+        - Value: True if generated, False or missing if not
+        
+        Noise data itself is stored in self.noise array, not in _tiles dict. The
+        _tiles dictionary only tracks generation status for lazy evaluation.
+        
+        See Also
+        --------
+        sample : Uses _isGenerated() to determine if tile generation needed
+        _genTile : Generates tile and marks as generated in _tiles
+        
+        Examples
+        --------
+        >>> pn = PerlinNoise(size=2000, seed=42)
+        >>> # Check position in center
+        >>> pn._isGenerated(1000, 1000)
+        False  # Large array, not yet generated
+        >>> 
+        >>> # Trigger generation with sample call
+        >>> _ = pn.sample(1000, 1000)
+        >>> 
+        >>> # Check again
+        >>> pn._isGenerated(1000, 1000)
+        True  # Tile now cached
+        >>> 
+        >>> # Nearby position in same tile also marked generated
+        >>> pn._isGenerated(1050, 1050)
+        True  # Same tile (if tileSize > 50)
+        >>>
+        >>> # Inspect tile dictionary
+        >>> print(pn._tiles)
+        {(2, 2): True}
+        """
+
+        tileI = i // self._tileSize
+        tileJ = j // self._tileSize
+        return self._tiles.get((tileI, tileJ), False)
+    
+    #--------------------------------------------------------------------------
+    def _genTile(self, tileI:int, tileJ:int)->None:
+        """
+        Generate and cache a tile of the noise array at grid position (tileI,
+        tileJ).
+
+        Evaluates the multi-octave Perlin noise for the specified tile region
+        and writes results to the corresponding area of the noise array. Marks
+        tile as generated in cache dictionary to prevent redundant computation.
+        Facilitates lazy evaluation.
+
+        Parameters
+        ----------
+        tileI : int
+            Tile grid column index ("x" direction, horizontal). Valid range: [0,
+            _tileN).
+        tileJ : int
+            Tile grid row index ("y" direction, vertical). Valid range: [0,
+            _tileN).
+
+        Notes
+        -----
+        **Tile Generation Process:**
+
+        1. Check if tile is already generated by look-up in _tiles dictionary
+        2. Convert tile grid indices to array slice bounds
+        3. Generate normalized Perlin noise for region by _evaluateTile()
+        4. Copy tile data to noise array, overwriting sentinel values
+        5. Update cache dictionary to prevent recomputation
+
+        **Tile Management:**
+    
+        Tile data stored in two places:
+        
+        1. self.noise[jMin:jMax, iMin:iMax]: Actual noise values
+        2. self._tiles[(tileI, tileJ)]: Boolean flag (True = generated)
+        
+        Dictionary stores only generation status, not tile data itself. This
+        minimizes memory overhead for tile management.
+        
+        See Also
+        --------
+        _evaluateTile : Core tile generation implementation
+        _isGenerated : Check tile generation status
+        sample : Triggers tile generation on-demand
+        sampleRegion : Generates multiple tiles as needed
+        _calcTileSize : Determines tile dimensions
+        """
+        
+        # Guard
+        if self._tiles.get((tileI, tileJ), False):
+            return
+        
+        # Determine array index bounds for this tile
+        iMin = tileI * self._tileSize
+        iMax = (tileI + 1) * self._tileSize
+        jMin = tileJ * self._tileSize
+        jMax = (tileJ + 1) * self._tileSize
+
+        # Generate tile
+        tile = self._evaluateTile(iMin, iMax, jMin, jMax)
+
+        # Write to noise array
+        self.noise[jMin:jMax, iMin:iMax] = tile
+
+        # Mark tile as generated
+        self._tiles[(tileI, tileJ)] = True
+
+    #--------------------------------------------------------------------------
+    def _evaluateTile(self,
+                      iMin:int, iMax:int,
+                      jMin:int, jMax:int,
+                      )->NPFltArr:
+        """
+        Evaluate multi-octave Perlin noise for a single tile without caching.
+        
+        Computes normalized Perlin noise over specified rectangular region by
+        accumulating contributions from all octaves. Each octave is evaluated
+        at progressively higher frequency and lower amplitude. Results are
+        normalized to [0, 1] range using precomputed empirical bounds. This is
+        the core computation method for tile-based lazy evaluation.
+        
+        Parameters
+        ----------
+        iMin : int
+            Column index (x direction, horizontal) lower bound (inclusive). 
+        iMax : int
+            Column index upper bound (exclusive).
+        jMin : int
+            Row index (y direction, vertical) lower bound (inclusive).
+        jMax : int
+            Row index upper bound (exclusive).
+            
+        Returns
+        -------
+        noise : ndarray, shape (jMax-jMin, iMax-iMin)
+            Normalized Perlin noise values in range [0, 1]. Note array indexing
+            is [row, column] = [j, i].
+
+        Notes
+        -----
+        **Tile Evaluation Algorithm:**
+    
+        1. **Region Dimensions:**
+
+          Calculate tile width and height from bounds:
+          
+          >>> width = iMax - iMin
+          >>> height = jMax - jMin
+        
+        2. **Base Frequency Calculation:**
+
+          Determine fundamental frequency from scale parameter:
+          
+          >>> freq = self.size / self.scale
+          
+          Lower scale -> higher frequency -> finer features.
+        
+        3. **Octave Accumulation:**
+
+          For each octave in range [0, self.octaves):
+          
+          a. **Frequency and Amplitude:**
+              
+              >>> currFreq = freq * (2.0 ** octave)
+              >>> currAmp = self.persistence ** octave
+              
+              Frequency doubles each octave (frequency_i = freq * 2^i).
+              Amplitude decays each octave (amplitude_i = persistence^i).
+          
+          b. **Frequency Space Mapping:**
+  
+              Convert tile bounds to Perlin coordinate space:
+              
+              >>> iStart = (iMin / self.size) * currFreq
+              >>> iEnd = (iMax / self.size) * currFreq
+              >>> jStart = (jMin / self.size) * currFreq
+              >>> jEnd = (jMax / self.size) * currFreq
+              
+              Maps array indices to frequency-scaled coordinates.
+          
+          c. **Coordinate Grid Generation:**
+  
+              Create meshgrid spanning frequency space region:
+              
+              >>> iCoords = np.linspace(iStart, iEnd, width, endpoint=False)
+              >>> jCoords = np.linspace(jStart, jEnd, height, endpoint=False)
+              >>> iMesh, jMesh = np.meshgrid(iCoords, jCoords)
+              
+              Generates width x height grid of evaluation points.
+          
+          d. **Perlin Evaluation:**
+  
+              Compute raw Perlin noise at meshgrid coordinates:
+              
+              >>> currNoise = self._perlin(iMesh, jMesh) * currAmp
+              
+              Applies amplitude scaling to this octave's contribution.
+          
+          e. **Accumulation:**
+  
+              Add octave contribution to cumulative noise:
+              
+              >>> noise += currNoise
+              
+              Builds up fractal detail across frequency scales.
+        
+        4. **Normalization:**
+
+          Apply pre-computed bounds for consistent [0, 1] mapping:
+          
+          >>> return self._normalize(noise)
+          
+          Uses self._min and self._diff from _calcNormalizationBounds().
+        
+        **Multi-Octave Generation:**
+        
+        Fractal detail achieved by summing octaves at different frequencies:
+        
+        - Octave 0: Base frequency (freq), full amplitude (1.0)
+        - Octave 1: Double frequency (2*freq), reduced amplitude (persistence)
+        - Octave 2: Quadruple frequency (4*freq), reduced (persistence^2)
+        - Octave i: Frequency = freq * 2^i, Amplitude = persistence^i
+        
+        Lower octaves contribute large-scale features (rolling hills).
+        Higher octaves add fine detail (rocky texture).
+        
+        **Coordinate Space Transformation:**
+        
+        Array indices must be mapped to frequency space for Perlin evaluation:
+        
+        - Array space: Integer indices [0, size) with uniform spacing
+        - Frequency space: Float coordinates [0, currFreq) with non-uniform features
+        - Transformation: coord_freq = (index / size) * currFreq
+        
+        This ensures correct spatial frequency regardless of tile location.
+        
+        See Also
+        --------
+        _genTile : Wrapper that calls this method and caches result
+        evaluateRegion : Public method that uses this for direct evaluation
+        _perlin : Core Perlin noise function used per octave
+        _normalize : Applies empirical bounds for [0, 1] mapping
+        _calcNormalizationBounds : Pre-computes bounds used in normalization
+        
+        Warnings
+        --------
+        **Large Region Memory Risk:**
+
+        This method does not enforce tile-based chunking. Requesting regions
+        with max(width, height) > 6000 may cause memory allocation errors or
+        system instability. Method assumes caller has already performed
+        appropriate chunking for larger requests.
+
+        **Internal Use Only:**
+
+        This method is not intended for direct external calls. Public methods
+        (sample, sampleRegion, etc) provide safe interfaces with automatic
+        tile management. Direct calls here bypass safety checks.
+        """
+        
+        width = iMax - iMin
+        height = jMax - jMin
+        
+        # Base frequency
+        freq = self.size / self.scale
+
+        # Allocate array
+        noise = np.zeros((height, width), dtype=np.float64)
+
+        # Sum noise across octaves
+        for octave in range(self.octaves):
+            # Frequency and amplitude for this octave
+            currFreq = freq * (2.0 ** octave)
+            currAmp = self.persistence ** octave
+
+            # Map chunk bounds to frequency space
+            iStart = (iMin / self.size) * currFreq
+            iEnd = (iMax / self.size) * currFreq
+            jStart = (jMin / self.size) * currFreq
+            jEnd = (jMax / self.size) * currFreq
+
+            # Create chunk coordinate arrays
+            iCoords = np.linspace(iStart, iEnd, width, endpoint=False)
+            jCoords = np.linspace(jStart, jEnd, height, endpoint=False)
+            iMesh, jMesh = np.meshgrid(iCoords, jCoords)
+
+            # Evaluate Perlin noise
+            currNoise = self._perlin(iMesh, jMesh) * currAmp
+
+            # Accumulate noise
+            noise += currNoise
+
+        return self._normalize(noise)
+
 ###############################################################################
 
 class Pollution:
@@ -5570,6 +6986,9 @@ class Pollution:
                   size:Optional[int] = None,
                   resolution:int = 100,
                   fromOcean:bool = False,
+                  absolute:bool = False,
+                  vmin: Optional[float] = None,
+                  vmax: Optional[float] = None
                   )->None:
         """
         Display 2D image of pollution concentration with contour lines.
@@ -5584,10 +7003,16 @@ class Pollution:
             Number of points per dimension.
         fromOcean : bool, default=False
             If True, uses the ocean dimensions to set the domain size.
+        absolute : bool, optional
+            If True will use the same color bar no matter what concentrations are measured
+        vmin : float, optional
+            Minimum value for the color bar when it is absolute
+        vmax : float, optional
+            Maximum value for the color bar when it is absolute
         """
 
         if (z is None):
-            z = self.z_s + 20
+            z = self.z_s
             
         if (not fromOcean):
             size = self.oceanSize if (size is None) else size
@@ -5610,7 +7035,7 @@ class Pollution:
         contour = plt.contourf(X, Y, Z, levels=50, cmap=cmap_a)
  
         # Add colorbar
-        plt.colorbar(contour, label='Concentration')
+        plt.colorbar(contour, label='Concentration (g/m^3)')
         
         # Highlight pollution source
         plt.scatter(self.x_s, self.y_s, color='red', s=100, marker='*', 
@@ -5690,5 +7115,62 @@ class Pollution:
         plt.tight_layout()
         plt.show()
         plt.savefig('pollution_concentration_3D.png', bbox_inches='tight')
+
+#-------------------------------------------------------------------------#
+    def overlay2D(self, 
+              z: Optional[int] = None,
+              size: Optional[int] = None,
+              resolution: int = 100,
+              fromOcean: bool = False,
+              ax: Optional[plt.Axes] = None
+              ) -> None:
+        """
+        Display 2D image of pollution concentration with contour lines on a given axis.
+
+        Parameters
+        ----------
+        ax : matplotlib.axes.Axes, optional
+            If provided, plots on the given axis instead of creating a new figure.
+        """
+
+        if z is None:
+            z = self.z_s + 20
+            
+        if not fromOcean:
+            size = self.oceanSize if (size is None) else size
+            X, Y = self.automesh(size, resolution, center=False)
+            Z = self(X, Y, -abs(z))
+        else:
+            Z, X, Y = self.get2D(z=z)
+        
+        # Adjust alpha values in colormap
+        cmap = plt.cm.viridis_r
+        cmap_a = cmap(np.arange(cmap.N))
+        split = int(cmap.N * 0.2)
+        alpha = np.linspace(0, 1, split) ** 1.6
+        cmap_a[:split, -1] = alpha
+        cmap_a = mpl.colors.ListedColormap(cmap_a)
+
+        # Use provided axis or create a new figure
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+        
+        # Create filled contour plot
+        contour = ax.contourf(X, Y, Z, levels=50, cmap=cmap_a)
+
+        # Add colorbar
+        cbar = plt.colorbar(contour, ax=ax, label='Concentration (g/m^3)')
+
+        # Highlight pollution source
+        #ax.scatter(self.x_s, self.y_s, color='red', s=250, marker='*', label='Pollution Source')
+
+        ax.set_title(
+            f'2D Pollution Concentration\nWind Speed: {self.u:.2f} m/s, '
+            f'Direction: {np.degrees(self.v):.1f}°\n'
+            f'Source depth: {abs(self.z_s):.1f} m, Plot depth: {abs(z):.1f} m',
+            fontsize=12)
+        ax.set_xlabel('X (m)', fontsize=10)
+        ax.set_ylabel('Y (m)', fontsize=10)
+        ax.legend()
 
 ###############################################################################

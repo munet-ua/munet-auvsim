@@ -185,6 +185,7 @@ class Model(Vehicle):
         self.velocity = np.copy(vehObj.velocity[:3])
         self.nextEta = np.copy(vehObj.nextEta)
         self.nextVel = np.copy(vehObj.nextVel)
+        self.gbest = np.copy(vehObj.gbest[:4])
         # New Attributes for Modelling
         self._logSize = 0
         self._logCap = 512
@@ -342,9 +343,14 @@ class AUV(Vehicle):
         velocity=[x_dot,y_dot,z_dot]    linear velocities: NED frame
         """
         self.eta = np.zeros(6)              # position & attitude vector
+        self.concentration = 0.0              # Current concentration of the vehicle | Seperated Variable to keep roll, pitch, yaw
+        self.pbest = np.array([-1.0, -1.0, -1.0, -np.inf])  # personal best concentration of pollution
+        self.gbest = np.array([-1.0, -1.0, -1.0, -np.inf])  # global best concentration of pollution
         self.nu = np.zeros(6)               # BODY velocity vector
         self.velocity = np.zeros(3)         # NED velocity vector
         self.clock = 0                      # simulation time
+        self.simTime = 0                    # final duration of simulation
+        self.findSource = 0                 # time to find source
         self.immobilized = False            # mobility status flag
         self.sensors = {}                   # installed sensors
 
@@ -1208,6 +1214,11 @@ class AUV(Vehicle):
             self.info["Installed Sensors"] = sensors
         else:
             self.info.pop("Installed Sensors", None)
+    
+    def broadcastPosition(self)->None:
+        logPosition = logger.addLog('curPos')
+        logPosition.warning("Vehicle %s at (%.2f, %.2f, %.2f)", 
+                            self.callSign, *np.round(self.eta[0:3],2).tolist())
 
 ###############################################################################
         
@@ -1623,6 +1634,7 @@ class Remus100s(AUV):
         ## Sensors
         self.addSensor('current', nav.OceanCurrentSensor())
         self.addSensor('depth', nav.OceanDepthSensor())
+        self.addSensor('concentration', nav.ParticleConcentrationSensor())
         
         #---------------------------------------------------------------------#
         #   Control                                                           #
@@ -2175,7 +2187,7 @@ class Remus100s(AUV):
         return (m*speed + b)
 
     #--------------------------------------------------------------------------
-    def collectSensorData(self, ocean:env.Ocean, i:int)->None:
+    def collectSensorData(self, ocean:env.Ocean, swarm:List[Vehicle], i:int)->None:
         """
         Update vehicle environmental state from installed sensors.
 
@@ -2271,6 +2283,9 @@ class Remus100s(AUV):
                 self.V_c, self.beta_V_c = self.readSensor('current',ocean,i)
             if (ocean.floor is not None):
                 self.z_bed = self.readSensor('depth',ocean,self.eta)
+            if(ocean.pollution is not None):
+                self.concentration = self.readSensor('concentration',self.pbest,self.gbest,ocean,self.eta,swarm,self.group, self.target)
+                # Update pbest and possibly gbest if current position is better (has higher particle concentration)
     
     #--------------------------------------------------------------------------
     def loadPathFollowing(self)->None:
@@ -2573,6 +2588,29 @@ class Remus100s(AUV):
                               ("Repulsion Function", f"{rep}")])
         self.info.update([("Target", f"{self.target.callSign}")])
 
+#-------------------------------------------------------------------------------------------#
+    def loadPSO(self)->None:
+        """
+        Loads PSO guidance system and guidance law
+        
+        #TODO: maybe allow different repulsion functions besides just variableExpRepulsionAPF
+        """
+        
+        # Load Vehicle Modules
+        self.GuidSystem = guid.PSOSystem
+        self.GuidLaw = guid.PSOLaw
+        self.GuidLaw.attraction = guid.PSOAttraction
+        self.GuidLaw.repulsion = guid.PSORep
+        self.DepthAP = ctrl.pitchPID
+        self.HeadingAP = ctrl.headingPID
+
+        # Swarm Group Data Acquisition Method
+
+        # Generate Information Parameters
+        self.info.update([("Guidance System", "PSOSystem, PSOLaw")])
+        self.info.update([("Attraction Function", "PSOAttraction"),
+                              ("Repulsion Function", "PSORep")])
+
     #--------------------------------------------------------------------------
     def loadConstantProp(self,n_setpt:float=1200)->None:
         """
@@ -2666,7 +2704,7 @@ class Remus100s(AUV):
                           ("Node Address", f"{self.nodeAddr}")])
 
     #--------------------------------------------------------------------------
-    def loadMuNetLF(self, network:comm.MuNet, **kwargs)->None:
+    def loadMuNetLF(self, network, epDur:float=20, **kwargs)->None:
         """
         Configure communication via MuNet for leader-follower swarm.
 

@@ -74,6 +74,7 @@ NPFltArr = NDArray[np.float64]
 
 # Globarl Variables
 log = logger.addLog('nav')
+check = logger.addLog('debug')
 
 ###############################################################################
 
@@ -197,6 +198,64 @@ class OceanDepthSensor(Sensor):
         
         return ocean.floor(eta[0],eta[1])
 
+###############################################################################
+
+class ParticleConcentrationSensor(Sensor):
+    def collectData(self,
+                    pbest:NDArray[Any],
+                    gbest:NDArray[Any],
+                    ocean:Ocean=None, 
+                    eta:NPFltArr=None,
+                    swarm:List[Vehicle]=None,
+                    group:List[Vehicle]=None,
+                    target:Vehicle=None,
+                    **kwargs) -> float:
+        """
+        Senses particle concentration at vehicle's current position, updates pbest (of vehicle)
+        and gbest (of entire swarm/group) if necessary, then returns pbest
+
+        Parameters
+        ----------
+        pbest: [x, y, z, concentration value]
+            vehicle's pbest before checking concentration at it's current position
+        pbest: [x, y, z, concentration value]
+            gbest of swarm before checking concentration at vehicle's current position 
+        ocean:
+            Ocean object. Contains Pollution instance used for calculating particle concentration.
+        eta:  [x, y, z, roll, pitch, yaw]
+            Vehicle position/attitude vector
+        swarm:
+            List of every vehicle in vehicle's group
+        **kwargs:
+            Unused keyword arguments. Necessary for compatibility with read
+            methods in vehicles.AUV class.
+        
+        Returns
+        -------
+        pbest: [x, y, z, concentration value]
+            vehicle's pbest after checking concentration at it's current position
+        """
+
+        # max = 0.1 # basically the max concentration value that will be encountered
+
+        # __call__ function takes arrays, not scalars
+        self.concentration = ocean.pollution(np.array(eta[0]), np.array(eta[1]), np.array(eta[2])) # z shouldn't need inverting anymore
+            #if gbest.size > 4:
+                #gbest = gbest[0:4]
+                        
+                        #for x in swarm: #Uncommented 
+                            #x.gbest = np.array([*eta[0:3], concentration])
+                            #if concentration > 0.01:
+                                #x.pbest = np.array([*eta[0:3], concentration])
+        #for member in group:
+            #if member.gbest[3] > gbest[3]:
+                #gbest = member.gbest
+        #if target.gbest[3] > gbest[3]:
+            #gbest = target.gbest
+        
+        return self.concentration
+        # return concentration/max # deal with small values by normalizing
+        # return -np.log10(concentration)
 ###############################################################################
 
 def attitudeEuler(vehicle:Vehicle)->Tuple[NPFltArr,NPFltArr]:
@@ -606,5 +665,82 @@ def maxDepthLimit(vehicle:Vehicle,z:float)->float:
     z = min(z, max_depth)
 
     return z
+
+###############################################################################
+"""implemented in collectData method of ParticleConcentrationSensor class"""
+def senseParticleConcentration(ocean:Ocean,eta:NPFltArr)->float:
+    """
+    Will return particle concentration at position eta[0:2] (normalized using max normalization)
+
+    Parameters
+    ----------
+    ocean:
+        Ocean object. Contains Pollution instance used for calculating particle concentration.
+    eta :  [x, y, z, roll, pitch, yaw]
+        Vehicle position/attitude vector
+    
+    Returns
+    -------
+    concentration:
+        particle concentration at vehicle position (eta[0:2])
+
+    """
+    max = 0.1 # basically the max concentration value that will be encountered
+
+    # __call__ function takes arrays, not scalars
+    concentration = ocean.pollution(np.copy(np.array(eta[0])), np.copy(np.array(eta[1])), np.copy(np.array(eta[2]))) # z shouldn't need inverting anymore
+    return concentration/max # deal with small values by normalizing
+    # return -np.log10(concentration)
+
+'''Used for Aswanth's plume simulation'''
+
+# # load pickle file for senseParticleConcentration (Should probably be at top of file)
+# pickle_file = os.path.abspath('particle_history.pkl')
+# # Load the particle history from the pickle file
+# with open(pickle_file, 'rb') as f:
+#     particle_history = pickle.load(f)
+
+# def senseParticleConcentration(r:int, eta:NPFltArr, t:int)->float:
+#     """
+#     Will return particle concentration in a cuboid centered at position eta[0:2] at time step t
+
+#     Parameters
+#     ----------
+
+#     r : range (in meters). Seeing how many particles are in a cube (2r)^3 in volume, centered at vehicle's position
+#     eta :  [x, y, z, roll, pitch, yaw]
+#         Vehicle position/attitude vector
+#     t : current time step of simulation, looking at where all the particles were at this time
+    
+#     Returns
+#     -------
+#     concentration:
+#         particle concentration at vehicle position (eta[0:2]) and time step t
+
+
+#     //JPC 09/2023
+#     """
+#     # x = every particle's position on x axis at time step t (same idea for y and z)
+#     x, y, z = particle_history[t]
+
+#     # Define bounds of cuboid 
+#     upper_x = eta[0] + r
+#     lower_x = eta[0] - r
+#     upper_y = eta[1] + r
+#     lower_y = eta[1] - r
+#     upper_z = eta[2] + r
+#     lower_z = eta[2] - r
+
+#     # Check which particles are within the bounds for each axis
+#     x_within_range = (x >= lower_x) & (x <= upper_x) # x_within_range[i] == true if x[i] is within x bounds of cuboid
+#     y_within_range = (y >= lower_y) & (y <= upper_y)
+#     z_within_range = (z >= lower_z) & (z <= upper_z)
+
+#     # See which particles are in bounds for all three axes, and count how many fulfill this condition using sum()
+#     num_particles_in_range = (x_within_range & y_within_range & z_within_range).sum()
+
+#     # each side of the cuboid is actually 2r in length, so volume is 2r cubed    
+#     volume = (2*r)**3
+#     return num_particles_in_range/volume
 
 ###############################################################################

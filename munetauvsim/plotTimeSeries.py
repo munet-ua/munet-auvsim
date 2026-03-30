@@ -47,10 +47,11 @@ import mpl_toolkits.mplot3d.axes3d as p3
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as np
 import math
-from munetauvsim.environment import Ocean
+from munetauvsim.environment import Ocean, Pollution
 from munetauvsim.vehicles import Vehicle
 from munetauvsim.gnc import ssa
 from munetauvsim import logger
+from munetauvsim.guidance import wmax, wmin, c1min, c1max, c2min, c2max, r1min, r1max, r2min, r2max
 
 #-----------------------------------------------------------------------------#
 
@@ -707,11 +708,10 @@ def plot3D(simData:NPFltArr,
         # Sample floor depth map at grid points
         x_pts = np.linspace(x_min, x_max, x_res)
         y_pts = np.linspace(y_min, y_max, y_res)
-        floorGrid = ocean.floor.sample_grid(x_pts, y_pts)
+        floorGrid = ocean.floor.sampleGrid(x_pts, y_pts)
 
         # Create meshgrid for plotting floor surface
         x_f, y_f = np.meshgrid(x_pts, y_pts)
-        z_f = floorGrid.T
 
         # Set floor color map
         terrain_cmap = mpl.colormaps['terrain']
@@ -721,7 +721,7 @@ def plot3D(simData:NPFltArr,
 
         # Render floor surface
         floorMap = ax.plot_surface(
-            x_f, y_f, z_f,
+            x_f, y_f, floorGrid,
             cmap=custom_cmap,
             shade=True,
             edgecolor='none',
@@ -810,5 +810,126 @@ def plot3D(simData:NPFltArr,
     log.info('Saving animation...')
     ani.save(filename, writer=animation.PillowWriter(fps=FPS))
     log.info('Done saving animation.')
+
+###############################################################################
+
+def plot2D(simData:NPFltArr,
+           size:int,
+           numDataPoints:int,
+           FPS:int,
+           filename:str,
+           vehicles:List[Vehicle],
+           figNo:int, 
+           traj:bool=True,
+           pos:bool=True,
+           waypts:bool=False,
+           pollution: Optional[Pollution] = None  # Add Pollution object for display2D
+           )->None:
+    """
+    Plot a top-down view (X-Y plane) of the vehicles' positions and trajectories.
+
+    Parameters
+    ----------
+    Parameters
+    ----------
+    simData : (n_vehicles, N, [eta, nu, u_control, u_actual])
+        Array of simulation data for all vehicles.
+    numDataPoints:
+        Number of data points to use in plot. Divides simData into
+        numDataPoints samples.
+    FPS:
+        Frames Per Second, used by the animated GIF.
+    filename:
+        Animated GIF file name.
+    vehicles:
+        Vehicle objects in order corresponding to simData.
+    figNo:
+        Figure number for plot window.
+    traj:
+        Set True to plot line showing vehicle trajectories.
+    pos:
+        Set True to plot point indicating vehicle location.
+    """
+     # Prepare the figure and axis
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Overlay the pollution concentration using display2D
+    if pollution is not None:
+        pollution.overlay2D(ax=ax, size=size)  # Pass ax to plot on the same figure
+
+    ax.set_title('Top-Down View: East (X) vs. North (Y)')
+    ax.set_xlabel('X / East (m)')
+    ax.set_ylabel('Y / North (m)')
+
+    # Display current PSO parameters
+    # pso_text = f"""PSO Parameters:\n wmin: {wmin}\n wmax: {wmax}\n wz: {wz}\n c1: {c1}\n c2: {c2}
+    # rmin: {rmin}\n rmax: {rmax}\n Repulsion: {vehicles[0].info["Repulsion Function"]} """
+    
+    #Commented out for formatting on posters.
+    #pso_text = f"""PSO Parameters:\n wmin: {wmin}\n wmax: {wmax}\n c1min: {c1min}\n c1max: {c1max}\n c2min: {c2min}\n
+    #c2max: {c2max}\n r1min: {r1min}\n r1max: {r1max}\n r2min: {r2min}\n r2max: {r2max}"""
+    #ax.text(0.05, 0.95, pso_text, transform=ax.transAxes, fontsize=10,
+    #        verticalalignment='top', bbox=dict(facecolor='white', alpha=0.5))
+
+    # Reduce the size of the dataset for animation
+    nDP = len(simData[0, :, 0]) // numDataPoints
+    dataSet = np.array(simData[:, ::nDP, 0:2])  # Extract X (0) and Y (1)
+    
+    # Plot starting locations
+    for i, data in enumerate(dataSet):
+        start_x, start_y = data[0, 0], data[0, 1]
+        ax.scatter(start_x, start_y, marker='^', s=35, label=f'Start {i}' if i == 0 else None, alpha=0.7)
+
+    # Initialize lines and points for animation
+    lines = [ax.plot([], [], lw=1, label=f'Trajectory {i}')[0] for i in range(len(dataSet))] if traj else None
+    points = [ax.plot([], [], 'o', markersize=5, label=f'Position {i}')[0] for i in range(len(dataSet))] if pos else None
+
+    if waypts:
+        # Plot waypoints as static elements
+        for vehicle in vehicles:
+            ax.scatter(vehicle.wpt.pos.x, vehicle.wpt.pos.y, marker='^', s=50, label='Waypoint', alpha=0.7)
+
+    # Set axis limits and aspect ratio
+    x_min, x_max = simData[:, :, 0].min(), simData[:, :, 0].max()
+    y_min, y_max = simData[:, :, 1].min(), simData[:, :, 1].max()
+    #if (x_min < -600):
+        #x_max = 600
+        #x_min = -size
+    #else:
+    #    x_min = -600
+    #    x_max = size
+    #if (y_min < -600):
+    #    y_max = 600
+    #    y_min = -size
+    #else:
+    #    y_min = -600
+    #    y_max = size
+    
+    print("%d %d %d %d", x_min, x_max, y_min, y_max)
+    ax.set_xlim(x_min - 10, x_max + 10)
+    ax.set_ylim(y_min - 10, y_max + 10)
+    ax.set_aspect('equal')
+    # ax.legend(loc='upper right')
+    plt.grid(True)
+
+    # Animation function
+    def anim_function(frame):
+        for i, data in enumerate(dataSet):
+            if traj:
+                lines[i].set_data(data[:frame, 0], data[:frame, 1])
+            if pos:
+                points[i].set_data(data[frame - 1:frame, 0], data[frame - 1:frame, 1])
+        return lines + points if traj and pos else lines or points
+
+    # Create the animation object
+    ani = animation.FuncAnimation(fig,
+                                  anim_function,
+                                  frames=numDataPoints,
+                                  interval=1500 // FPS,
+                                  blit=False,
+                                  repeat=True)
+
+    # Save the animation
+    ani.save(filename, writer=animation.PillowWriter(fps=FPS))
 
 ###############################################################################
