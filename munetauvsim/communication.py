@@ -1855,7 +1855,9 @@ class MuNet:
             self.stats['plrDeliveryRate'] = (
                 self.stats['packetDelivered'] / totalSent)
             self.stats['inTransitRate'] = (
-                self.stats['inTransitTX'] + self.stats['inTransitRX']/totalSent)
+                (self.stats['inTransitTX'] + self.stats['inTransitRX']) 
+                / totalSent
+            )
     
     #--------------------------------------------------------------------------
     def getStatsReport(self)->str:
