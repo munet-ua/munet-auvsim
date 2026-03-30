@@ -2999,7 +2999,8 @@ class Floor:
 
     @depth.setter
     def depth(self, value: NPFltArr)->None:
-        """Manual depth array assignment."""
+        """Assign depth array directly and invalidate prior tile cache."""
+        self._resetDepthCache()
         self._depth = value
     
     #--------------------------------------------------------------------------
@@ -3626,7 +3627,7 @@ class Floor:
     #--------------------------------------------------------------------------
     def generate(self)->None:
         """
-        Explicitly precomputes full depth array.
+        Explicitly precomputes full depth array from Perlin noise.
         
         Forces generation of all tiles and caches the complete depth array.
         Subsequent accesses to depth property or tile-based queries will use
@@ -3634,11 +3635,14 @@ class Floor:
         
         Notes
         -----
-        This method is equivalent to accessing the `depth` property but makes
-        the intent explicit. Useful for:
+        Resets tile cache and depth data, and always regenerates from Perlin
+        noise regardless of any prior state. A manually assigned depth array
+        will be discarded.
+        
+        Useful for:
         
         - Precomputing before batch simulations
-        - Forcing generation for visualization
+        - Forcing Perlin regeneration after parameter changes
         - Eliminating on-demand generation overhead
         
         Examples
@@ -3649,8 +3653,8 @@ class Floor:
         >>> floor.display3D()   # instant visualization
         """
 
-        # Accessing depth array triggers property getter to build full array
-        _ = self.depth
+        self._resetDepthCache()
+        self._depth = self._buildFullDepth()
     
     #--------------------------------------------------------------------------
     def display2D(self, 
@@ -4082,16 +4086,20 @@ class Floor:
             jStart = tileJ * self._tileSize
             iEnd = min(iStart + self._tileSize, self.size)
             jEnd = min(jStart + self._tileSize, self.size)
-            
-            # Evaluate noise region
-            noise = self.perlin.evaluateRegion(
-                [iStart, iEnd],
-                [jStart, jEnd]
-            )
-            
-            # Convert noise to depth
-            tile = self.createMap(noise=noise)
-            
+
+            if (self._depth is not None):
+                # Slice tile from existing depth array
+                tile = self._depth[jStart:jEnd, iStart:iEnd].copy()
+            else:
+                # Evaluate noise region
+                noise = self.perlin.evaluateRegion(
+                    [iStart, iEnd],
+                    [jStart, jEnd]
+                )
+
+                # Convert noise to depth
+                tile = self.createMap(noise=noise)
+
             # Cache
             self._tiles[key] = tile
         
