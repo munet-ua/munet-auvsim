@@ -1437,7 +1437,7 @@ def formationTargetNormPolyAPF(vehicle:Vehicle)->NPFltArr:
 
     Generates a velocity vector that drives the vehicle to maintain a preferred
     following distance from the leader using zones of different behavior, with
-    repulsion and attraction goverened by a normalized polynomial APF. Produces
+    repulsion and attraction governed by a normalized polynomial APF. Produces
     repulsion when too close, attraction when too far, and a deadband neutral
     zone around the preferred following distance. Only computes APF between
     vehicle and target. Designed to be assigned to a vehicle as the
@@ -1455,9 +1455,10 @@ def formationTargetNormPolyAPF(vehicle:Vehicle)->NPFltArr:
         - r_safe : float
             Safety radius in meters. Hard maximum repulsion applied inside
             this distance.
-        - r_avoid : float
-            Avoidance zone width in meters. Used to compute width of neutral
-            zone and attraction zone.
+        - r_inner : float
+            Inner formation boundary in meters. Outer boundary of the repulsion
+            zone and inner boundary of the neutral deadband. Must satisfy
+            r_safe < r_inner < r_follow.
         - r_follow : float
             Preferred following distance in meters. Center of neutral zone.
         - target : Vehicle
@@ -1478,11 +1479,12 @@ def formationTargetNormPolyAPF(vehicle:Vehicle)->NPFltArr:
     **Zone Geometry:**
 
     Five zones are defined along the radial distance r from the vehicle to
-    the leader. Zone boundaries are derived from r_safe, r_avoid, and r_follow:
+    the leader. The zone structure is symmetric around r_follow: the
+    attraction zone width equals the repulsion zone width. r_outer and
+    r_max are derived quantities, not free parameters:
 
-        - outer_n = r_follow + (0.5 * r_avoid)   # Outer neutral boundary
-        - inner_n = r_follow - (0.5 * r_avoid)   # Inner neutral boundary
-        - r_max   = outer_n + r_avoid            # Maximum attraction radius
+        - r_outer = 2 * r_follow - r_inner   # Outer neutral boundary
+        - r_max   = 2 * r_follow - r_safe    # Maximum attraction radius
 
     **Piecewise APF Function:**
 
@@ -1494,30 +1496,36 @@ def formationTargetNormPolyAPF(vehicle:Vehicle)->NPFltArr:
         - Hard maximum repulsion away from leader
         - Prevents collision when dangerously close
 
-    2. **Repulsion Zone** (r_safe < r < inner_n)
+    2. **Repulsion Zone** (r_safe < r < r_inner)
 
-        - v(r) = -u_max * ((inner_n - r) / (inner_n - r_safe))^p_rep
-        - Polynomial decay from -u_max at r_safe to 0 at inner_n
-        - Exponent p_rep = 2 produces a smooth quadratic onset
+        - v(r) = -u_max * ((r_inner - r) / (r_inner - r_safe))^p
+        - Polynomial decay from -u_max at r_safe to 0 at r_inner
+        - Exponent p = 3
 
-    3. **Neutral Zone / Deadband** (inner_n <= r <= outer_n)
+    3. **Neutral Zone / Deadband** (r_inner <= r <= r_outer)
 
         - v(r) = 0
-        - No force applied; Formation keeping APF produces no velocity input
-        - Deadband centered on r_follow prevents oscillation between repulsion 
-          and attraction
+        - No force applied; formation keeping APF produces no velocity input
+        - Wide neutral zone (aka Deadband) centered on r_follow prevents
+          oscillation between repulsion and attraction
 
-    4. **Attraction Zone** (outer_n < r < r_max)
+    4. **Attraction Zone** (r_outer < r < r_max)
 
-        - v(r) = +u_max * ((r - outer_n) / (r_max - outer_n))^p_att
-        - Polynomial increase from 0 at outer_n to u_max at r_max
-        - Exponent p_att = 3 produces a fast-onset cubic pull at r_max
+        - v(r) = +u_max * ((r - r_outer) / (r_max - r_outer))^p
+        - Polynomial increase from 0 at r_outer to u_max at r_max
+        - Exponent p = 3
 
     5. **Maximum Attraction Zone** (r >= r_max)
 
         - v(r) = +u_max
         - Hard maximum attraction toward leader
         - Enables fast recovery from large separation distances
+
+    **Symmetric Zone Design:**
+
+    The repulsion zone width (r_inner - r_safe) equals the attraction zone width
+    (r_max - r_outer), and both use the same polynomial exponent. This produces
+    a symmetric potential well centered on r_follow.
 
     **Modularity:**
 
@@ -1557,14 +1565,13 @@ def formationTargetNormPolyAPF(vehicle:Vehicle)->NPFltArr:
     
     # Zone Parameters
     r_safe = vehicle.r_safe                 # Safety Radius
-    r_avoid = vehicle.r_avoid               # Avoidance Radius
+    r_inner = vehicle.r_inner               # Inner Neutral Boundary Distance
     r_follow = vehicle.r_follow             # Following Radius
-    inner_n = r_follow - (0.5 * r_avoid)    # Inner Neutral Boundary Distance
-    outer_n = r_follow + (0.5 * r_avoid)    # Outer Neutral Boundary Distance
-    r_max = outer_n + r_avoid               # Maximum Attraction Radius
+    r_outer = 2 * r_follow - r_inner        # Outer Neutral Boundary Distance  
+    r_max = 2 * r_follow - r_safe           # Maximum Attraction Radius
 
     # APF Parameters
-    p_rep = 2                               # Repulsion polynomial exponent
+    p_rep = 3                               # Repulsion polynomial exponent
     p_att = 3                               # Attraction polynomial exponent
     
     # Safety Zone: Maximum Repulsion
@@ -1572,16 +1579,16 @@ def formationTargetNormPolyAPF(vehicle:Vehicle)->NPFltArr:
         return -u_max * r_hat
     
     # Repulsion Zone: Reduce Radial Velocity
-    if (r < inner_n):
-        return -u_max * ((inner_n - r) / (inner_n - r_safe))**p_rep * r_hat
+    if (r < r_inner):
+        return -u_max * ((r_inner - r) / (r_inner - r_safe))**p_rep * r_hat
     
     # Neutral Zone (Deadband): Zero Repulsion and Zero Attraction
-    if (r <= outer_n):
+    if (r <= r_outer):
         return np.zeros(3)
     
     # Attraction Zone: Increase Radial Velocity
     if (r < r_max):
-        return u_max * ((r - outer_n) / (r_max - outer_n))**p_att * r_hat
+        return u_max * ((r - r_outer) / (r_max - r_outer))**p_att * r_hat
     
     # Maximum Attraction Zone
     return u_max * r_hat

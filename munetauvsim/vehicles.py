@@ -330,6 +330,7 @@ class AUV(Vehicle):
         self.nextVel = None             # next velocity
         self.r_safe = 10.0              # minimum safe vehicle distance (m)
         self.r_avoid = 40.0             # avoidance radius (m)
+        self.r_inner = 80.0             # inner radius of neutral zone(m)
         self.r_follow = 100.0           # following distance (m)
 
         #---------------------------------------------------------------------#
@@ -1271,6 +1272,8 @@ class Remus100s(AUV):
             Minimum safe vehicle separation distance, 10.0 m
         r_avoid : float
             Avoidance radius for APF repulsion, 40.0 m
+        r_inner : float
+            Inner radius of neutral APF around following distance, 80.0 m
         r_follow : float
             Preferred following distance, 100.0 m
             
@@ -1513,7 +1516,8 @@ class Remus100s(AUV):
         - **Swarm Coordination:**
 
             - r_safe: minimum safe separation (10 m)
-            - r_avoid: avoidance radius for APF (40 m)  
+            - r_avoid: avoidance radius for APF (40 m)
+            - r_inner: inner radius of neutral follow zone (80 m)
             - r_follow: preferred following distance (100 m)
             - target: reference to leader vehicle (initially None)
             - group: list of swarm neighbors, excludes self (initially None)
@@ -2477,6 +2481,8 @@ class Remus100s(AUV):
             Minimum safe separation distance, triggers strong repulsion
         - r_avoid : float
             Avoidance radius, repulsion active within this range
+        - r_inner : float
+            Inner radius of neutral zone around preferred following distance
         - r_follow : float
             Preferred following distance from target
             
