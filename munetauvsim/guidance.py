@@ -85,7 +85,7 @@ import numpy as np
 from munetauvsim import navigation as nav
 from munetauvsim import logger
 
-#-----------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
 
 # Type Aliases
 NPFltArr = NDArray[np.float64]
@@ -93,7 +93,7 @@ NPFltArr = NDArray[np.float64]
 # Global Variables
 log = logger.addLog('guid')
 
-###############################################################################
+################################################################################
 
 @dataclass
 class Position:
@@ -186,7 +186,7 @@ class Position:
         """Return [x, y, z] at index or slice."""
         return [self.x[key], self.y[key], self.z[key]]
 
-###############################################################################
+################################################################################
 
 class Waypoint:
     """
@@ -321,7 +321,7 @@ class Waypoint:
     
     __slots__ = ['pos']
 
-    ## Constructor ===========================================================#
+    ## Constructor ============================================================#
     def __init__(self,
                  xPos:Union[float, List[float]] = 0,
                  yPos:Union[float, List[float]] = 0,
@@ -330,17 +330,17 @@ class Waypoint:
         """Initialize waypoint database with coordinate lists."""
         self.pos = Position(xPos, yPos, zPos)
     
-    ## Special Methods =======================================================#
+    ## Special Methods ========================================================#
     def __getitem__(self, key:Union[int,slice])->Self:
         """Index or slice waypoints, returns new Waypoint object."""
         return self.__class__(*self.pos[key])
     
-    #-------------------------------------------------------------------------#
+    #--------------------------------------------------------------------------#
     def __len__(self)->int:
         """Return number of waypoints in database."""
         return len(self.pos.x)
     
-    #-------------------------------------------------------------------------#
+    #--------------------------------------------------------------------------#
     def __repr__(self)->str:
         """Detailed description of Waypoint"""
         fmt = f'.1f'
@@ -358,7 +358,7 @@ class Waypoint:
             out += ', ' if (i < len(self)-1) else ')' 
         return f'{self.__class__.__name__}(' + out + ')'
 
-    #-------------------------------------------------------------------------#
+    #--------------------------------------------------------------------------#
     def __str__(self)->str:
         """Return user-friendly string representation of Waypoint"""
         fmt = f'8.1f'
@@ -372,7 +372,7 @@ class Waypoint:
                     f')\n')
         return out.rstrip('\n')
 
-    #-------------------------------------------------------------------------#
+    #--------------------------------------------------------------------------#
     def __add__(self, other:Self)->Self:
         """Concatenate two waypoint databases."""
         x = self.pos.x + other.pos.x
@@ -380,7 +380,7 @@ class Waypoint:
         z = self.pos.z + other.pos.z
         return self.__class__(x, y, z)
 
-    ## Methods ===============================================================#
+    ## Methods ================================================================#
     def insert(self, index:int, point:List[float])->None:
         """
         Insert point into the database before the position at index.
@@ -397,7 +397,7 @@ class Waypoint:
         self.pos.y.insert(index,point[1])
         self.pos.z.insert(index,point[2])
 
-    #-------------------------------------------------------------------------#
+    #--------------------------------------------------------------------------#
     def calcWptDistance(self, index:Optional[int]=None)->NPFltArr:
         """
         Return array of distances between consecutive waypoints.
@@ -427,7 +427,7 @@ class Waypoint:
                            np.diff(self.pos.y)**2 + 
                            np.diff(self.pos.z)**2)
 
-    #-------------------------------------------------------------------------#
+    #--------------------------------------------------------------------------#
     def calcTotalDistance(self)->np.float64:
         """
         Calculate total path length through all waypoints.
@@ -440,7 +440,7 @@ class Waypoint:
 
         return sum(self.calcWptDistance())
     
-    #-------------------------------------------------------------------------#
+    #--------------------------------------------------------------------------#
     def calcWptHeading(self, index:Optional[int]=None)->NPFltArr:
         """
         Return heading angles (rad) between consecutive waypoints.
@@ -468,7 +468,7 @@ class Waypoint:
         else:
             return np.arctan2(np.diff(self.pos.y), np.diff(self.pos.x))
         
-    #-------------------------------------------------------------------------#
+    #--------------------------------------------------------------------------#
     def estimateTime(self, speed:float=2.0, coeff:float=1.2)->np.float64:
         """
         Estimate travel time to traverse full path through all waypoints.
@@ -490,7 +490,7 @@ class Waypoint:
 
         return coeff * self.calcTotalDistance()/speed
     
-    #-------------------------------------------------------------------------#
+    #--------------------------------------------------------------------------#
     def estimateAreaRoot(self, padding:int=300)->Tuple[int,int]:
         """
         Compute bounding square dimensions for path area.
@@ -521,7 +521,7 @@ class Waypoint:
         p = int(padding)
         return int(np.ceil(l)) + 2*p, [abs(xmin)+p, abs(ymin)+p]
     
-###############################################################################
+################################################################################
 
 def generateRandomPath(num:int=1,
                        start:List[float]=[0,0,0],
@@ -568,7 +568,7 @@ def generateRandomPath(num:int=1,
         wpt.insert(len(wpt), [x,y,z])
     return wpt
 
-###############################################################################
+################################################################################
 
 def addEtaWpt(vehicle:Vehicle)->None:
     """
@@ -601,7 +601,7 @@ def addEtaWpt(vehicle:Vehicle)->None:
     if (d > R_switch):
         vehicle.wpt.insert(k_p, [eta[0],eta[1],eta[2]])
 
-###############################################################################
+################################################################################
 
 def getNextWpt(vehicle:Vehicle)->List[float]:
     """
@@ -650,7 +650,7 @@ def getNextWpt(vehicle:Vehicle)->List[float]:
     
     return [x_n, y_n, z_n]
 
-###############################################################################
+################################################################################
 
 def updateWpt(vehicle:Vehicle)->List[List[float]]:
     """
@@ -711,7 +711,7 @@ def updateWpt(vehicle:Vehicle)->List[List[float]]:
 
     return [prevPt, nextPt]
 
-###############################################################################
+################################################################################
 
 def predictNextEtaVel(vehicle:Vehicle)->List[NPFltArr]:
     """
@@ -757,7 +757,8 @@ def predictNextEtaVel(vehicle:Vehicle)->List[NPFltArr]:
     **Position Prediction:**
 
     Next position is taken directly from the waypoint database via getNextWpt().
-    If at the end of waypoints, extrapolates along last bearing to distant point.
+    If at the end of waypoints, extrapolates along last bearing to distant
+    point.
     
     **Velocity Prediction:**
 
@@ -776,9 +777,10 @@ def predictNextEtaVel(vehicle:Vehicle)->List[NPFltArr]:
     
     **Usage Context:**
 
-    This function is called by communication message generation routines to populate
-    nextEta and nextVel fields in broadcast messages. Followers use these predictions
-    with predictSwarmState() to extrapolate leader position during message delays.
+    This function is called by communication message generation routines to
+    populate nextEta and nextVel fields in broadcast messages. Followers use
+    these predictions with predictSwarmState() to extrapolate leader position
+    during message delays.
     
     **Limitations:**
 
@@ -810,7 +812,7 @@ def predictNextEtaVel(vehicle:Vehicle)->List[NPFltArr]:
 
     return [nextPoint, nextVel]
 
-###############################################################################
+################################################################################
 
 def ALOSlaw(vehicle:Vehicle,
             pt1:List[float],
@@ -960,7 +962,7 @@ def ALOSlaw(vehicle:Vehicle,
 
     return psi_ref
 
-###############################################################################
+################################################################################
 
 def pathFollow(vehicle:Vehicle)->NPFltArr:
     """
@@ -1089,7 +1091,7 @@ def pathFollow(vehicle:Vehicle)->NPFltArr:
 
     return np.array([delta_r, delta_s, n], float)
 
-###############################################################################
+################################################################################
 
 def velCB(vehicle:Vehicle)->NPFltArr:
     """
@@ -1229,7 +1231,7 @@ def velCB(vehicle:Vehicle)->NPFltArr:
 
     return v_d
 
-###############################################################################
+################################################################################
 
 def predictSwarmState(vehicle:Vehicle)->None:
     """
@@ -1357,7 +1359,7 @@ def predictSwarmState(vehicle:Vehicle)->None:
             # Position
             member.eta += (member.velocity * h)
 
-###############################################################################
+################################################################################
 
 def missionTargetFeedForwardAPF(vehicle:Vehicle)->NPFltArr:
     """
@@ -1429,7 +1431,7 @@ def missionTargetFeedForwardAPF(vehicle:Vehicle)->NPFltArr:
 
     return vehicle.target.velocity[0:3].copy()
 
-###############################################################################
+################################################################################
 
 def formationTargetNormPolyAPF(vehicle:Vehicle)->NPFltArr:
     """
@@ -1593,7 +1595,7 @@ def formationTargetNormPolyAPF(vehicle:Vehicle)->NPFltArr:
     # Maximum Attraction Zone
     return u_max * r_hat
 
-###############################################################################
+################################################################################
 
 def survivalGroupNormPolyAPF(vehicle:Vehicle)->NPFltArr:
     """
@@ -1734,7 +1736,7 @@ def survivalGroupNormPolyAPF(vehicle:Vehicle)->NPFltArr:
     
     return v_ca
 
-###############################################################################
+################################################################################
 
 def depthSafetyLimit(vehicle:Vehicle, vel:NPFltArr)->NPFltArr:
     """
@@ -1803,7 +1805,7 @@ def depthSafetyLimit(vehicle:Vehicle, vel:NPFltArr)->NPFltArr:
     
     return vel_copy
 
-###############################################################################
+################################################################################
 
 def velocitySubsumptionCascadeAPF(vehicle:Vehicle)->NPFltArr:
     """
@@ -1979,7 +1981,7 @@ def velocitySubsumptionCascadeAPF(vehicle:Vehicle)->NPFltArr:
 
     return v_d
 
-###############################################################################
+################################################################################
 
 def targetTrack(vehicle:Vehicle)->NPFltArr:
     """
@@ -2054,18 +2056,19 @@ def targetTrack(vehicle:Vehicle)->NPFltArr:
     - **Depth/Pitch Channel**:
 
         - Sets vehicle.theta_d = theta (pitch reference)
-        - DepthAP(): Converts pitch/depth error to stern plane deflection command
+        - DepthAP(): Converts pitch/depth error to stern plane deflection
+          command
 
     - **Speed Control**:
 
         - xferU2N(): Converts desired speed magnitude to propeller RPM command
     
-    Each component (GuidLaw, HeadingAP, DepthAP, xferU2N) is assigned to the 
-    vehicle as a callable function, allowing different implementations to be 
-    plugged in without modifying this coordination workflow. This design supports 
-    various velocity guidance algorithms (APF-based, geometric, reactive), 
-    autopilot configurations (PID, LQR, sliding mode), and propulsion models 
-    through a common interface.
+    Each component (GuidLaw, HeadingAP, DepthAP, xferU2N) is assigned to the
+    vehicle as a callable function, allowing different implementations to be
+    plugged in without modifying this coordination workflow. This design
+    supports various velocity guidance algorithms (APF-based, geometric,
+    reactive), autopilot configurations (PID, LQR, sliding mode), and propulsion
+    models through a common interface.
 
     **Key Design Feature:**
 
@@ -2077,7 +2080,8 @@ def targetTrack(vehicle:Vehicle)->NPFltArr:
     **Current Limitations:**
 
     - Direct velocity-to-attitude mapping assumes no environmental filtering
-    - Course angle (chi) used directly as heading reference without drift compensation
+    - Course angle (chi) used directly as heading reference without drift
+      compensation
     - Pitch angle computed geometrically without considering depth reference
     - Future versions should incorporate state estimation and wave filtering
 
@@ -2125,4 +2129,4 @@ def targetTrack(vehicle:Vehicle)->NPFltArr:
 
     return np.array([delta_r, delta_s, n], float)
 
-###############################################################################
+################################################################################
