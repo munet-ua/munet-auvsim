@@ -374,43 +374,65 @@ def demoSwarmTargetTracking() -> None:
     printd("""
     ARTIFICIAL POTENTIAL FIELD (APF) CONFIGURATION
     ----------------------------------------------
-    As a guidance system, APF models vehicles as charged particles with
-    attraction and repulsion forces. The combined result generates desired
-    velocity commands and produces emergent formation behavior.
+    The APF guidance system uses a subsumption architecture with three
+    behavioral layers, each computing a velocity vector that is blended by
+    a guidance law. Higher-priority layers progressively suppress lower
+    layers through a saturation cascade:
+
+      1) Survival (highest)   - Collision avoidance from group members
+      2) Formation (middle)   - Formation keeping with leader vehicle
+      3) Mission (lowest)     - Feed-forward control from leader velocity
+
+    Each layer is a modular component that can be independently replaced
+    with alternative algorithms.
     """)
 
     printd("""\
-    ATTRACTION FUNCTION
+    MISSION FUNCTION (lowest priority)
            
-      * Followers attracted to leader position
-      * Creates velocity field pointing toward target
-      * Attraction increases with distance
+      Provides feed-forward velocity commands for coordinated motion.
+      Active when higher-priority layers are not consuming the velocity
+      budget. When the formation is stable, this becomes the dominant
+      command, driving the follower to match the leader's velocity.
   
-      1) Linear               - Simple linear function
-      2) Linear w/ CB zone    - Linear with central constant bearing zone
-      3) Cubic                - Smooth cubic polynomial with flat inflection
+      1) Target Feed-Forward   - Match leader velocity vector
     """)
 
-    attChoice = input("Select attraction function (1-3) [2]: ").strip() or "2"
-    attMap = {'1': 'linear', '2': 'linearCBZ', '3': 'cubic'}
-    attStr = attMap.get(attChoice, 'linearCBZ')
-    print(f"> {attStr}")
+    missionChoice = input("Select mission function (1) [1]: ").strip() or "1"
+    missionMap = {'1': 'targetFeedforward'}
+    missionStr = missionMap.get(missionChoice, 'targetFeedforward')
+    print(f"> {missionStr}")
 
     printd("""
-    REPULSION FUNCTION
+    FORMATION FUNCTION (middle priority)
            
-      * Followers repelled away from all swarm members
-      * Creates velociy fields pointing away from target and neighbors
-      * Repulsion decreases with distance
+      Maintains preferred following distance from leader using radial
+      attraction and repulsion zones with a neutral deadband. Produces
+      repulsion when too close, attraction when too far, and zero output
+      in the deadband around the preferred following distance.
       
-      1) Exponential             - Simple exponential decay function
-      2) Variable Exponential    - Scales with velocity along line-of-sight
+      1) Normalized Polynomial - Zone-based polynomial attraction/repulsion
     """)
 
-    repChoice = input("Select repulsion function (1-2) [2]: ").strip() or "2"
-    repMap = {'1': 'exp', '2': 'varExp'}
-    repStr = repMap.get(repChoice, 'varExp')
-    print(f"> {repStr}")
+    formationChoice = input("Select formation function (1) [1]: ").strip() or "1"
+    formationMap = {'1': 'targetNormPoly'}
+    formationStr = formationMap.get(formationChoice, 'targetNormPoly')
+    print(f"> {formationStr}")
+
+    printd("""
+    SURVIVAL FUNCTION (highest priority)
+           
+      Collision avoidance from all swarm group members. Overrides lower
+      layers when vehicles are within avoidance distance. Maximum
+      repulsion is applied inside the safety radius.
+      
+      1) Normalized Polynomial - Polynomial repulsion from group members
+    """)
+
+    survivalChoice = input("Select survival function (1) [1]: ").strip() or "1"
+    survivalMap = {'1': 'groupNormPoly'}
+    survivalStr = survivalMap.get(survivalChoice, 'groupNormPoly')
+    print(f"> {survivalStr}")
 
     # ------------------------------------------------------------------------
     # FORMATION PARAMETERS
@@ -418,27 +440,28 @@ def demoSwarmTargetTracking() -> None:
     printd("""
     FORMATION CONTROL PARAMETERS
     ----------------------------
-    Three distances influence APF swarm formation behavior:
+    Three distances define the APF zone geometry for formation keeping and
+    collision avoidance:
     
     * Following Distance (r_follow): 
-      - The preferred spacing away from the leader vehicle
-      - APF should match target velocity at this distance
-      - Larger values create looser formation with more stability, while
-        smaller values create tighter formation with more responsiveness
+      - The preferred spacing from the leader vehicle
+      - Center of the formation keeping neutral zone (deadband)
+      - Larger values create looser formations, smaller values tighter
       
     * Avoidance Distance (r_avoid): 
-      - The distance at which repulsion becomes active
-      - APF should be neutral at this distance
-      - Larger values create stricter separation enforcement, while smaller 
-        values allow closer approach before repulsion activates
+      - Controls the width of APF transition zones
+      - Defines the neutral zone and attraction zone width for formation
+        keeping, and the outer boundary of collision avoidance repulsion
+      - Larger values produce wider, smoother transitions between zones
          
     * Safety Distance (r_safe): 
       - The critical minimum separation limit
-      - Inside this distance, maximum repulsion is experienced
+      - Inside this distance, maximum repulsion is applied by both
+        formation keeping and collision avoidance layers
            
-    The goal is to balance these distance values within the selected APF
-    functions to maintain stable group formation while minimizing oscillations
-    and violent reactions.
+    The goal is to balance these distance values to maintain stable group
+    formation while minimizing oscillations and ensuring smooth APF
+    transitions.
     """)
 
     r_follow = float(input("Following distance [100m]: ").strip() or 100)
@@ -544,8 +567,9 @@ def demoSwarmTargetTracking() -> None:
     for follower in vehicles[1:]:
         follower.loadTargetTracking(
             target = leader,
-            att = attStr,
-            rep = repStr,
+            mission = missionStr,
+            formation = formationStr,
+            survival = survivalStr,
         )
         print(f"> Follower: \"{follower.callSign}\" APF target tracking")
 
@@ -599,7 +623,7 @@ def demoSwarmTargetTracking() -> None:
     captures key parameters of the simulation scenario.
     """)
 
-    generatedName = '_'.join([name, numStr, attStr, repStr, formStr, commStr])
+    generatedName = '_'.join([name, numStr, missionStr, formationStr, survivalStr, formStr, commStr])
     name = input(f"Simulation name [{generatedName}]: ").strip()
     name = name.replace(' ', '_') if name else generatedName
     print(f"> {name}")
@@ -614,8 +638,9 @@ def demoSwarmTargetTracking() -> None:
     print(f"  Number of vehicles:     {numStr}")
     print(f"  Leader:                 Path following, Random, {len(path)-1} waypoints")
     print(f"  Followers:              APF guidance")
-    print(f"  APF attraction:         {attStr}")
-    print(f"  APF repulsion:          {repStr}")
+    print(f"  APF mission:            {missionStr}")
+    print(f"  APF formation:          {formationStr}")
+    print(f"  APF survival:           {survivalStr}")
     print(f"  Following distance:     {r_follow} m")
     print(f"  Avoidance distance:     {r_avoid} m")
     print(f"  Safety distance:        {r_safe} m")

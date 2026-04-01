@@ -23,20 +23,24 @@ Functions
 **Target Tracking:**
 
     - targetTrack(vehicle) : Target-tracking guidance system.
-    - velAPF(vehicle) : APF-based velocity guidance law.
+    - velocitySubsumptionCascadeAPF(vehicle) : APF velocity guidance.
     - velCB(vehicle) : Constant bearing velocity guidance law.
 
-**APF Attraction Functions:**
+**APF Mission Functions:**
 
-    - variableCubicAttractionAPF(vehicle) : Cubic attraction with inflection point.
-    - variableLinearAttractionAPF(vehicle) : Linear attraction.
-    - variableLinearZoneAttractionAPF(vehicle) : Linear with constant bearing zone.
+    - missionTargetFeedForwardAPF : Target velocity feed-forward vector.
 
-**APF Repulsion Functions:**
+**APF Formation Keeping Functions:**
 
-    - exponentialRepulsionAPF(vehicle) : Exponential repulsion from neighbors.
-    - variableExpRepulsionAPF(vehicle) : Exponential with variable maximum.
-    - depthAPF(vehicle, vel) : Depth constraint repulsion.
+    - formationTargetNormPolyAPF : Attraction and repulsion to target vehicle.
+
+**APF Survival Functions:**
+
+    - survivalGroupNormPolyAPF : Repulsion from group vehicles.
+
+**Depth Governing Functions**
+
+    - depthSafetyLimit(vehicle, vel) : Depth constraint repulsion.
 
 **Waypoint Utilities:**
 
@@ -1188,8 +1192,8 @@ def velCB(vehicle:Vehicle)->NPFltArr:
     See Also
     --------
     vehicles.Remus100s.loadTargetTracking : Assigns guidance system
-    velAPF : APF-based guidance (more complex, handles multiple targets)
-    targetTrack : Complete tracking guidance system using velCB or velAPF
+    velocitySubsumptionCascadeAPF : APF-based guidance
+    targetTrack : Target tracking guidance system
     
 
     References
@@ -1330,7 +1334,7 @@ def predictSwarmState(vehicle:Vehicle)->None:
     --------
     predictNextEtaVel : Generates predictive states for communication messages
     updateWpt : Updates target waypoint position
-    velAPF : Uses current group.eta for repulsion forces
+    velocitySubsumptionCascadeAPF : Uses group state for APF forces
     communication.writeEtaVelLogs : Logs reported position and velocities
     """
 
@@ -1370,586 +1374,382 @@ def predictSwarmState(vehicle:Vehicle)->None:
 
 ###############################################################################
 
-def variableCubicAttractionAPF(vehicle:Vehicle)->NPFltArr:
+def missionTargetFeedForwardAPF(vehicle:Vehicle)->NPFltArr:
     """
-    Compute cubic Artificial Potential Field (APF) attraction velocity vector.
+    Compute feed-forward control velocity vector from leader velocity.
 
-    Generates attractive velocity vector toward target vehicle with cubic
-    nonlinearity, providing smooth but responsive guidance. Cubic function
-    constructed such that the inflection point provides a neutral or stationary
-    point. Velocity is zero at maximum avoidance radius and approaches target
-    velocity at preferred following distance. This function is designed to be
-    assigned to a vehicle as the GuidLaw.attraction callable attribute as part
-    of a target tracking guidance system that uses the velAPF Guidance Law.
-    
+    Returns the leader's current velocity vector directly as the contol velocity
+    command. Provides a feed-forward term that drives the vehicle to match the
+    target's instantaneous velocity, independent of relative position. Only 
+    takes the target vehicle into consideration. Designed to be assigned to a 
+    vehicle as the GuidLaw.mission callable attribute as part of a guidance 
+    system.
 
     Parameters
     ----------
     vehicle : Vehicle
-        Follower vehicle. Must have:
-        
-        - eta : ndarray, shape (6,)
-            Follower position [x, y, z, ...] in END frame.
-        - velocity : ndarray, shape (3,)
-            Current velocity [vx, vy, vz] in m/s.
-        - u_max : float
-            Maximum velocity magnitude in m/s.
-        - r_avoid : float
-            Radius of avoidance (m), the minimum distance for APF repulsion.
-        - r_follow : float
-            Preferred following distance in meters.
-        - target : Vehicle or Model
-            Target/leader vehicle with:
+        Follower vehicle computing the control vector. Must have:
 
-            - eta : ndarray, shape (6,)
-                Target position.
-            - velocity : ndarray, shape (3,)
-                Target velocity.
+        - target : Model or Vehicle
+            Leader vehicle. Must have:
 
-                          
+            - velocity : ndarray, shape (3,) or greater
+                Leader velocity [vx, vy, vz, ...] in END frame (m/s).
+                Only the first three elements are used.
+
     Returns
     -------
-    v_a : ndarray, shape (3,)
-        Attractive velocity vector in END frame (m/s).
-        Magnitude ranges from 0 at r_avoid to target velocity at r_follow.
-    
-        
+    v_c : ndarray, shape (3,)
+        Control velocity vector [vx, vy, vz] in END frame (m/s). Equal to
+        the leader's current velocity vector.
+
     Notes
     -----
-    The attraction function has only the cubic term, creating a monotonically
-    increasing function with a flat inflection point,
+    **Feed-Forward Control:**
 
-        v = (alpha * distance^3) + v_target
-        
-    where alpha and distance are such that the function goes to zero at the
-    Avoidance Radius, goes to the target velocity at the Following Radius, and
-    increases at larger distances,
+    Returns a copy of the leader's velocity vector directly:
 
-        alpha = -v_target / (r_avoid - r_follow)^3,
-        distance = (dist_to_target - r_follow)
+        v_c = target.velocity[0:3]
 
-    The resulting velocity will be along the vector from the follower to the
-    target.
+    As the lowest-priority layer in the subsumption architecture, this vector is
+    scaled by the residual speed budget remaining after collision avoidance and
+    formation keeping. When higher-priority layers are inactive, this term
+    drives the follower to match the leader's velocity, providing smooth
+    coordinated motion without relying solely on the reactive APF layers.
 
-    
-    See Also
-    --------
-    vehicles.Remus100s.loadTargetTracking : Assigns guidance system
-    variableLinearAttractionAPF : Simple linear attraction
-    variableLinearZoneAttractionAPF : Linear with uniform zone
-    variableExpRepulsionAPF : Repulsion complement to attraction
-    velAPF : Main guidance law combining attraction and repulsion
-    """
+    **Role in Subsumption Architecture:**
 
-    # Vehicle Parameters
-    p = vehicle.eta[0:3]            # Vehicle Position Vector
-    leader = vehicle.target         # Tracking Target / Swarm Leader
-    r_a = vehicle.r_avoid           # Avoidance Radius
-    r_f = vehicle.r_follow          # Following Distance
+    In a stable formation where collision avoidance and formation keeping
+    produce little or no output, this feed-forward term becomes the dominant
+    velocity command. This is consistent with the formation stability
+    assumption: when the swarm is in formation, the follower should simply
+    match the leader's velocity to maintain relative position.
 
-    # APF Parameters
-    u_l = nav.stateSpeed(leader)
-    alpha = -u_l / (r_a - r_f)**3
+    **Modularity:**
 
-    # Determine Attraction Velocity to Leader
-    p_l = leader.eta[0:3]       # Leader Position Vector
-    d_l = p_l - p               # Distance Vector from Vehicle to Leader
-    dl_mag = np.linalg.norm(d_l)
-    dl_hat = d_l / dl_mag
-    if (dl_mag <= r_a):
-        v_a = np.zeros(3)
-    else:
-        u_v = (alpha*(dl_mag - r_f)**3) + u_l
-        v_a = u_v * dl_hat
-    
-    return v_a
-
-###############################################################################
-
-def variableLinearAttractionAPF(vehicle:Vehicle)->NPFltArr:
-    """
-    Compute linear Artificial Potential Field (APF) attraction velocity vector.
-    
-    Generates attractive velocity toward target proportional to distance.
-    Simpler and more computationally efficient than cubic, with linear scaling
-    from zero force at r_avoid to maximum at r_follow. This function is designed
-    to be assigned to a vehicle as the GuidLaw.attraction callable attribute as
-    part of a target tracking guidance system that uses the velAPF Guidance Law.
-
-    
-    Parameters
-    ----------
-    vehicle : Vehicle
-        Follower vehicle. Must have:
-        
-        - eta : ndarray, shape (6,)
-            Follower position [x, y, z, ...] in END frame.
-        - velocity : ndarray, shape (3,)
-            Current velocity [vx, vy, vz] in m/s.
-        - u_max : float
-            Maximum velocity magnitude in m/s.
-        - r_avoid : float
-            Radius of avoidance (m), the minimum distance for APF repulsion.
-        - r_follow : float
-            Preferred following distance in meters.
-        - target : Vehicle or Model
-            Target/leader vehicle with:
-
-            - eta : ndarray, shape (6,)
-                Target position.
-            - velocity : ndarray, shape (3,)
-                Target velocity.
-
-                       
-    Returns
-    -------
-    v_a : ndarray, shape (3,)
-        Attractive velocity vector in END frame (m/s).
-
-        
-    Notes
-    -----
-    The attraction function is a simple linear scaling with distance, with the
-    slope based on the speed of the target,
-    
-        v = alpha * distance
-
-    where alpha and distance are such that the function goes to zero at the
-    Avoidance Radius and equals the target speed at the Following Radius.
-
-        alpha = v_target / (r_follow - r_avoid),
-        distance = (dist_to_target - r_avoid)
-    
-    The resulting velocity will be along the vector from the follower to the
-    target.
-    
+    This function implements one specific control algorithm for the
+    GuidLaw.mission role. Alternative algorithms can be assigned to
+    GuidLaw.mission, provided they accept a vehicle argument and return an
+    ndarray of shape (3,) in the END frame. Possible alternatives include
+    waypoint-tracking control vectors, mission objective vectors, or
+    operator-commanded velocity inputs.
 
     See Also
     --------
-    vehicles.Remus100s.loadTargetTracking : Assigns guidance system
-    variableCubicAttractionAPF : More responsive cubic variant
-    variableLinearZoneAttractionAPF : Linear with uniform zone
-    variableExpRepulsionAPF : Repulsion complement to attraction
-    velAPF : Main guidance law combining attraction and repulsion
+    velocitySubsumptionCascadeAPF : Subsumption guidance law
+    survivalGroupNormPolyAPF : Collision avoidance from group vehicles
+    formationTargetNormPolyAPF : Formation keeping with leader vehicle
+    depthSafetyLimit : Depth safety constraint applied after control vector
     """
 
-    # Vehicle Parameters
-    p = vehicle.eta[0:3]            # Vehicle Position Vector
-    leader = vehicle.target         # Tracking Target / Swarm Leader
-    r_a = vehicle.r_avoid           # Avoidance Radius
-    r_f = vehicle.r_follow          # Following Distance
-
-    # APF Parameters
-    alpha = nav.stateSpeed(leader) / (r_f - r_a)    # Attraction Slope
-
-    # Determine Attraction Velocity to Leader
-    p_l = leader.eta[0:3]       # Leader Position Vector
-    d_l = p_l - p               # Distance Vector from Vehicle to Leader
-    dl_mag = np.linalg.norm(d_l)
-    dl_hat = d_l / dl_mag
-    if (dl_mag <= r_a):
-        v_a = np.zeros(3)
-    else:
-        u_l = alpha * (dl_mag - r_a)
-        v_a =  u_l * dl_hat   # Attraction Vector
-
-    return v_a
+    return vehicle.target.velocity[0:3].copy()
 
 ###############################################################################
 
-def variableLinearZoneAttractionAPF(vehicle:Vehicle)->NPFltArr:
+def formationTargetNormPolyAPF(vehicle:Vehicle)->NPFltArr:
     """
-    Compute linear APF attraction velocity vector with three zones.
+    Compute formation keeping APF vector using a normalized polynomial function.
 
-    Creates three regions centered spherically on the target: inner, center, and
-    outer. The inner region has linear scaling less than target velocity, center
-    region equals target velocity, and outer region has linear scaling greater
-    than target velocity. This function is designed to be assigned to a vehicle
-    as the GuidLaw.attraction callable attribute as part of a target tracking
-    guidance system that uses the velAPF Guidance Law.
+    Generates a velocity vector that drives the vehicle to maintain a preferred
+    following distance from the leader using zones of different behavior, with
+    repulsion and attraction goverened by a normalized polynomial APF. Produces
+    repulsion when too close, attraction when too far, and a deadband neutral
+    zone around the preferred following distance. Only computes APF between
+    vehicle and target. Designed to be assigned to a vehicle as the
+    GuidLaw.formation callable attribute as part of a guidance system.
 
-    
     Parameters
     ----------
     vehicle : Vehicle
-        Follower vehicle. Must have:
-        
-        - eta : ndarray, shape (6,)
-            Follower position [x, y, z, ...] in END frame.
-        - velocity : ndarray, shape (3,)
-            Current velocity [vx, vy, vz] in m/s.
-        - u_max : float
-            Maximum velocity magnitude in m/s.
-        - r_avoid : float
-            Radius of avoidance (m), the minimum distance for APF repulsion.
-        - r_follow : float
-            Preferred following distance in meters.
-        - target : Vehicle or Model
-            Target/leader vehicle with:
+        Follower vehicle computing formation keeping. Must have:
 
-            - eta : ndarray, shape (6,)
-                Target position.
-            - velocity : ndarray, shape (3,)
-                Target velocity.
-
-                       
-    Returns
-    -------
-    v_a : ndarray, shape (3,)
-        Attractive velocity vector in END frame (m/s).
-
-        
-    Notes
-    -----
-    **Attraction Algorithm:**
-
-    The attraction function implements a three-zone piecewise linear attraction
-    model that creates smooth transitions between different behavioral regions
-    around the target vehicle. Zones are defined by radial distance so the
-    regions are spherical.
-
-    **Zone Definitions:**
-
-    The boundaries of the Central zone are computed as:
-
-        central_inner = r_follow - (cbz_w * r_avoid)
-        central_outer = r_follow + (cbz_w * r_avoid)
-
-    where cbz_w (constant bearing zone width) determines the size of the central
-    region as a fraction of the avoidance radius, and the central zone is
-    centered at the preferred following distance.
-
-    **Piecewise Linear Function Regions:**
-
-    The slope of the function in the two linear regions changes dynamically to
-    the speed of the:
-
-        alpha = u_target / (r_inner - r_avoid)
-
-    1. **Avoidance Zone** (distance < r_avoid)
-
-        - v_a = 0
-        - No attraction, leaving APF repulsion as only forces
-        - Prevent collision with target when very close
-
-    2. **Inner Linear Zone** (r_avoid <= distance < central_inner)
-
-        - v_a = alpha * (distance - r_avoid) * direction vector
-        - Linear increase from zero to target velocity
-        - Direction is along vector towards target
-
-    3. **Central Uniform Zone** (central_inner <= distance <= central_outer)
-
-        - v_a = u_a * (v_target / abs(v_target))
-        - u_a is speed of target or a minimum value of 0.5 m/s
-        - Maintains formation by matching target speed and direction
-        - Creates a 'constant bearing' region for stable following
-    
-    4. **Outer Linear Zone** (central_outer < distance)
-
-        - v_a = alpha * (distance - r_avoid - center_width) * direction vector
-        - Linear increase beyond target velocity for catch-up behavior
-        - Enables faster approach from distant positions
-        - Direction is along vector towards target
-        - Upper bound is naturally set by limit of vehicle capabilities
-        
-    **Key Parameters:**
-
-    - u_min (0.5 m/s): Minimum speed in uniform zone prevents stagnation
-    - cbz_w (0.5): Zone width ratio - larger values create wider stable region
-    - alpha: Linear slope ensuring continuity at zone boundaries
-
-    
-    See Also
-    --------
-    vehicles.Remus100s.loadTargetTracking : Assigns guidance system
-    variableCubicAttractionAPF : More responsive cubic variant
-    variableLinearAttractionAPF : Simple linear attraction
-    variableExpRepulsionAPF : Repulsion complement to attraction
-    velAPF : Main guidance law combining attraction and repulsion
-    """
-
-    # Vehicle Parameters
-    p = vehicle.eta[0:3]            # Vehicle Position Vector
-    leader = vehicle.target         # Tracking Target / Swarm Leader
-    r_f = vehicle.r_follow          # Following Distance
-    r_a = vehicle.r_avoid           # Avoidance Radius
-
-    # APF Parameters
-    u_min = 0.5                     # Minimum Speed in Uniform Zone
-    cbz_w = 0.5                     # Ratio of r_a to use as 1/2 CB Zone width
-
-    # Calculate Distance
-    p_l = leader.eta[0:3]           # Leader Position Vector
-    d_l = p_l - p                   # Distance Vector from Vehicle to Leader
-    dl_mag = np.linalg.norm(d_l)
-
-    # Calculate APF Terms
-    u_l = nav.stateSpeed(leader)    # Target Speed
-    u_a = max(u_min, u_l)           # Attraction Speed
-    inner = r_f - (cbz_w * r_a)     # Inner CB Zone Boundary Distance
-    outer = r_f + (cbz_w * r_a)     # Outer CB Zone Boundary Distance
-
-    # Central Uniform Zone
-    if ((dl_mag <= outer) and (dl_mag >= inner)):
-        if (u_l == 0):
-            v_a = np.zeros(3)
-        else:
-            v_l = leader.velocity[0:3]
-            v_a = u_a * (v_l / u_l)
-    # Avoidance Zone
-    elif (dl_mag < r_a):
-        v_a = np.zeros(3)
-    # Attraction Zone
-    else:
-        alpha = u_a / (inner - r_a)                 # Linear Attraction Slope
-        dl_hat = d_l / dl_mag
-        # Outer
-        if (dl_mag > outer):
-            v_a = alpha * (dl_mag - r_a - (outer-inner)) * dl_hat
-        # Inner
-        else:
-            v_a = alpha * (dl_mag - r_a) * dl_hat
-
-    return v_a
-
-###############################################################################
-
-def exponentialRepulsionAPF(vehicle:Vehicle)->NPFltArr:
-    """
-    Compute exponential APF repulsion vector from swarm neighbors and target.
-
-    Generates repulsive velocity that avoids collisions with other vehicles.
-    Uses exponential decay function for smooth, gradual avoidance with
-    short-range hard constraint at r_safe. This function is designed to be
-    assigned to a vehicle as the GuidLaw.repulsion callable attribute as part of
-    a target tracking guidance system that uses the velAPF Guidance Law.
-
-    
-    Parameters
-    ----------
-    vehicle : Vehicle
-        Vehicle computing repulsion. Must have:
-        
         - eta : ndarray, shape (6,)
             Own position [x, y, z, ...] in END frame.
-        - velocity : ndarray, shape (3,)
-            Own velocity [vx, vy, vz] in m/s.
-        - id : int
-            Own vehicle ID.
         - u_max : float
-            Maximum vehicle speed in m/s.
+            Maximum vehicle speed in m/s. Sets velocity ceiling.
         - r_safe : float
-            Minimum safe distance in meters.
+            Safety radius in meters. Hard maximum repulsion applied inside
+            this distance.
         - r_avoid : float
-            Maximum repulsion influence radius in meters.
-        - group : list of Model
-            Swarm neighbor vehicles with:
+            Avoidance zone width in meters. Used to compute width of neutral
+            zone and attraction zone.
+        - r_follow : float
+            Preferred following distance in meters. Center of neutral zone.
+        - target : Vehicle
+            Leader vehicle. Must have:
 
             - eta : ndarray, shape (6,)
-                Neighbor position.
-            - id : int
-                Neighbor vehicle ID.
-
-        - target : Vehicle or Model
-            Target/leader vehicle with eta and id attributes.
-            
+                Leader position [x, y, z, ...] in END frame.
 
     Returns
     -------
-    v_r : ndarray, shape (3,)
-        Total repulsive velocity (END frame, m/s). Magnitude ≤ u_max.
-    
-        
+    v_fk : ndarray, shape (3,)
+        Formation keeping velocity vector in END frame (m/s). Directed along
+        the radial vector between the vehicle and the leader. Magnitude ranges
+        from -u_max (maximum repulsion) to +u_max (maximum attraction).
+
     Notes
     -----
-    **Repulsion Function:**
+    **Zone Geometry:**
 
-    The total repulsion velocity is the sum of all repulsion velocities to each
-    swarm group member.
+    Five zones are defined along the radial distance r from the vehicle to
+    the leader. Zone boundaries are derived from r_safe, r_avoid, and r_follow:
 
-    The repulsion function has a maximum value inside the Safety Radius and
-    decays exponentially toward zero at the Avoidance Radius. 
+        - outer_n = r_follow + (0.5 * r_avoid)   # Outer neutral boundary
+        - inner_n = r_follow - (0.5 * r_avoid)   # Inner neutral boundary
+        - r_max   = outer_n + r_avoid            # Maximum attraction radius
 
-        v = v_max * e^((r_safety - distance_to_member)/beta)
-    
-    where the maximum velocity is determined as a factor of the maximum vehicle
-    speed, and beta is used to decay the function within the Avoidance Radus.
+    **Piecewise APF Function:**
 
-        v_max = gamma * u_max,
-        beta = (r_safety - r_avoid) / log_e(zero_value / v_max)
-    
-    Because the function cannot decay to exactly zero, a 'zero_value' is used,
-    which is a value small enough to produce an acceptably negligible result.
-    The resulting velocity is along the vector from the swarm group member
-    toward the follower.
+    The velocity magnitude v(r) along r_hat (unit vector toward leader) is:
 
-    **Properties:**
+    1. **Safety Zone** (r <= r_safe)
 
-    1. Zero repulsion for r_avoid < d_i (no influence beyond avoidance radius)
-    2. Rapid increase for r_safe < d_i < r_avoid (collision avoidance)
-    3. Maximum repulsion at d_i <= r_safe (hard constraint)
+        - v(r) = -u_max
+        - Hard maximum repulsion away from leader
+        - Prevents collision when dangerously close
 
-    
+    2. **Repulsion Zone** (r_safe < r < inner_n)
+
+        - v(r) = -u_max * ((inner_n - r) / (inner_n - r_safe))^p_rep
+        - Polynomial decay from -u_max at r_safe to 0 at inner_n
+        - Exponent p_rep = 2 produces a smooth quadratic onset
+
+    3. **Neutral Zone / Deadband** (inner_n <= r <= outer_n)
+
+        - v(r) = 0
+        - No force applied; Formation keeping APF produces no velocity input
+        - Deadband centered on r_follow prevents oscillation between repulsion 
+          and attraction
+
+    4. **Attraction Zone** (outer_n < r < r_max)
+
+        - v(r) = +u_max * ((r - outer_n) / (r_max - outer_n))^p_att
+        - Polynomial increase from 0 at outer_n to u_max at r_max
+        - Exponent p_att = 3 produces a fast-onset cubic pull at r_max
+
+    5. **Maximum Attraction Zone** (r >= r_max)
+
+        - v(r) = +u_max
+        - Hard maximum attraction toward leader
+        - Enables fast recovery from large separation distances
+
+    **Modularity:**
+
+    This function implements one specific formation keeping algorithm for the
+    GuidLaw.formation role. Alternative algorithms can be assigned to
+    GuidLaw.formation, provided they accept a vehicle argument and return an
+    ndarray of shape (3,) in the END frame.
+
+    **Relationship to survivalGroupNormPolyAPF:**
+
+    Both functions use the same normalized polynomial structure, but serve
+    different roles in the subsumption hierarchy. This formation keeping
+    function operates only on the leader and includes both repulsion and
+    attraction zones. survivalGroupNormPolyAPF operates on all group members
+    (excludes leader) and uses only repulsion.
+
     See Also
     --------
-    vehicles.Remus100s.loadTargetTracking : Assigns guidance system
-    variableLinearZoneAttractionAPF : Attraction complement to repulsion
-    variableExpRepulsionAPF : Velocity-dependent repulsion
-    depthAPF : Depth safety constraints
-    velAPF : Main guidance law combining attraction and repulsion
+    velocitySubsumptionCascadeAPF : Subsumption guidance law
+    survivalGroupNormPolyAPF : Collision avoidance from group vehicles
+    missionTargetFeedForwardAPF : Control vector from target velocity
+    depthSafetyLimit : Depth safety constraint applied after formation keeping
     """
 
     # Vehicle Parameters
-    p = vehicle.eta[0:3]                # Vehicle Position Vector
-    leader = vehicle.target             # Tracking Target / Swarm Leader
-    vehList = vehicle.group             # List of Followers in Group / Swarm
-    r_s = vehicle.r_safe                # Minimum Safe Vehicle Distance
-    r_a = vehicle.r_avoid               # Avoidance Radius
-    u_max = vehicle.u_max               # Vehicle Maximum Speed
+    p = vehicle.eta[0:3].copy()             # Vehicle Position Vector
+    leader = vehicle.target                 # Leader Vehicle
+    p_l = leader.eta[0:3].copy()            # Leader Position Vector
+    u_max = vehicle.u_max                   # Maximum Vehicle Speed
 
-    # APF Repulsion Parameters
-    gamma = 1.2                         # Repulsion Max Scaling Factor
-    vr_zero = 0.0001                    # Repulsion Velocity at r_avoid
-    vr_max = gamma * u_max              # Maximum Repulsion Velocity
-    beta = (r_s - r_a) / np.log(vr_zero / vr_max)   #Repulsion Decay
+    # Distance Parameters
+    r_vector = p_l - p                      # Radial Vector: Vehicle to Leader
+    r = np.linalg.norm(r_vector)            # Radial distance to Leader
+    if (r < 1e-6):                          # Guard against Div by Zero
+        return np.zeros(3)
+    r_hat = r_vector / r                    # Radial Unit Vector
+    
+    # Zone Parameters
+    r_safe = vehicle.r_safe                 # Safety Radius
+    r_avoid = vehicle.r_avoid               # Avoidance Radius
+    r_follow = vehicle.r_follow             # Following Radius
+    inner_n = r_follow - (0.5 * r_avoid)    # Inner Neutral Boundary Distance
+    outer_n = r_follow + (0.5 * r_avoid)    # Outer Neutral Boundary Distance
+    r_max = outer_n + r_avoid               # Maximum Attraction Radius
 
-    # Determine Repulsion Potential from Swarm Group Vehicles
-    v_r = np.zeros(3)                   # Repulsion Potential Vector
-    for member in [leader, *vehList]:
-        if (member.id != vehicle.id):
-            p_s = member.eta[:3]        # Swarm Group Vehicle Position Vector
-            d_s = p - p_s               # Distance Vector, Member to Vehicle
-            ds_mag = np.linalg.norm(d_s)
-            ds_hat = d_s / ds_mag
-            if (ds_mag < r_a):
-                # Safety Radius
-                if (ds_mag <= r_s):
-                    v_r += vr_max * ds_hat
-                # Avoidance Radius
-                else:
-                    v_r += vr_max * np.exp(r_s-ds_mag / beta) * ds_hat
-
-    return v_r
+    # APF Parameters
+    p_rep = 2                               # Repulsion polynomial exponent
+    p_att = 3                               # Attraction polynomial exponent
+    
+    # Safety Zone: Maximum Repulsion
+    if (r <= r_safe):
+        return -u_max * r_hat
+    
+    # Repulsion Zone: Reduce Radial Velocity
+    if (r < inner_n):
+        return -u_max * ((inner_n - r) / (inner_n - r_safe))**p_rep * r_hat
+    
+    # Neutral Zone (Deadband): Zero Repulsion and Zero Attraction
+    if (r <= outer_n):
+        return np.zeros(3)
+    
+    # Attraction Zone: Increase Radial Velocity
+    if (r < r_max):
+        return u_max * ((r - outer_n) / (r_max - outer_n))**p_att * r_hat
+    
+    # Maximum Attraction Zone
+    return u_max * r_hat
 
 ###############################################################################
 
-def variableExpRepulsionAPF(vehicle:Vehicle)->NPFltArr:
+def survivalGroupNormPolyAPF(vehicle:Vehicle)->NPFltArr:
     """
-    Compute exponential APF repulsion with velocity-dependent maximum.
+    Compute collision avoidance APF vector with a normalized polynomial function
 
-    Adaptive repulsion that scales based on relative velocity. Higher closing
-    velocity generates stronger repulsion. This function is designed to be
-    assigned to a vehicle as the GuidLaw.repulsion callable attribute as part of
-    a target tracking guidance system that uses the velAPF Guidance Law.
+    Generates a repulsive velocity vector away from swarm group members that are
+    within the avoidance radius. Uses a normalized polynomial repulsion function
+    with a maximum at the safety radius and zero at the avoidance radius. Only
+    checks vehicles that are in the group list. Designed to be assigned to a
+    vehicle as the GuidLaw.survival callable attribute as part of a guidance
+    system.
 
     Parameters
     ----------
     vehicle : Vehicle
-        Vehicle computing repulsion. Must have:
-        
+        Vehicle computing collision avoidance. Must have:
+
         - eta : ndarray, shape (6,)
             Own position [x, y, z, ...] in END frame.
-        - velocity : ndarray, shape (3,)
-            Own velocity [vx, vy, vz] in m/s.
-        - id : int
-            Own vehicle ID.
         - u_max : float
-            Maximum vehicle speed in m/s.
+            Maximum vehicle speed in m/s. Sets repulsion ceiling.
         - r_safe : float
-            Minimum safe distance in meters.
+            Safety radius in meters. Maximum repulsion applied inside this
+            distance.
         - r_avoid : float
-            Maximum repulsion influence radius in meters.
-        - group : list of Model
-            Swarm neighbor vehicles with:
+            Avoidance radius in meters. Outer boundary of repulsion influence.
+            No repulsion applied beyond this distance.
+        - group : list of Vehicle
+            Swarm group members. Each must have:
 
             - eta : ndarray, shape (6,)
-                Neighbor position.
-            - id : int
-                Neighbor vehicle ID.
+                Member position [x, y, z, ...] in END frame.
 
-        - target : Vehicle or Model
-            Target/leader vehicle with eta and id attributes.
-
-               
     Returns
     -------
-    v_r : ndarray, shape (3,)
-        Total repulsive velocity (END frame, m/s).
-    
-        
+    v_ca : ndarray, shape (3,)
+        Total collision avoidance velocity vector in END frame (m/s).
+        Magnitude clamped to u_max if multiple neighbors cause the sum to
+        exceed vehicle capability.
+
+
     Notes
     -----
-    The total repulsion velocity is the sum of all repulsion velocities to each
-    swarm group member.
-    
-    The repulsion function has a maximum value inside the Safety Radius and
-    decays exponentially toward zero at the Avoidance Radius.
+    **Polynomial Repulsion Function:**
 
-        v = v_max * e^((r_safety - distance_to_member)/beta)
-    
-    where maximum velocity is equal to the component of the vehicle velocity
-    along the vector toward the group member vehicle, and beta is used to decay
-    the function within the Avoidance Radius.
+    For each group member within the avoidance radius, a repulsion velocity is
+    computed along the radial unit vector from the member toward the vehicle.
+    The total collision avoidance vector is the sum over all contributing
+    members:
 
-        v_max = v_vehicle * r_hat (dot product),
-        beta = (r_safety - r_avoid) / log_e(zero_value / v_max)
-    
-    Because the function cannot decay to exactly zero, a 'zero_value' is used,
-    which is a value small enough to produce an acceptably negligible result.
-    The resulting velocity is along the vector from the swarm group member
-    toward the follower.
+        v_ca = sum_i( v(r_i) * r_hat_i )
 
-    
+    The per-member repulsion magnitude v(r) is a piecewise function of the
+    radial distance r to each group member:
+
+    1. **Safety Zone** (r <= r_safe)
+
+        - v(r) = u_max
+        - Hard maximum repulsion applied regardless of distance
+        - Provides strong barrier against collision
+
+    2. **Repulsion Zone** (r_safe < r < r_avoid)
+
+        - v(r) = u_max * ((r_avoid - r) / (r_avoid - r_safe))^p_rep
+        - Polynomial increase as distance decreases toward r_safe
+        - Exponent p_rep = 3 produces a smooth cubic onset
+
+    3. **Outside Avoidance Radius** (r >= r_avoid)
+
+        - v(r) = 0
+        - No collision avoidance influence
+
+    **Output Clamping:**
+
+    When multiple neighbors contribute simultaneously, the summed vector can
+    exceed u_max. The total is clamped to u_max while preserving direction:
+
+        if norm(v_ca) > u_max: v_ca = u_max * (v_ca / norm(v_ca))
+
+    **Modularity:**
+
+    This function implements one specific collision avoidance algorithm for the
+    GuidLaw.survival role. Alternative algorithms can be assigned to
+    GuidLaw.survival, provided they accept a vehicle argument and return an
+    ndarray of shape (3,) in the END frame.
+
+    **Relationship to formationTargetNormPolyAPF:**
+
+    Both functions use the same normalized polynomial structure, but serve
+    different roles in the subsumption hierarchy. This survival function
+    operates on all group members and uses only repulsion.
+    formationTargetNormPolyAPF operates only on the leader and includes both
+    repulsion and attraction zones.
+
     See Also
     --------
-    vehicles.Remus100s.loadTargetTracking : Assigns guidance system
-    variableLinearZoneAttractionAPF : Attraction complement to repulsion
-    variableExpRepulsionAPF : Fixed repulsion version
-    depthAPF : Depth safety constraints
-    velAPF : Main guidance law combining attraction and repulsion
+    velocitySubsumptionCascadeAPF : Subsumption guidance law
+    formationTargetNormPolyAPF : Formation keeping layer
+    missionTargetFeedForwardAPF : Control layer
+    depthSafetyLimit : Depth safety constraint applied after collision avoidance
     """
 
     # Vehicle Parameters
-    p = vehicle.eta[0:3]            # Vehicle Position Vector
-    v = vehicle.velocity[0:3]       # Vehicle Velocity Vector
-    leader = vehicle.target         # Tracking Target / Swarm Leader
-    vehList = vehicle.group         # List of Followers in Group / Swarm
-    r_s = vehicle.r_safe            # Minimum Safe Vehicle Distance
-    r_a = vehicle.r_avoid           # Avoidance Radius
+    p = vehicle.eta[0:3].copy()             # Vehicle Position Vector
+    u_max = vehicle.u_max                   # Maximum Vehicle Speed
+    
+    # Zone Parameters
+    r_safe = vehicle.r_safe                 # Safety Radius
+    r_avoid = vehicle.r_avoid               # Avoidance Radius
 
-    # APF Repulsion Parameters
-    v_r = np.zeros(3)               # Repulsion Potential Vector
-    vr_zero = 0.0001                # Repulsion Velocity at r_avoid
-    gamma = 0.1                     # Minimum Value of Repulsion Max (m/s)
+    # APF Parameters
+    p_rep = 3                               # Repulsion polynomial exponent
 
-    # Determine Repulsion Potential from Swarm Group Vehicles
-    for member in [leader, *vehList]:
-        if (member.id != vehicle.id):
-            p_s = member.eta[:3]    # Swarm Group Vehicle Position Vector
-            d_s = p - p_s           # Distance Vector, Member to Vehicle
-            ds_mag = np.linalg.norm(d_s)
-            ds_hat = d_s / ds_mag
-            if (ds_mag < r_a):
-                vr_max = -min(np.dot(v,d_s) / ds_mag, -gamma)
-                # Safety Radius
-                if (ds_mag <= r_s):
-                    v_r += vr_max * ds_hat
-                # Avoidance Radius
-                else:
-                    beta = (r_s - r_a) / np.log(vr_zero / vr_max)
-                    v_r += vr_max * np.exp(r_s-ds_mag / beta) * ds_hat
+    # Sum Repulsion from Swarm Group
+    v_ca = np.zeros(3)                      # Total Collision Avoidance Vector
+    
+    for member in vehicle.group:
+        # Distance Parameters
+        p_m = member.eta[0:3].copy()        # Member Position Vector
+        r_vector = p - p_m                  # Radial Vector: Member to Vehicle
+        r = np.linalg.norm(r_vector)        # Radial distance to Member
+        if ((r < 1e-6) or (r >= r_avoid)):  # Outside CA Zone & Div by Zero
+            continue
+        r_hat = r_vector / r                # Radial Unit Vector
 
-    return v_r
+        # Safety Zone: Maximum Repulsion
+        if (r <= r_safe):
+            v_ca += u_max * r_hat
+        
+        # Repulsion Zone: Reduce Radial Velocity
+        else:
+            v_ca += u_max * ((r_avoid - r) / (r_avoid - r_safe))**p_rep * r_hat
+    
+    # Clamp Total Collision Avoidance to Maximum Vehicle Speed
+    u_ca = np.linalg.norm(v_ca)
+    if (u_ca > u_max):
+        return u_max * (v_ca / u_ca)
+    
+    return v_ca
 
 ###############################################################################
 
-def depthAPF(vehicle:Vehicle, vel:NPFltArr)->NPFltArr:
+def depthSafetyLimit(vehicle:Vehicle, vel:NPFltArr)->NPFltArr:
     """
-    Apply depth safety constraint via artificial potential field.
+    Apply depth safety constraint.
     
     Modifies desired velocity to enforce minimum distance from ocean floor
-    (z=z_bed - z_safe) using repulsive APF forces.
+    (z=z_bed - z_safe).
     
 
     Parameters
@@ -1976,7 +1776,6 @@ def depthAPF(vehicle:Vehicle, vel:NPFltArr)->NPFltArr:
          
     Notes
     -----
-    - Applied as final stage in velAPF() pipeline.
     - Attempts to prevent ground collision (z > z_bed - z_safe).
 
     When the vehicle is below the Safety Distance threshold from the Maximum
@@ -1990,80 +1789,201 @@ def depthAPF(vehicle:Vehicle, vel:NPFltArr)->NPFltArr:
     """
     
     # Vehicle Parameters
-    z = vehicle.eta[2]         # vehicle depth (m)
-    v_z = vehicle.velocity[2]  # vehicle depth velocity (m/s)
-    z_max = vehicle.z_max
-    z_safe = vehicle.z_safe
+    z = vehicle.eta[2]          # vehicle depth (m)
+    v_z = vehicle.velocity[2]   # vehicle depth velocity (m/s)
+    dz_safe = vehicle.z_safe    # width of depth safety zone
+    vel_copy = np.copy(vel)     # proposed velocity command
+    vel_z = vel_copy[2]         # z-component of proposed velocity
 
-    # APF
-    z_max = nav.maxDepthLimit(vehicle,z_max)
-    vel_copy = np.copy(vel)
-    vel_z = vel_copy[2]
-    if ((z > (z_max-z_safe)) and ((vel_z+v_z) > 0)):
+    # Depth control geometry
+    hard_floor = nav.maxDepthLimit(vehicle, vehicle.z_max)
+    safety_depth = hard_floor - dz_safe
+
+    # Apply depth filtering if vehicle below safety depth and moving down
+    if ((z > safety_depth) and ((vel_z+v_z) > 0)):
+        gamma = min(1.0, ((z - safety_depth) / dz_safe))   # Scaling Factor
+        # Reduce downward component of proposed command
         if (vel_z > 0):
-            vel_copy[2] += -vel_z
+            vel_copy[2] -= gamma * vel_z
+        # Apply braking against vehicles downward motion
         if (v_z > 0):
-            gamma = ((z - (z_max - z_safe)) / z_safe)   # Scaling Factor
-            vel_copy[2] += -gamma * v_z
+            vel_copy[2] -= gamma * v_z
     
     return vel_copy
 
 ###############################################################################
 
-def velAPF(vehicle:Vehicle)->NPFltArr:
+def velocitySubsumptionCascadeAPF(vehicle:Vehicle)->NPFltArr:
     """
-    Artificial Potential Field (APF) velocity guidance law.
+    APF velocity guidance law with subsumption-based saturation cascade.
     
-    Combines attraction to target, repulsion from neighbors, and depth
-    constraints to compute desired velocity for swarm coordination.
-    
+    Combines three Artificial Potential Field (APF) behaviors -- collision
+    avoidance, formation keeping, and a control vector -- into a single desired
+    velocity vector. Behavioral priority follows the subsumption architecture of
+    Brooks [1], where higher-priority layers inhibit lower-priority layers.
+    Behaviors are fused by weighted vector summation following Arkin's motor
+    schema formulation [2]. The weight computation uses saturation ratios that
+    cascade multiplicatively through the priority hierarchy, analogous to the
+    nested null-space projections in the NSB approach of Antonelli et al. [3]
+    but reduced to scalar velocity-budget residuals. This function is designed
+    to be assigned to a vehicle as the GuidLaw callable attribute as part of a
+    guidance system.
 
     Parameters
     ----------
     vehicle : Vehicle
-        Vehicle with GuidLaw.attraction, GuidLaw.repulsion, u_max, CommNetwork.
+        Vehicle object. Must have:
 
-        - GuidLaw.attraction: Function used for APF attraction
-        - GuidLaw.repulsion: Function used for APF repulsion
-        - u_max: Maximum vehicle speed (m/s)        
-        - CommNetwork: Communication network manager
+        - GuidLaw.survival : callable
+            Computes collision avoidance velocity vector. Highest priority
+            layer.
+        - GuidLaw.formation : callable
+            Computes formation keeping velocity vector. Middle priority layer.
+        - GuidLaw.mission : callable
+            Computes control / misison velocity vector. Lowest priority layer.
+        - u_max : float
+            Maximum vehicle speed in m/s. Defines total velocity budget.
+        - CommNetwork : object or None
+            Communication network manager. If not None, swarm state is
+            predicted via predictSwarmState() before guidance evaluation.
 
-         
     Returns
     -------
     v_d : ndarray, shape (3,)
-        Desired velocity in END frame, limited to u_max.
+        Desired velocity vector [vx, vy, vz] in END frame (m/s).
+        Magnitude limited to u_max. Depth-constrained by depthSafetyLimit().
 
-           
     Notes
     -----
-    - Calls predictSwarmState() if using communication network.
-    - Uses depthAPF() to enforce depth safety constraints.
+    **Subsumption Architecture:**
+
+    Behaviors are organized into a strict priority hierarchy. Each layer can
+    fully suppress all layers below it by consuming the shared velocity budget.
+    The total available speed u_max is treated as the budget, and each layer
+    draws down a fraction proportional to its output magnitude:
+
+    1. **Collision Avoidance** (highest layer)
+
+        - Saturation ratio: `s_ca = norm(v_ca) / u_max`
+        - Scaling weight: `w_ca = 1.0` (always full weight)
+        - Residual passed down: `w_fk = 1 - (w_ca * s_ca)`
+        - When `s_ca = 1`: all lower layers are fully suppressed
+
+    2. **Formation Keeping** (middle layer)
+
+        - Saturation ratio: `s_fk = norm(v_fk) / u_max`
+        - Scaling weight: `w_fk = 1 - (w_ca * s_ca)`
+        - Residual passed down: `w_m = w_fk * (1 - s_fk)`
+        - Fully suppressed when collision avoidance saturates the budget
+
+    3. **Mission** (lowest layer)
+
+        - Scaling weight: `w_m = w_fk * (1 - s_fk)`
+        - Only active when neither collision nor formation consumes the budget
+        - Fully suppressed when either higher layer saturates the budget
+
+    **Total Velocity:**
+
+        v_tot = (w_ca * v_ca) + (w_fk * v_fk) + (w_m * v_m)
+
+    Clamped to u_max if the total magnitude exceeds the vehicle limit, then
+    passed through depthSafetyLimit() for depth safety enforcement.
+
+    The subsumption model allows higher-priority behaviors to dominate when
+    needed: when collision avoidance is active it progressively suppresses
+    formation keeping, and both suppress the mission vector. This prevents
+    lower-priority behaviors from counteracting safety-critical responses.
+
+    The general N-layer pattern:
+
+    .. code-block:: none
+
+        w[0] = alpha
+        w[1] = 1.0 - (w[0] * s[0])
+        w[2] = w[1] * (1.0 - s[1])
+        w[3] = w[2] * (1.0 - s[2])
+        ...
+    
+
+    **Full Suppression:**
+
+    When `s_ca = 1` (collision avoidance saturates u_max), the formation keeping
+    residual `w_fk = 0`, which in turn forces `w_m = 0`. Both lower layers are
+    completely inhibited and the vehicle behaves purely as a collision avoidance
+    agent, consistent with subsumption's hard behavioral priority guarantee.
+
+    **Multiplicative Cascade:**
+
+    The mission weight `w_m = w_fk * (1 - s_fk)` means the mission layer
+    is doubly suppressed: first by how much collision avoidance consumes the
+    budget (via `w_fk`), then by how much formation keeping consumes what
+    remains (via `1 - s_fk`). This nested structure mirrors the cascaded 
+    null-space projections of the NSB framework, but operating on scalar budget 
+    residuals.
+ 
+    **Communication:**
+
+    If vehicle.CommNetwork is not None, predictSwarmState() is called at the
+    start of each evaluation to propagate estimated member positions forward
+    using a prediction model.
+
+    References
+    ----------
+    [1] R. Brooks, "A robust layered control system for a mobile robot," 
+    in IEEE Journal on Robotics and Automation, vol. 2, no. 1, pp. 14-23, 
+    March 1986, doi: 10.1109/JRA.1986.1087032.
+
+    [2] R. C. Arkin, "Motor schema-based mobile robot navigation," 
+    The International Journal of Robotics Research. 1989;8(4):92-112. 
+    doi:10.1177/027836498900800406
+
+    [3] G. Antonelli, F. Arrichiello and S. Chiaverini, "Experiments of 
+    Formation Control With Multirobot Systems Using the Null-Space-Based 
+    Behavioral Control," in IEEE Transactions on Control Systems Technology, 
+    vol. 17, no. 5, pp. 1173-1182, Sept. 2009, 
+    doi: 10.1109/TCST.2008.2004447.
+
+    See Also
+    --------
+    survivalGroupNormPolyAPF : Collision avoidance from group vehicles
+    formationTargetNormPolyAPF : Formation keeping with leader vehicle
+    missionTargetFeedForwardAPF : Control/tracking vector from leader velocity
+    depthSafetyLimit : Depth safety constraint enforcement
+    predictSwarmState : Swarm state prediction during communication gaps
+    targetTrack : Target tracking guidance system
     """
+
+    # Maximum Vehicle Speed
+    u_max = vehicle.u_max
 
     # Update Swarm State Data
     if (vehicle.CommNetwork is not None):
         predictSwarmState(vehicle)
 
-    # APF Attraction Velocity
-    v_a = vehicle.GuidLaw.attraction(vehicle)
+    # Evaluate Velocity Components
+    v_ca = vehicle.GuidLaw.survival(vehicle)        # Collision Avoidance
+    v_fk = vehicle.GuidLaw.formation(vehicle)       # Formation Keeping
+    v_m = vehicle.GuidLaw.mission(vehicle)          # Mission
+
+    # Evaluate Component Saturation Ratios
+    s_ca = min(np.linalg.norm(v_ca) / u_max, 1.0)
+    s_fk = min(np.linalg.norm(v_fk) / u_max, 1.0)
+
+    # Evaluate Subsumption Weights
+    w_ca = 1.0                                      # 1.0 = No scaling
+    w_fk = 1.0 - (w_ca * s_ca)
+    w_m = w_fk * (1.0 - s_fk)
     
-    # APF Repulsion Velocity
-    v_r = vehicle.GuidLaw.repulsion(vehicle)
-    
-    # Total APF
-    v_tot = v_a + v_r
+    # Total Velocity
+    v_tot = (w_ca * v_ca) + (w_fk * v_fk) + (w_m * v_m)
 
     # Limit to Maximum Vehicle Speed
     u_tot = np.linalg.norm(v_tot)
-    u_max = vehicle.u_max
     if (u_tot > u_max):
         v_tot = u_max * (v_tot / u_tot)
-    if (u_tot == 0):
-        return np.array([0., 0., 0.])
     
     # APF Depth Constraints
-    v_d = depthAPF(vehicle,v_tot)
+    v_d = depthSafetyLimit(vehicle,v_tot)
 
     return v_d
 
@@ -2173,10 +2093,11 @@ def targetTrack(vehicle:Vehicle)->NPFltArr:
     See Also
     --------
     vehicles.Remus100s.loadTargetTracking() : Assigns use of targetTrack()
-    velAPF : APF velocity guidance (typical choice)
-    velCB : Constant bearing velocity guidance (alternative)
-    variableLinearZoneAttractionAPF : APF attraction function
-    variableExpRepulsionAPF : APF repulsion function
+    velocitySubsumptionCascadeAPF : APF velocity guidance
+    velCB : Constant bearing velocity guidance
+    missionTargetFeedForwardAPF : Target velocity feed-forward
+    formationTargetNormPolyAPF : Attraction and repulsion to target vehicle
+    survivalGroupNormPolyAPF : Repulsion from all group vehicles
     control.headingPID : Heading autopilot
     control.depthPID : Depth autopilot
     """

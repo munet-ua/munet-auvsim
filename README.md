@@ -1,6 +1,9 @@
 # muNet AUV Sim
 
-**Version:** 0.1.0-beta  
+[![Latest Release](https://img.shields.io/github/v/release/munet-ua/munet-auvsim?include_prereleases&sort=semver)](https://github.com/munet-ua/munet-auvsim/releases/latest)
+[![DOI](https://zenodo.org/badge/1109695731.svg)](https://doi.org/10.5281/zenodo.18176580)
+
+**Version:** 0.2.0-beta  
 **Status:** Beta Release
 
 ## Description
@@ -208,6 +211,9 @@ The full project documentation is available at:
 
 This documentation is up to date with the latest release and is the best place to start if you're new to the project or need reference information.
 
+> **What’s New:** See release notes at https://github.com/munet-ua/munet-auvsim/releases/latest
+
+
 ### Using the Documentation
 
 - **Browse:**
@@ -267,7 +273,7 @@ You can also build the documentation from source if you wish to experiment, prev
 
 4. **View Documentation:**
 
-    Open munet-auvsim/docs/build/html/index.html in your browser.
+    Open `munet-auvsim/docs/build/html/index.html` in your browser.
 
 The Sphinx configuration and source files are provided in the `docs/` directory, excluding the built HTML.
 
@@ -737,7 +743,7 @@ file for details.
 
 ### Contributors
 
-- **Michael Qin** -- *Developed the 'Pollution' object for representing a static
+- **Gang Qin** -- *Developed the 'Pollution' object for representing a static
   Gaussian plume dispersion*  
   [Michael](https://munet-gitlab.eng.ua.edu/Michael)
 
@@ -766,13 +772,19 @@ If you use muNet-AUVsim in your research, please cite:
 
 ```bibtex
 @software{munet_auvsim,
-  author = {Crawford, JP and Song, Aijun},
+  author = {Crawford, JP and Qin, Gang and Song, Aijun},
   title = {muNet-AUVsim: Multi-Agent AUV Simulation Framework},
-  year = {2025},
-  version = {0.1.0-beta},
+  year = {2026},
+  version = {0.2.0-beta},
+  doi = {10.5281/zenodo.18176581},
   url = {https://github.com/munet-ua/munet-auvsim}
 }
 ```
+
+**Or use the CFF citation file:**
+See [CITATION.cff](CITATION.cff) for standard citation formats.
+
+**DOI:** [![DOI](https://zenodo.org/badge/1109695731.svg)](https://doi.org/10.5281/zenodo.18176581)
 
 ## Contact and Support
 
@@ -781,7 +793,7 @@ If you use muNet-AUVsim in your research, please cite:
 
 ## Project Status
 
-**Current Version**: 0.1.0-beta  
+**Current Version**: 0.2.0-beta  
 **Status**: Beta Release - Core features stable, API subject to refinement
 
 ### Roadmap
@@ -790,14 +802,14 @@ Short list of bug fixes and features intended for future development:
 
 **Near Term:**
 
-- [ ] **Improved Ocean Modeling** - Remove size limitations in Perlin terrain
-  generation for larger simulation areas
+- [x] **Improved Ocean Modeling** - Removed size limitations in Perlin terrain
+  generation for larger simulation areas ([shipped in 0.2.0-beta](https://github.com/munet-ua/munet-auvsim/releases/latest))
+- [x] **APF Performance** - Updated APF design to use subsumption architecture with Mission, Formation, and Survival layers to improve guidance behavior ([shipped in 784e2d3](https://github.com/munet-ua/munet-auvsim/commit/784e2d3ca0f82e92e87130ef641c785f9ea46cf5))
+- [ ] **Environment Injection Refactor** - Move origination of ocean current and depth in the vehicle dynamics function from sensor models to direct simulator injection
 - [ ] **Better Network Tools** - Enhanced node registration and channel
   assignment utilities for muNet
 - [ ] **Visualization Improvements** - Separate 3D plot generation from
   animation rendering for better performance and user control
-- [ ] **APF Performance** - Investigate wave filtering in APF and errant vehicle
-  behavior
 
 ---
 ---

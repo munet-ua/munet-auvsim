@@ -627,6 +627,8 @@ def plot3D(simData:NPFltArr,
         if (ocean is not None) and (ocean.floor is not None):
             staticData['dep'] = [ocean.floor.z,
                                  ocean.floor.z+ocean.floor.z_range]
+        else:
+            staticData['dep'] = [np.nan, np.nan]
         # communication
         if (vehicles[0].CommNetwork is None):
             staticData['com'] = 'Direct Access'

@@ -15,7 +15,7 @@ import munetauvsim
 
 project = 'muNet-AUVsim'
 author = 'JP Crawford'
-release = '0.1.0-beta'
+release = '0.2.0-beta'
 
 project_urls = {
     'GitHub Repository': 'https://github.com/munet-ua/munet-auvsim',

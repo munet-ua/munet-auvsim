@@ -136,6 +136,8 @@ class Ocean:
         Descriptive name for this ocean environment instance.
     plume : list of float, default=None
         Pollution source location [x, y, z] in meters. z is depth (positive).
+    createFloor : bool, default=True
+        If False, no Floor instance is generated.
     createPlume : bool, default=False
         If True, creates a pollution plume with emission from source location.
     currentSeed : int, optional
@@ -232,21 +234,6 @@ class Ocean:
     Currently, ocean parameters like current speed/direction are not
     automatically synchronized between current and pollution objects. Future
     versions should improve consistency handling.
-    
-    **Memory Considerations:**
-
-    Large N values create proportionally large current time series:
-
-    - N=60000: ~1MB for speed and angle arrays
-    - N=600000: ~10MB per ocean instance
-    
-    Floor size affects memory quadratically:
-
-    - size=1000: ~8MB for depth array
-    - size=5000: ~200MB per floor instance
-    - Known issue: Ocean floor sizes exceeding ~6000m may trigger memory
-      allocation failures. This limitation will be resolved through chunked
-      Perlin noise generation in an upcoming update.
 
       
     Examples
@@ -326,7 +313,6 @@ class Ocean:
     
     Warnings
     --------
-    - Large size values (>5000) may cause memory issues
     - Pollution parameters (u, v) not auto-synced with current (manual update
       needed)
     """
@@ -339,6 +325,7 @@ class Ocean:
                  h:float = 0.02,
                  name="Ocean",
                  plume:Union[NPFltArr, List[float], None] = None,
+                 createFloor:bool = True,
                  createPlume:bool = False,
                  currentSeed:Optional[int] = None,
                  floorSeed:int = 0,
@@ -367,7 +354,6 @@ class Ocean:
             - Standard ops: 1000-2000m
             - Large survey: 3000-5000m
             
-            Maximum practical: ~6000m (Perlin generation memory limit).
         origin : list of float, default=[500, 500]
             Coordinates [x_origin, y_origin] where (x=0, y=0) maps in domain.
             Allows negative coordinate values. Passed to Floor and Pollution.
@@ -394,6 +380,12 @@ class Ocean:
             If None and createPlume=True, uses a default source of [0, 0, 30].
             If not None, creates Pollution regardless of createPlume (backwards
             compatible).
+        createFloor : bool, default=True
+            If True (default), creates a Floor instance with procedural
+            bathymetry from Perlin noise. If False, sets `floor` to None —
+            useful for deep-ocean scenarios or control experiments where
+            terrain is irrelevant. Floor can also be disabled post-construction
+            by setting `ocean.floor = None`.
         createPlume : bool, default=False
             If True, creates a Pollution instance with emission from the
             specified plume source location.
@@ -413,7 +405,7 @@ class Ocean:
             If randomPlume=False, plumeSeed has no effect.
         randomFloor : bool, default=False
             If True, generates random floor seed (ignores floorSeed parameter).
-            Creates unique terrain each run.
+            Creates unique terrain each run. Ignored if createFloor=False.
         randomPlume : bool, default=False
             If True, randomizes pollution u and v parameters.
             Generates random plumeSeed if plumeSeed=None.
@@ -459,10 +451,12 @@ class Ocean:
             Origin coordinates (managed property, updates floor.origin).
         current : Current1D
             Time-varying ocean current instance.
-        floor : Floor
-            Procedurally generated ocean floor instance.
-        pollution : Pollution or None 
-            Gaussian plume pollution instance. None if not requested.
+        floor : Floor or None
+            Procedurally generated ocean floor instance. None if
+            createFloor=False or disabled post-construction.
+        pollution : Pollution or None
+            Gaussian plume pollution instance. None if createPlume = False 
+            (default).
         
         Notes
         -----
@@ -626,30 +620,32 @@ class Ocean:
         --------
         ### Default calm ocean with pollution:
         
-        >>> import munetauvsim.environment as env
-        >>> ocean = env.Ocean(createPlume=True)
-        >>> print(ocean)
-        Ocean: Ocean
-        -------------------------------------
-        Current
-        Speed:       0.275 +/-0.055 m/s (180.0s)
-        Angle:       0.785 +/-0.140 rad (180.0s)
-        Seed:        1234567890
+        .. code-block:: pycon
 
-        Floor
-        Size:        1000 m
-        Origin:      [500, 500]
-        Depth:       125 to 135 m
-        Style:       linear
+            >>> import munetauvsim.environment as env
+            >>> ocean = env.Ocean(createPlume=True)
+            >>> print(ocean)
+            Ocean: Ocean
+            ----------------------------------------
+            Current
+            Speed:       0.275 +/-0.055 m/s (180.0s)
+            Angle:       0.785 +/-0.140 rad (180.0s)
+            Seed:        1234567890
 
-        ... (Perlin noise details)
+            Floor
+            Size:        1000 m
+            Origin:      [500, 500]
+            Depth:       125 to 135 m
+            Style:       linear
 
-        Pollution
-        Source:      (0.00, 0.00, 30.00)
-        Strength:    1.59 g/s
-        Speed:       0.28 m/s at 0.79 rad
-        Seed:        None
-        -------------------------------------
+            ... (Perlin noise details)
+
+            Pollution
+            Source:      (0.00, 0.00, 30.00)
+            Strength:    1.59 g/s
+            Speed:       0.28 m/s at 0.79 rad
+            Seed:        None
+            ----------------------------------------
 
         ### Custom environment:
         
@@ -704,8 +700,6 @@ class Ocean:
         --------
         - Pollution parameters NOT automatically synchronized with current
           changes after construction. Manual updates required.
-        - Large size values (>5000) may trigger memory errors during floor
-          generation.
         """
         
         self.name = name
@@ -713,22 +707,33 @@ class Ocean:
         self.sampleTime = h
         self.size = size
         self.origin = origin
+
+        # Current1D instance
         self.current = Current1D(nIter=N, h=h, seed=currentSeed, **kwargs)
-        self.floor = Floor(size=size,
-                           origin=origin,
-                           seed=floorSeed,
-                           random=randomFloor, 
-                           **kwargs)
+
+        # Floor instance 
+        if (createFloor):
+            self.floor = Floor(size=size,
+                               origin=origin,
+                               seed=floorSeed,
+                               random=randomFloor,
+                               **kwargs)
+        else:
+            self.floor = None
+
+        # Pollution instance
         if ((plume is not None) or (createPlume)):
             if (plume is None):
                 plume = [0, 0, 30]
 
+            oceanDepth = (self.floor.z if (self.floor is not None)
+                          else kwargs.get('z', 6000))
             self.pollution = Pollution(source=plume,
-                                    u=self.current.v_spd, 
+                                    u=self.current.v_spd,
                                     v=self.current.b_ang,
-                                    oceanSize=size, 
+                                    oceanSize=size,
                                     oceanOrigin=origin,
-                                    oceanDepth=self.floor.z,
+                                    oceanDepth=oceanDepth,
                                     seed=plumeSeed,
                                     random=randomPlume,
                                     **kwargs)
@@ -875,22 +880,34 @@ class Ocean:
     ## Special Methods =======================================================#
     def __repr__(self) -> str:
         """Detailed description of Ocean"""
-        plumeRepr = ""
-        if (self.pollution is not None):
-            plumeRepr = f"\npollution={self.pollution!r}"
-
+        
+        geometry = ""
+        if (self.floor is None):
+            geometry = f"size={self.size}, origin={self.origin}, "
         return (
-            f"{self.__class__.__name__}(\n"
-            f"name='{self.name}'\n"
-            f"current={self.current!r}\n"
-            f"floor={self.floor!r}"
-            f"{plumeRepr})"
+            f"{self.__class__.__name__}("
+            f"name='{self.name}', {geometry}"
+            f"current={self.current!r}, "
+            f"floor={self.floor!r}, "
+            f"pollution={self.pollution!r})"
         )
     
     #--------------------------------------------------------------------------
     def __str__(self) -> str:
         """User friendly description of Ocean"""
-        components = [str(self.current), str(self.floor)]
+
+        cw = 16
+        components = []
+        
+        if (self.floor is not None):
+            floorStr = str(self.floor)
+        else:
+            components.append(f"{'Size:':{cw}} {self.size} m")
+            components.append(f"{'Origin:':{cw}} {self.origin}\n")
+            floorStr = "Floor            None\n"
+
+        components.extend([str(self.current), floorStr])
+
         if (self.pollution is not None):
             components.append(str(self.pollution))
 
@@ -1327,12 +1344,15 @@ class Current1D:
             This is the central value around which speed oscillates.
             
             **Float**: Exact mean speed in m/s (0.0-2.5).
+
             >>> Current1D(spd=0.75)  # Exactly 0.75 m/s mean
             
             **List [low, high]**: Random selection within range via uniform distribution.
+
             >>> Current1D(spd=[0.5, 1.0])  # Random between 0.5-1.0 m/s
             
             **String categories** (m/s ranges):
+
             - 'dead':          0.0 (no current)
             - 'typical':  0.05-0.5 (coastal/shelf currents)
             - 'moderate': 0.5-1.0  (active shelf/slope)
@@ -1349,12 +1369,15 @@ class Current1D:
             around this value (adds stochastic variation).
             
             **Float**: Exact mean amplitude deviation in m/s (0.0-1.5).
+
             >>> Current1D(spd=1.0, dSpd=0.2)  # Speed varies ~0.8-1.2 m/s
             
             **List [low, high]**: Random mean amplitude deviation from range.
+
             >>> Current1D(dSpd=[0.1, 0.3])
             
             **String categories** (m/s ranges):
+
             - 'constant':      0.0 (no variation, steady speed)
             - 'steady':   0.01-0.1 (gentle fluctuations)
             - 'varied':   0.1-0.5  (moderate variations)
@@ -1370,12 +1393,15 @@ class Current1D:
             Larger values -> slower, smoother variations.
             
             **Float**: Exact half-period in seconds.
+
             >>> Current1D(dtSpd=120.0)  # 2-minute oscillation period
             
             **List [low, high]**: Random selection of period range.
+
             >>> Current1D(dtSpd=[30, 90]) 
             
             **String categories** (second ranges):
+
             - 'calm':       600 (10-minute oscillations, very smooth)
             - 'smooth':  90-150 (1.5-2.5 minutes, gentle)
             - 'regular': 30-90  (0.5-1.5 minutes, typical)
@@ -1387,13 +1413,16 @@ class Current1D:
             This is the central bearing around which direction oscillates.
             
             **Float**: Exact mean direction in radians.
+
             >>> Current1D(ang=np.pi/2)  # North (90 deg)
             >>> Current1D(ang=0)         # East (0 deg)
             
             **List [low, high]**: Random mean direction from range.
+
             >>> Current1D(ang=[0, np.pi/4])  # East to Northeast
             
             **String categories** (radian ranges, +/- pi/8 from center):
+
             - 'east':           0 +/- pi/8 (337.5 deg to  22.5 deg)
             - 'northeast':   pi/4 +/- pi/8 ( 22.5 deg to  67.5 deg)
             - 'north':       pi/2 +/- pi/8 ( 67.5 deg to 112.5 deg)
@@ -1412,12 +1441,15 @@ class Current1D:
             Each half-period samples new amplitude from normal distribution around this value.
             
             **Float**: Exact mean angular deviation in radians (0.0-pi/2).
+
             >>> Current1D(ang=0, dAng=0.2)  # +/- 11.5 deg oscillation
             
             **List [low, high]**: Random mean amplitude selection from range.
+
             >>> Current1D(dAng=[0.1, 0.3])  # +/- 5.7 deg to +/- 17.2 deg
             
             **String categories** (radian ranges):
+
             - 'constant':           0.0 (no directional change)
             - 'steady':     0.1 - pi/18 (+/-  5.7 deg to +/-   10 deg, slight meander)
             - 'varied':   pi/18 - pi/8  (+/-   10 deg to +/- 22.5 deg, moderate swing)
@@ -1431,6 +1463,7 @@ class Current1D:
             Time for one directional oscillation from max to min.
             
             **Float**: Exact half-period in seconds.
+
             >>> Current1D(dtAng=180.0)  # 3-minute direction cycle
             
             **List [low, high]**: Random period range.
@@ -1443,7 +1476,6 @@ class Current1D:
         h : float, default=0.02
             Time step per iteration in seconds.
             Default 0.02s = 50 Hz sampling rate.
-            
             Total simulation time = nIter * h seconds.
             
         seed : int, optional
@@ -1488,6 +1520,7 @@ class Current1D:
         
         2. **Parameter Resolution:**
         For each parameter (spd, dSpd, dtSpd, ang, dAng, dtAng):
+
         a. If string: Look up in category dictionary, select random value in range.
         b. If list [low, high]: Select random value via uniform distribution.
         c. If float: Use value.
@@ -1503,8 +1536,10 @@ class Current1D:
         
         4. **RNG State Capture:**
         Before each time series generation, store RNG state:
+
         - _spd_rng_state: For speed reproducibility
         - _ang_rng_state: For angle reproducibility
+
         Allows resizing/resampling while maintaining pattern.
         
         5. **Time Series Generation:**
@@ -1554,6 +1589,7 @@ class Current1D:
         **Parameter Priority:**
         
         When parameters specified multiple ways:
+
         1. Property setter validation (clipping/wrapping)
         2. User explicit value (if float)
         3. Random from custom range (if list)
@@ -1562,20 +1598,24 @@ class Current1D:
         **Categorical Parameter Philosophy:**
         
         String categories enable quick prototyping without remembering exact numerical ranges:
+
         >>> current = Current1D(spd='moderate', dSpd='steady', ang='north')
         
         For precise control, use floats:
+
         >>> current = Current1D(spd=0.82, dSpd=0.15, ang=np.pi/2)
         
         **Reproducibility:**
         
         Identical seed + parameters -> identical time series:
+
         >>> c1 = Current1D(spd='typical', seed=42)
         >>> c2 = Current1D(spd='typical', seed=42)
         >>> np.array_equal(c1.speed, c2.speed)
         True
         
         But different seeds with same category -> different values:
+
         >>> c3 = Current1D(spd='typical', seed=43)
         >>> c1.v_spd != c3.v_spd  # Different mean selected
         True
@@ -1583,6 +1623,7 @@ class Current1D:
         **Property-Triggered Regeneration:**
         
         Changing n or h after initialization regenerates time series:
+
         >>> current = Current1D(nIter=10000, seed=100)
         >>> current.n = 20000  # Extends to 20000 iterations
         >>> # Uses stored RNG state to maintain pattern continuity
@@ -1590,6 +1631,7 @@ class Current1D:
         **Integration with Ocean:**
         
         Ocean passes categorical or numerical current parameters:
+        
         >>> ocean = Ocean(
         ...     spd='moderate',
         ...     dSpd='steady',
@@ -2433,23 +2475,20 @@ class Floor:
         Generates size x size depth array.
     origin : list of float, default=[500, 500]
         Coordinates [x, y] where (0, 0) maps to floor array center.
-    seed : int, default=0
-        PRNG seed for Perlin noise generation. Same seed produces
-        identical terrain. seed=0 is valid and reproducible.
-    random : bool, default=False
-        If True, generates random seed to generate unique terrain. Overrides
-        seed parameter and saves newly generated seed.
     style : str, default='linear'
-        How Perlin noise is stretched over z_range, determining terrain
-        characteristics.
+        Depth mapping style. Determines how the depth array is constructed.
+        'flat' produces uniform depth without Perlin noise; all other styles
+        map Perlin noise values onto z_range.
     **kwargs
         Additional optional keyword arugments.
 
         **Perlin noise parameters**
 
-        - scale : int - Spatial frequency scale
-        - octaves : int - Number of noise layers
-        - persistence : float - Amplitude decay factor
+        - seed : int - Same seed produces idential terrain (default: 0)
+        - random : bool - True generates random seed (default: False)
+        - scale : int - Spatial frequency scale (default: 0.3*size)
+        - octaves : int - Number of noise layers (default: 3)
+        - persistence : float - Amplitude decay factor (default: 0.5)
 
         See PerlinNoise documentation for detailed parameter descriptions.
 
@@ -2464,8 +2503,6 @@ class Floor:
         Floor array side length in meters.
     origin : list of float
         Origin coordinates [x, y] for indexing.
-    seed : int
-        PRNG seed used for generation.
     style : str
         Terrain generation style.
     depth : ndarray, shape (size, size)
@@ -2513,6 +2550,7 @@ class Floor:
       Floor uses a strategy pattern to select depth mapping algorithms. The
       `style` parameter determines which mapping function is applied:
       
+      - 'flat': Uniform depth array (ignores Perlin noise)
       - 'linear': Linear stretch over z range
       - 'sigmoid': Smooth transitions via sigmoid function
       - 'shelf': Asymmetric scaling for shelf-like features
@@ -2568,11 +2606,12 @@ class Floor:
     
     **Resampling:**
 
-    Changing size, style, or perlin instance invalidates the tile cache, 
-    causing any previously generated depth terrain to require regeneration.
+    Changing z, z_range, size, style, or perlin instance invalidates the tile
+    cache, causing any previously generated depth terrain to require
+    regeneration.
     
     >>> floor = Floor(size=1000)
-    >>> floor.size = 2000           # Clears cache, expands area
+    >>> floor.size = 2000        # Clears cache, regenerates terrain at new size
     
 
     Examples
@@ -2655,8 +2694,6 @@ class Floor:
                  z_range:Number=10,
                  size:int=1000,
                  origin:List[float]=[500,500],
-                 seed:int=0,
-                 random:bool=False,
                  style:str='linear',
                  **kwargs
                  ):
@@ -2711,24 +2748,11 @@ class Floor:
             - [1000, 1000]: Allows negative coords from -1000 to 0
 
             Typically set to [size/2, size/2] for centered operations.
-        seed : int, default=0
-            PRNG seed for Perlin noise generation.
-            Ensures reproducible terrain:
-
-            - Same seed -> identical terrain every time
-            - Different seed -> completely different terrain
-            - seed=0 is valid (not treated as null)
-
-            Ignored if random=True.
-        random : bool, default=False
-            If True, generates random seed from system entropy.
-            Overrides explicit seed parameter.
-            Seed stored in self.seed after generation.
-            Generates unique terrains.
         style : str, default='linear'
             Terrain generation style (how Perlin noise maps to depth).
             Available styles supported:
 
+            - 'flat': uniform depth with no variation (ignores Perlin noise)
             - 'linear': linear scaling across z_range
             - 'sigmoid': smooth s-curve transitions
             - 'shelf': asymmetric scaling 
@@ -2739,41 +2763,41 @@ class Floor:
             - 'bimodal': For plateaus and valleys
             - 'terraced': For step-like formations
 
-            Invalid style triggers warning and fallback to default.
+            Invalid style logs warning and fallback to default.
         **kwargs
             Additional optional keyword arguments.
 
             **Perlin noise parameters**
 
-            - scale : int - Spatial frequency scale (default: 300)
+            - seed : int - Same seed produces idential terrain (default: 0)
+            - random : bool - True generates random seed (default: False)
+            - scale : int - Spatial frequency scale (default: 0.3*size)
             - octaves : int - Number of noise layers (default: 3)
             - persistence : float - Amplitude decay factor (default: 0.5)
+
+            See PerlinNoise documentation for detailed parameter descriptions.
             
         Attributes
         ----------
         z : float
-            Minimum depth (stored directly).
+            Minimum depth (stored, invalidates depth cache on change).
         z_range : float
-            Depth variation range (stored directly).
+            Depth variation range (stored, invalidates depth cache on change).
         size : int
             Floor area dimension (stored, triggers regeneration on change).
         origin : list of float
             Origin coordinates (stored directly).
-        seed : int
-            Actual seed used (from parameter or generated if random=True).
         style : str
-            Terrain style (stored, triggers method assignment).
+            Terrain style (stored, triggers PerlinNoise and method assignment).
+        depth : ndarray, shape (size, size)
+            Final depth map in meters. Only fully computed on explicit access.
         perlin : PerlinNoise
             Perlin noise generator instance containing:
 
             - noise: Normalized 2D array [0, 1]
-            - scale, octaves, persistence: Generation parameters
+            - scale, octaves, persistence, seed: Generation parameters
 
-        depth : ndarray, shape (size, size)
-            Final depth map in meters. Only fully computed on explicit access.
-        createMap : callable
-            Dynamically assigned method based on style parameter. Default is 
-            'linear'.
+            Set to None if style is 'flat'.
             
         Notes
         -----
@@ -2781,7 +2805,8 @@ class Floor:
 
         1. **Parameter Storage:**
 
-          Store z, z_range, size, origin directly as attributes.
+          Store z, z_range, size, origin, style directly as managed properties
+          or attributes.
         
         2. **Perlin Noise Generation:**
 
@@ -2789,9 +2814,7 @@ class Floor:
 
           >>> self.perlin = PerlinNoise(
           ...     size=size,
-          ...     seed=seed,
-          ...     random=random,
-          ...     **perlinKwargs          # scale, octaves, persistence
+          ...     **perlinKwargs     # scale, octaves, persistence, seed, random
           ... )
 
           This generates normalized noise array in [0, 1] on-demand.
@@ -2801,6 +2824,7 @@ class Floor:
           Validates style parameter and initializes strategy dictionary:
 
           >>> self._styleStrategies = {
+          ...     'flat': self._mapFlat,
           ...     'linear': self._mapLinear,
           ...     'sigmoid': self._mapSigmoid,
           ...     'shelf': self._mapShelf
@@ -2818,16 +2842,19 @@ class Floor:
           - Full array accessed via `depth` property.
           - Explicitly generated in full with `generate()` method.
         
-        **Size Property Behavior:**
-        
-        Changing size after initialization clears cached terrain:
-        
-        >>> floor = Floor(size=1000, seed=42)
-        >>> floor.size = 2000 
-        >>> # Depth cache cleared, regenerated on-demand as queried
-        
-        Expanding size extends existing terrain pattern seamlessly, and reducing
-        size shrinks the domain but maintains pattern in retained region.
+        **Managed Property Behavior**
+
+        `z`, `z_range`, `size`, `style`, and `perlin` are managed
+        properties. Setting any of them at runtime has side effects:
+
+        - `z`, `z_range`: Invalidate the depth cache; depth is
+          recomputed on next access.
+        - `size`: Rebuilds the Perlin instance (preserving seed and noise
+          parameters) at the new size, which in turn resets the depth
+          cache. For `style='flat'`, only `_size` is updated.
+        - `style`: Validates and assigns the new style, resets the depth
+          cache, and clears or assigns the PerlinNoise instance.
+        - `perlin`: Syncs `_tileSize` and resets the depth cache.
         
         **Style Strategy Pattern**
 
@@ -2842,6 +2869,7 @@ class Floor:
         2. Register in `style.setter`:
         
         >>> self._styleStrategies = {
+        ...     'flat': self._mapFlat,
         ...     'linear': self._mapLinear,
         ...     'sigmoid': self._mapSigmoid,
         ...     'shelf': self._mapShelf,
@@ -2932,14 +2960,17 @@ class Floor:
         self.origin = origin
 
         # Perlin parameters
-        perlinKwargs = {
-            k: kwargs[k] for k in ['scale', 'octaves', 'persistence']
-            if k in kwargs
+        self._perlinKwargs = {
+            # Default values
+            'seed': 0,
+            'scale': 0.3 * self.size,
+            'octaves': 3,
+            'persistence': 0.5,
+            'random': False,
+            # Overwrite defaults if parameters passed in kwargs
+            **{k:v for k,v in kwargs.items() 
+            if k in {'seed', 'scale', 'octaves', 'persistence', 'random'}}
         }
-        self.perlin = PerlinNoise(size=size, 
-                                  seed=seed, 
-                                  random=random,
-                                  **perlinKwargs)
 
         # Depth array parameters
         self.style = style
@@ -2967,9 +2998,34 @@ class Floor:
 
     @depth.setter
     def depth(self, value: NPFltArr)->None:
-        """Manual depth array assignment."""
+        """Assign depth array directly and invalidate prior tile cache."""
+        self._resetDepthCache()
         self._depth = value
     
+    #--------------------------------------------------------------------------
+    @property
+    def z(self)->Number:
+        """Minimum floor depth in meters."""
+        return self._z
+
+    @z.setter
+    def z(self, z:Number)->None:
+        """Set minimum floor depth and invalidate depth cache."""
+        self._resetDepthCache()
+        self._z = z
+    
+    #--------------------------------------------------------------------------
+    @property
+    def z_range(self)->Number:
+        """Depth range in meters. Maximum depth is `z + z_range`."""
+        return self._z_range
+
+    @z_range.setter
+    def z_range(self, z_range:Number)->None:
+        """Set depth range and invalidate depth cache."""
+        self._resetDepthCache()
+        self._z_range = z_range
+
     #--------------------------------------------------------------------------
     @property
     def size(self)->int:
@@ -2978,8 +3034,9 @@ class Floor:
 
     @size.setter
     def size(self, size:int)->None:
-        """Set size and recreate map with new length. Assumes same origin."""
-        if ('_perlin' in self.__dict__):
+        """Set size and regenerate Perlin with new size. Assumes same origin."""
+        if (('_style' in self.__dict__) and (self._style != 'flat') and
+            ('_perlin' in self.__dict__) and (self._perlin is not None)):
             # Use perlin property setter for automatic sync
             self.perlin = PerlinNoise(size=size,
                                       scale=self.perlin.scale,
@@ -2997,25 +3054,33 @@ class Floor:
 
     @style.setter
     def style(self, style:str)->None:
-        """Set depth mapping style and invalidate depth caches."""
+        """Set depth mapping style, invalidate depth cache, and assign Perlin"""
 
         # Define available strategies
         self._styleStrategies = {
+            'flat': self._mapFlat,
             'linear': self._mapLinear,
             'sigmoid': self._mapSigmoid,
             'shelf': self._mapShelf,
         }
 
-        # Validate input
+        # Validate and assign input
         style = self._validateStyle(style)
-
-        # Assign new attribute
         self._style = style
     
-        # Invalidate depth caches
-        if hasattr(self, '_tiles'):
-            self._tiles.clear()
-            self._depth = None
+        # Set PerlinNoise instance
+        ## Note: Style change requires call to _resetDepthCache, but both of 
+        ## these branches call setters on managed properties and each of them
+        ## independently resets the depth cache. No explicit call needed here.
+        if (style == 'flat'):
+            self._z_range_orig = self.z_range # cache original for later reuse
+            self.z_range = 0
+            self.perlin = None
+        else:
+            if (self.z_range == 0):
+                self.z_range = getattr(self, '_z_range_orig', 10) # reuse orig
+            self.perlin = PerlinNoise(size=self.size, 
+                                      **self._perlinKwargs)
 
     #--------------------------------------------------------------------------
     @property
@@ -3024,13 +3089,11 @@ class Floor:
         return self._perlin
     
     @perlin.setter
-    def perlin(self, pn:'PerlinNoise')->None:
-        """Set PerlinNoise instance and synchronize tile management."""
+    def perlin(self, pn:Optional['PerlinNoise'])->None:
+        """Set PerlinNoise, sync tile size, and invalidate depth cache."""
         self._perlin = pn
-        self._tileSize = pn._tileSize
-        # Invalidate caches
-        self._tiles = {}
-        self._depth = None
+        self._tileSize = pn._tileSize if pn else self.size
+        self._resetDepthCache()
 
     ## Special Methods =======================================================#
     def __call__(self, x:Number, y:Number)->np.float64:
@@ -3049,9 +3112,11 @@ class Floor:
             
         Notes
         -----
-        Uses tile cache for lazy evaluation. Tiles are generated on-demand and
-        cached for efficiency. First query within a tile triggers depth array
-        generation for that region, with results cached for subsequent queries.
+        - Uses tile cache for lazy evaluation. Tiles are generated on-demand and
+          cached for efficiency. First query within a tile triggers depth array
+          generation for that region, with results cached for subsequent
+          queries.
+        - Short-circuits for the 'flat' style by delegating to `_getFlatZ()`.
 
         Examples
         --------
@@ -3059,6 +3124,10 @@ class Floor:
         >>> z = floor(100,100)   # Depth value at (x=100,y=100)
         """
 
+        # Check depth style
+        if (self.style == 'flat'):
+            return self._getFlatZ()
+        
         # Convert to array indices
         col, row = self.xy2Index(x, y)
         
@@ -3082,6 +3151,8 @@ class Floor:
     #--------------------------------------------------------------------------
     def __repr__(self)->str:
         """Detailed description of Floor."""
+
+        perlin = f"{self.perlin!r}" if (self._perlin is not None) else "None"
         return (
             f"{self.__class__.__name__}("
             f"z={self.z}, "
@@ -3089,20 +3160,23 @@ class Floor:
             f"size={self.size}, "
             f"origin={self.origin}, "
             f"style='{self.style}', "
-            f"perlin={self.perlin!r})"
+            f"perlin={perlin})"
         )
 
     #--------------------------------------------------------------------------
     def __str__(self)->str:
         """User friendly description of Floor."""
+
         cw = 16
+        perlin = (f"{self.perlin}" if (self._perlin is not None) 
+                  else f"{'Perlin':{cw}} None\n")
         return (
             f"Floor\n"
             f"{' Size:':{cw}} {self.size} m\n"
             f"{' Origin:':{cw}} {self.origin}\n"
             f"{' Depth:':{cw}} {self.z} to {self.z + self.z_range} m\n"
             f"{' Style:':{cw}} {self.style}\n"
-            f"\n{self.perlin}"
+            f"\n{perlin}"
         )
     
     ## Methods ===============================================================#
@@ -3141,6 +3215,11 @@ class Floor:
         
         >>> floor = Floor(size = 1000)
         >>> z1 = floor(1100, 500)       # Same as floor(100, 500)
+
+        **Short Circuit:**
+
+        If `style='flat'`, then the method short-circuits by delegating to
+        `_mapFlat()`.
         
         Examples
         --------
@@ -3149,6 +3228,10 @@ class Floor:
         >>> y = [150, 250, 350]
         >>> z = floor.samplePoints(x, y)   # z is list of length 3
         """
+
+        # Check depth style
+        if (self.style == 'flat'):
+            return self._mapFlat(np.asarray(x))
 
         # Convert to indices
         x = np.asarray(x)
@@ -3201,7 +3284,7 @@ class Floor:
         -------
         z : ndarray, shape (len(y), len(x))
             2D array of depth values at each grid point (xi,yj). 
-            z[j, i] = floor.sample(x[i], y[j]).
+            z[j, i] = floor(x[i], y[j]).
 
         Notes
         -----
@@ -3222,6 +3305,12 @@ class Floor:
         If all requirements are met, a faster computation is used that
         relies on the sampleRegion() method. If any requirement fails, a slower
         computation is used that relies on the samplePoints() method.
+
+        **Short Circuit:**
+
+        If `style='flat'`, then the method short-circuits by delegating to
+        `_mapFlat()`, passing a shaped empty array to ensure the output has the
+        correct shape.
         
         Examples
         --------
@@ -3231,6 +3320,10 @@ class Floor:
         >>> z = floor.sampleGrid(x, y)     # z is array (3,3)
         """
         
+        # Check depth style
+        if (self.style == 'flat'):
+            return self._mapFlat(np.empty((len(y), len(x))))
+
         # Check for coordinates out-of-bounds
         xArr, yArr = np.asarray(x), np.asarray(y)
         colRaw = (xArr + self.origin[0]).astype(int)
@@ -3305,9 +3398,10 @@ class Floor:
 
         Notes
         -----
-        Upper bounds of region are excluded from returned array: x=[0, 100], 
-        y=[0, 100] returns columns 0-99 (100 columns) and rows 0-99 (100 
-        rows).
+        - Upper bounds of region are excluded from returned array: x=[0, 100], 
+          y=[0, 100] returns columns 0-99 (100 columns) and rows 0-99 
+          (100 rows).
+        - Short-circuits for the 'flat' style by delegating to `_mapFlat()`.
         
         Examples
         --------
@@ -3333,6 +3427,10 @@ class Floor:
         width = colMax - colMin
         height = rowMax - rowMin
         region = np.empty((height, width), dtype=np.float64)
+
+        # Check depth style
+        if (self.style == 'flat'):
+            return self._mapFlat(region)
 
         # Determine tiles that cover requested region
         tileIMin = colMin // self._tileSize
@@ -3391,20 +3489,64 @@ class Floor:
         style : str
             Terrain generation style. Valid options:
 
+            - "flat" : Flat plane
             - "linear" : Linear depth mapping (default)
             - "sigmoid" : Smooth transitions
             - "shelf" : Plateaus and ridges
 
-        kwargs : dict, optional
-            Keyword arguments to pass parameters to depth generating method.
+        **kwargs : dict, optional
+            Keyword arguments passed through to the depth generating method.
+            Available for all styles:
+
+            - noise : ndarray - Pre-computed noise array [0, 1]. Otherwises uses
+              default perlin instance if available. Generates a temporary array
+              on-demand from `_perlinKwargs` if not provided and none found.
+            - z : float - Override minimum depth (m). Defaults to self.z.
+            - z_range : float - Override depth range (m). Defaults to
+              self.z_range. Ignored by 'flat'.
+
+            Style-specific:
+
+            - k : float - For 'sigmoid': transition steepness (default 5.0).
+              For 'shelf': asymmetry strength (default 3.0).
 
         Returns
         -------
         depth : ndarray
             Depth map in meters with shape (size, size)
+
+        Notes
+        -----
+        **Flat Floor with Noise-Based Style:**
+
+        If the Floor instance is in `style='flat'` mode (`perlin=None`) but a
+        noise-based style is requested, a temporary `PerlinNoise` instance is
+        created using the stored `_perlinKwargs` (seed, scale, octaves,
+        persistence, random) and discarded after use. This does not modify
+        `self.perlin` or change the operating mode of the Floor.
+         
+        If making multiple calls to createMap with noise-based styles while in
+        `style='flat'` mode, a new noise array is generated each time. To avoid 
+        this, either provide a pregenerated noise array or swith to a terrain 
+        Floor style to allow createMap to use the default perlin instance.
+
+        If a `noise` array is supplied via `**kwargs`, no `PerlinNoise` instance
+        is created regardless of floor mode.
         """
 
+        # Get strategy key from style
         strategy = self.style if (style is None) else self._validateStyle(style)
+
+        # Ensure noise array is available in edge cases
+        if ((strategy != 'flat') and 
+            (self.perlin is None) and 
+            ('noise' not in kwargs)):
+            pn = PerlinNoise(size=self.size, **self._perlinKwargs)
+            return self._styleStrategies[strategy](
+                noise = pn.evaluateRegion([0, self.size], [0, self.size]),
+                **kwargs,
+            )
+        
         return self._styleStrategies[strategy](**kwargs)
 
     #--------------------------------------------------------------------------
@@ -3484,7 +3626,7 @@ class Floor:
     #--------------------------------------------------------------------------
     def generate(self)->None:
         """
-        Explicitly precomputes full depth array.
+        Explicitly precomputes full depth array from Perlin noise.
         
         Forces generation of all tiles and caches the complete depth array.
         Subsequent accesses to depth property or tile-based queries will use
@@ -3492,11 +3634,14 @@ class Floor:
         
         Notes
         -----
-        This method is equivalent to accessing the `depth` property but makes
-        the intent explicit. Useful for:
+        Resets tile cache and depth data, and always regenerates from Perlin
+        noise regardless of any prior state. A manually assigned depth array
+        will be discarded.
+        
+        Useful for:
         
         - Precomputing before batch simulations
-        - Forcing generation for visualization
+        - Forcing Perlin regeneration after parameter changes
         - Eliminating on-demand generation overhead
         
         Examples
@@ -3507,8 +3652,8 @@ class Floor:
         >>> floor.display3D()   # instant visualization
         """
 
-        # Accessing depth array triggers property getter to build full array
-        _ = self.depth
+        self._resetDepthCache()
+        self._depth = self._buildFullDepth()
     
     #--------------------------------------------------------------------------
     def display2D(self, 
@@ -3549,12 +3694,12 @@ class Floor:
 
         # Plot with countour lines
         else:
-            plt.imshow(z.T, extent=extent, origin='lower', 
+            plt.imshow(z, extent=extent, origin='lower',
                        cmap='viridis_r', alpha=0.5)
             plt.colorbar().ax.invert_yaxis()
             x = np.linspace(extent[0], extent[1] - 1, z.shape[1])
             y = np.linspace(extent[2], extent[3] - 1, z.shape[0])
-            contours = plt.contour(x, y, z.T, 10, colors='black', alpha=0.4)
+            contours = plt.contour(x, y, z, 10, colors='black', alpha=0.4)
             plt.clabel(contours, inline=True, fontsize=8, fmt="%.0f")
 
         # Lines at origin
@@ -3570,6 +3715,8 @@ class Floor:
             plt.plot(path.pos.x, path.pos.y, linestyle="dotted", color=plc)
             plt.scatter(path.pos.x, path.pos.y, marker='^', color=pmc, s=64)
 
+        plt.xlabel('X / East (m)')
+        plt.ylabel('Y / North (m)')
         plt.show()
 
     #--------------------------------------------------------------------------
@@ -3598,14 +3745,19 @@ class Floor:
 
         # Plot floor
         # z.shape[1] is 'x' (columns), z.shape[0] is 'y' (rows)
-        x, y = np.meshgrid(np.arange(z.shape[1]),np.arange(z.shape[0]))
+        x_coords = np.arange(z.shape[1]) - self.origin[0]
+        y_coords = np.arange(z.shape[0]) - self.origin[1]
+        x, y = np.meshgrid(x_coords, y_coords)
         fig = plt.figure(figsize=(9,9))
         ax = fig.add_subplot(111, projection='3d')
         ax.set_zlim(-z.max(),0)
         ax.plot_surface(x, y, -z, alpha=0.9, cmap=new_cmap)
-        
+
         # Add water surface
         ax.plot_surface(x, y, 0*z, alpha=0.3, color='blue')
+        ax.set_xlabel('X / East (m)')
+        ax.set_ylabel('Y / North (m)')
+        ax.set_zlabel('Z / Down (m)')
         plt.show()
 
     ## Helper Methods ========================================================#
@@ -3618,6 +3770,7 @@ class Floor:
         style : str
             Terrain generation style. Valid options:
 
+            - "flat" : Flat plane
             - "linear" : Linear depth mapping (default)
             - "sigmoid" : Smooth transitions
             - "shelf" : Plateaus and ridges
@@ -3639,6 +3792,43 @@ class Floor:
             style = default
         
         return style
+
+    #--------------------------------------------------------------------------
+    def _getFlatZ(self)->np.float64:
+        """Return self.z as numpy scalar for flat floor depth queries"""
+        return np.float64(self.z)
+    
+    #--------------------------------------------------------------------------
+    def _mapFlat(self,
+                 noise:Optional[NPFltArr]=None, 
+                 z:Optional[Number]=None, 
+                 **kwargs
+                 )->NPFltArr:
+        """
+        Flat depth mapping with no depth variation.
+
+        Parameters
+        ----------
+        noise : ndarray, optional
+            2D array whose shape is used for the output. If None, output shape
+            is (size,size).
+        z : float, optional
+            Constant depth value in meters. If None, uses self.z.
+        kwargs
+            Accepted but ignored. Allows uniform call signature with other depth
+            mapping methods (e.g., via `createMap`).
+
+        Returns
+        -------
+        depth : ndarray
+            Constant-valued depth array in meters.
+        """
+
+        # Use size from noise array if provided
+        shape = noise.shape if (noise is not None) else (self.size, self.size)
+        z_val = self.z if (z is None) else z
+
+        return np.full(shape, z_val, dtype=np.float64)
 
     #--------------------------------------------------------------------------
     def _mapLinear(self,
@@ -3674,6 +3864,7 @@ class Floor:
             noise = self.perlin.evaluateRegion([0, self.size], [0, self.size])
         z_val = self.z if (z is None) else z
         z_r = self.z_range if (z_range is None) else z_range
+
         return (noise * z_r) + z_val
     
     #--------------------------------------------------------------------------
@@ -3798,9 +3989,18 @@ class Floor:
         -------
         depth : ndarray
             Fully computed depth array.
+
+        Notes
+        -----
+        Short-circuits for the 'flat' style by delegating directly to
+        `_mapFlat()`.
         """
 
         depth = np.zeros((self.size, self.size), dtype=np.float64)
+
+        # Check depth style
+        if (self.style == 'flat'):
+            return self._mapFlat(depth)
         
         nTilesI = (self.size + self._tileSize - 1) // self._tileSize
         nTilesJ = (self.size + self._tileSize - 1) // self._tileSize
@@ -3885,20 +4085,42 @@ class Floor:
             jStart = tileJ * self._tileSize
             iEnd = min(iStart + self._tileSize, self.size)
             jEnd = min(jStart + self._tileSize, self.size)
-            
-            # Evaluate noise region
-            noise = self.perlin.evaluateRegion(
-                [iStart, iEnd],
-                [jStart, jEnd]
-            )
-            
-            # Convert noise to depth
-            tile = self.createMap(noise=noise)
-            
+
+            if (self._depth is not None):
+                # Slice tile from existing depth array
+                tile = self._depth[jStart:jEnd, iStart:iEnd].copy()
+            else:
+                # Evaluate noise region
+                noise = self.perlin.evaluateRegion(
+                    [iStart, iEnd],
+                    [jStart, jEnd]
+                )
+
+                # Convert noise to depth
+                tile = self.createMap(noise=noise)
+
             # Cache
             self._tiles[key] = tile
         
         return self._tiles[key]
+    
+    #--------------------------------------------------------------------------
+    def _resetDepthCache(self)->None:
+        """
+        Clear the tile cache and full depth array.
+
+        Resets both the tile dictionary and cached full depth array to their
+        uninitialized states, forcing re-generation on next access.
+
+        Notes
+        -----
+        Should be called whenever any parameter that affects depth values
+        changes — such as `size`, `style`, or the `perlin` instance — to ensure
+        stale cached data is not returned.
+        """
+
+        self._tiles = {}
+        self._depth = None
     
 ###############################################################################
 
