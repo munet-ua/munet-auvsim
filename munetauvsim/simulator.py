@@ -1617,7 +1617,7 @@ class Simulator:
                 v.clock = currentTime
 
                 # Collect Sensor Data
-                v.collectSensorData(self.ocean,i)
+                v.collectSensorData(i, self.ocean)
                 
                 # Compute Control Commands
                 u_control = v.GuidSystem(v)
@@ -1677,7 +1677,7 @@ class Simulator:
                 v.CommSched(v)
 
                 # Collect Sensor Data
-                v.collectSensorData(self.ocean,i)
+                v.collectSensorData(i, self.ocean)
                 
                 # Compute Control Commands
                 u_control = v.GuidSystem(v)
@@ -1744,7 +1744,7 @@ class Simulator:
                 v.CommSched(v)
 
                 # Collect Sensor Data
-                v.collectSensorData(self.ocean,i)
+                v.collectSensorData(i, self.ocean)
                 
                 # Compute Control Commands
                 u_control = v.GuidSystem(v)

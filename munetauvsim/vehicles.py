@@ -2179,7 +2179,7 @@ class Remus100s(AUV):
         return (m*speed + b)
 
     #--------------------------------------------------------------------------
-    def collectSensorData(self, ocean:env.Ocean, i:int)->None:
+    def collectSensorData(self, i:int, ocean:env.Ocean)->None:
         """
         Update vehicle environmental state from installed sensors.
 
@@ -2191,6 +2191,11 @@ class Remus100s(AUV):
         
         Parameters
         ----------
+        i : int
+            Current simulation iteration counter. Used for time-dependent
+            sensing, logging, and sensor dynamics. Typically ranges from 0 to
+            N-1 where N is total simulation iterations.
+            
         ocean : env.Ocean
             Ocean environment object containing:
 
@@ -2199,11 +2204,6 @@ class Remus100s(AUV):
             - floor : env.OceanFloor or None
                 Ocean floor depth model (bathymetry)
             - Additional environment features as available
-            
-        i : int
-            Current simulation iteration counter. Used for time-dependent
-            sensing, logging, and sensor dynamics. Typically ranges from 0 to
-            N-1 where N is total simulation iterations.
 
             
         Notes
@@ -2223,30 +2223,23 @@ class Remus100s(AUV):
         These attributes are used by the dynamics() method to compute
         environmental effects.
 
-        **Present Implementation (Remus100s):**
+        **Implementation:**
 
-        The present implementation specifically reads:
-        
-        1. **Ocean Current Sensor:**
+        Calls `readAllSensors` with the current environment kwargs, then maps
+        the returned data dictionary to the corresponding vehicle attributes.
+        Only sensors that are installed and return data will update vehicle
+        state. The default sensors and their state mappings are:
 
-        - Checks if ocean.current is not None
-        - Calls readSensor('current', ocean, i)
-        - Updates self.V_c and self.beta_Vc
-        
-        2. **Ocean Depth Sensor:**
+        - 'current' -> `self.V_c`, `self.beta_V_c`
+        - 'depth'   -> `self.z_bed`
 
-        - Checks if ocean.floor is not None
-        - Calls readSensor('depth', ocean, self.eta)
-        - Updates self.z_bed
-        
         **Extensibility:**
 
         To add additional sensors and state updates:
-        
-        1. Define a sensor that inherits nav.Sensor
-        2. Install sensor via addSensor()
-        3. Modify this method to read new sensor
-        4. Update relevant vehicle attribute with sensor data
+
+        1. Define a sensor that inherits `nav.Sensor`
+        2. Install sensor via `addSensor()`
+        3. Add a corresponding attribute update below
 
         **Simulator Integration:**
 
@@ -2269,12 +2262,13 @@ class Remus100s(AUV):
         updateSensorInfo : Helper that updates info dictionary
         """
         
-        # Read Ocean Environment
+        # Read All Installed Sensors
         if (ocean is not None):
-            if (ocean.current is not None):
-                self.V_c, self.beta_V_c = self.readSensor('current',ocean,i)
-            if (ocean.floor is not None):
-                self.z_bed = self.readSensor('depth',ocean,self.eta)
+            data = self.readAllSensors(ocean=ocean, i=i, eta=self.eta)
+            if ('current' in data):
+                self.V_c, self.beta_V_c = data['current']
+            if ('depth' in data):
+                self.z_bed = data['depth']
     
     #--------------------------------------------------------------------------
     def loadPathFollowing(self)->None:
