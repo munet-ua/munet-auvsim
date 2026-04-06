@@ -529,7 +529,7 @@ def depthFilter(vehicle:Vehicle,pt:List[float])->None:
         - z_d: Desired depth command (m)
         - wn_d_z: Desired natural frequency (Hz), depth
         - z_max: Maximum operating depth (m).
-        - z_bed: Ocean floor depth (m).
+        - seabed_z: Sensed ocean floor depth (m).
         - z_safe: Safety distance from ocean floor (m).
 
     pt : list of float, [x, y, z]
@@ -580,10 +580,10 @@ def maxDepthLimit(vehicle:Vehicle,z:float)->float:
     Parameters
     ----------
     vehicle : Vehicle
-        Vehicle with z_max, z_bed, z_safe attributes.
+        Vehicle with z_max, seabed_z, z_safe attributes.
 
         - z_max: Maximum operating depth (m).
-        - z_bed: Ocean floor depth (m).
+        - seabed_z: Sensed ocean floor depth (m).
         - z_safe: Safety distance from ocean floor (m).
 
     z : float
@@ -593,16 +593,16 @@ def maxDepthLimit(vehicle:Vehicle,z:float)->float:
     Returns
     -------
     z_limited : float
-        Depth bounded by min(z_max, z_bed - z_safe).
+        Depth bounded by min(z_max, seabed_z - z_safe).
     """
 
     # Input Parameters
     z_max = vehicle.z_max
-    z_bed = vehicle.z_bed
+    seabed_z = vehicle.seabed_z
     z_safe = vehicle.z_safe
 
     # Enforce Maximum Depth Limit
-    max_depth = min(z_max, z_bed-z_safe)
+    max_depth = min(z_max, seabed_z - z_safe)
     z = min(z, max_depth)
 
     return z

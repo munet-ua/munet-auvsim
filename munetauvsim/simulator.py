@@ -1601,8 +1601,9 @@ class Simulator:
         Notes
         -----
         - Vehicles access each other's states directly (no network delays).
-        - Iteration sequence: update clock, collect sensors, compute guidance,
-          store data, integrate dynamics, propagate attitude.
+        - Iteration sequence: update clock, sync environment state, collect
+          sensors, compute guidance, store data, integrate dynamics, propagate
+          attitude.
         """
 
         for i in range(0, self.N+1):
@@ -1615,6 +1616,9 @@ class Simulator:
 
                 # Clock
                 v.clock = currentTime
+
+                # Synchronize Environment State
+                v.syncEnvironmentState(i, self.ocean)
 
                 # Collect Sensor Data
                 v.collectSensorData(i, self.ocean)
@@ -1650,8 +1654,9 @@ class Simulator:
         Notes
         -----
         - Handles message transmission timing and network updates.
-        - Iteration sequence: transmit messages per schedule, deliver messages,
-          update vehicle states, compute guidance, integrate dynamics.
+        - Iteration sequence: update clock, sync environment state, transmit
+          messages per schedule, deliver messages, update vehicle states,
+          compute guidance, integrate dynamics.
         - Supports multiple muNet networks if passed as list.
         """
 
@@ -1672,6 +1677,9 @@ class Simulator:
 
                 # Clock
                 v.clock = currentTime
+
+                # Synchronize Environment State
+                v.syncEnvironmentState(i, self.ocean)
 
                 # Transmit According to Communication Schedule
                 v.CommSched(v)
@@ -1739,6 +1747,9 @@ class Simulator:
 
                 # Clock
                 v.clock = currentTime
+
+                # Synchronize Environment State
+                v.syncEnvironmentState(i, self.ocean)
 
                 # Transmit According to Communication Schedule
                 v.CommSched(v)

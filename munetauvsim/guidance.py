@@ -1743,16 +1743,16 @@ def depthSafetyLimit(vehicle:Vehicle, vel:NPFltArr)->NPFltArr:
     Apply depth safety constraint.
     
     Modifies desired velocity to enforce minimum distance from ocean floor
-    (z=z_bed - z_safe).
+    (z=seabed_z - z_safe).
     
 
     Parameters
     ----------
     vehicle : Vehicle
-        Vehicle with z_max, z_bed, z_safe, eta, and velocity attributes.
+        Vehicle with z_max, seabed_z, z_safe, eta, and velocity attributes.
 
         - z_max: Maximum operating depth (m).
-        - z_bed: Ocean floor depth (m).
+        - seabed_z: Sensed ocean floor depth (m).
         - z_safe: Safety distance from ocean floor (m).
         - eta : [x, y, z, phi, theta, psi], vehicle position / attitude vector
         - velocity : [vx, vy, vz], vehicle velocity vector (m/s)
@@ -1770,7 +1770,7 @@ def depthSafetyLimit(vehicle:Vehicle, vel:NPFltArr)->NPFltArr:
          
     Notes
     -----
-    - Attempts to prevent ground collision (z > z_bed - z_safe).
+    - Attempts to prevent ground collision (z > seabed_z - z_safe).
 
     When the vehicle is below the Safety Distance threshold from the Maximum
     Depth Limit, the depth component of the velocity command is cancelled out
@@ -1794,7 +1794,7 @@ def depthSafetyLimit(vehicle:Vehicle, vel:NPFltArr)->NPFltArr:
     safety_depth = hard_floor - dz_safe
 
     # Apply depth filtering if vehicle below safety depth and moving down
-    if ((z > safety_depth) and ((vel_z+v_z) > 0)):
+    if ((z > safety_depth) and ((vel_z + v_z) > 0)):
         gamma = min(1.0, ((z - safety_depth) / dz_safe))   # Scaling Factor
         # Reduce downward component of proposed command
         if (vel_z > 0):

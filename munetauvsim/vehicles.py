@@ -333,6 +333,9 @@ class AUV(Vehicle):
         self.r_inner = 80.0             # inner radius of neutral zone(m)
         self.r_follow = 100.0           # following distance (m)
 
+        ## Environment
+        self.z_safe = 5                 # safety distance from ocean floor (m)
+
         #---------------------------------------------------------------------#
         #   Navigation                                                        #
         #---------------------------------------------------------------------#
@@ -359,10 +362,9 @@ class AUV(Vehicle):
         self.r_d = 0.0                      # desired yaw rate (rad/s)
         
         ## Environment
-        self.V_c = 0                    # ocean current speed (m/s)
-        self.beta_V_c = 0               # ocean current direction (rad)
-        self.z_bed = 6000               # ocean floor depth (m)
-        self.z_safe = 5                 # safety distance from ocean floor (m)
+        self.drift_c = 0                # sensed ocean current speed (m/s)
+        self.set_c = 0                  # sensed ocean current direction (rad)
+        self.seabed_z = 6000            # sensed ocean floor depth (m)
 
         #---------------------------------------------------------------------#
         #   Physics                                                           #
@@ -371,6 +373,11 @@ class AUV(Vehicle):
         self.D2R = math.pi / 180        # deg2rad
         self.rho = 1026                 # density of water (kg/m^3)
         self.g = 9.81                   # acceleration of gravity (m/s^2)
+
+        ## Environment
+        self.V_c = 0                    # ocean current speed (m/s)
+        self.beta_V_c = 0               # ocean current direction (rad)
+        self.z_floor = 6000             # ocean floor depth (m)
 
     ## Properties ============================================================#
     @property
@@ -544,13 +551,84 @@ class AUV(Vehicle):
         return '\n'+'\n'.join(out)
     
     ## Methods ===============================================================#
+    def syncEnvironmentState(self, i:int, ocean:env.Ocean)->None:
+        """
+        Inject true environmental state for the current simulation step.
+
+        Called by the Simulator each iteration to inject true environmental
+        conditions directly into the vehicle for dynamics calculations. These
+        values represent the physical reality of the environment and are used
+        exclusively by the vehicle dynamics method for accurate force and
+        collision computations.
+
+
+        Parameters
+        ----------
+        i : int
+            Current simulation iteration counter. Used to index time-varying
+            environmental arrays (e.g., current speed and direction).
+        ocean : env.Ocean
+            Ocean environment object containing:
+
+            - current : env.Current1D or None
+                Time-varying current model with speed and angle arrays.
+            - floor : env.Floor or None
+                Bathymetric floor model with callable floor(x, y).
+
+
+        Notes
+        -----
+        **Side Effects:**
+
+        Updates the following vehicle attributes:
+
+        - V_c : float
+            True ocean current speed (m/s).
+        - beta_V_c : float
+            True ocean current direction (rad).
+        - z_floor : float
+            True ocean floor depth at vehicle position (m).
+
+        These attributes feed directly into dynamics() and are not intended
+        for use by guidance or navigation algorithms. For sensed estimates of
+        environmental conditions, see collectSensorData().
+
+        **Separation from Sensor Pathway:**
+
+        This method and collectSensorData() represent two distinct pathways
+        for environmental data on the vehicle:
+
+        - syncEnvironmentState() -- true environment state injection from the
+          simulator (e.g z_floor, V_c, beta_V_c) for vehicle dynamics
+          calculations.
+        - collectSensorData() -- sensor-based observations (e.g. seabed_z,
+          drift_c, set_c) for use by guidance and navigation algorithms or
+          environmental data collection.
+
+
+        See Also
+        --------
+        collectSensorData : Sensor-based environmental observation pathway.
+        dynamics : Utilizes V_c, beta_V_c, z_floor for physics evaluations.
+        """
+
+        if (ocean is not None):
+            # Current
+            if (ocean.current is not None):
+                self.V_c = ocean.current.speed[i]
+                self.beta_V_c = ocean.current.angle[i]
+            # Depth
+            if (ocean.floor is not None):
+                self.z_floor = ocean.floor(self.eta[0], self.eta[1])
+    
+    #--------------------------------------------------------------------------
     def addSensor(self, name:str, sensor:nav.Sensor)->None:
         """
         Install or replace a sensor in the vehicle's sensor suite.
 
         Adds a sensor object to the vehicles internal sensor dictionary, making
         it available for data collection during simulation. If a sensor with the
-        specified name already exists, it is replaced. The vehilce's info
+        specified name already exists, it is replaced. The vehicle's info
         dictionary is automatically updated to reflect the current sensor
         configuration.
         
@@ -601,10 +679,10 @@ class AUV(Vehicle):
         
         **Sensor Data Flow:**
         
-        1. Simulation calls vehicle.collectSensorData(ocean, i)
+        1. Simulation calls vehicle.collectSensorData(i, ocean)
         2. Vehicle calls vehicle.readAllSensors() or readSensor(name)
         3. Sensor.collectData() extracts parameters and returns measurement
-        4. Vehicle updates internal state (e.g., V_c, beta_Vc, z_bed, etc.)
+        4. Vehicle updates internal state (e.g., seabed_z, etc.)
 
         
         See Also
@@ -1503,14 +1581,13 @@ class Remus100s(AUV):
         
         - **Sensor Suite:**
 
-            - OceanCurrentSensor: measures current speed and direction
             - OceanDepthSensor: measures ocean floor depth
             - Additional sensors can be added via addSensor() method
         
         - **Navigation Parameters:**
 
             - z_max: maximum operating depth (100 m)
-            - z_safe: safety distance from floor (5 m)
+            - z_safe: safety distance from sensed ocean floor (5 m)
             - wn_d_z: desired natural frequency for depth (1/s)
         
         - **Swarm Coordination:**
@@ -1625,7 +1702,6 @@ class Remus100s(AUV):
         self.z_max = 100                # max vehicle operating depth (m)
 
         ## Sensors
-        self.addSensor('current', nav.OceanCurrentSensor())
         self.addSensor('depth', nav.OceanDepthSensor())
         
         #---------------------------------------------------------------------#
@@ -1888,7 +1964,7 @@ class Remus100s(AUV):
         **Safety and Collision Detection:**
 
         - Surface breach (z < 0): Buoyancy set to zero, continues dynamics
-        - Floor collision (z > z_bed): Vehicle immobilized, returns zero
+        - Floor collision (z > z_floor): Vehicle immobilized, returns zero
           velocities
         - Immobilization flag set to True on floor collision, persists for
           simulation duration
@@ -1956,7 +2032,7 @@ class Remus100s(AUV):
         # Check Environment
         if (eta[2] < 0):                # surface breach
             B = 0
-        if (eta[2] > self.z_bed):       # floor collision
+        if (eta[2] > self.z_floor):       # floor collision
             log.warning('**COLLISION with ocean floor! Vehicle: ' +
                         '%s at [%.1f,%.1f,%.1f] %.2f s',
                         self.callSign, eta[0], eta[1], eta[2], self.clock)
@@ -2212,16 +2288,13 @@ class Remus100s(AUV):
 
         Updates the following vehicle attributes based on sensor readings:
 
-        - V_c : float
+        - drift_c : float
             Ocean current speed in m/s (from 'current' sensor if installed)
-        - beta_Vc : float
+        - set_c : float
             Ocean current direction in radians (from 'current' sensor if
             installed)
-        - z_bed : float
+        - seabed_z : float
             Ocean floor depth in meters (from 'depth' sensor if installed)
-            
-        These attributes are used by the dynamics() method to compute
-        environmental effects.
 
         **Implementation:**
 
@@ -2230,8 +2303,8 @@ class Remus100s(AUV):
         Only sensors that are installed and return data will update vehicle
         state. The default sensors and their state mappings are:
 
-        - 'current' -> `self.V_c`, `self.beta_V_c`
-        - 'depth'   -> `self.z_bed`
+        - 'current' -> `self.drift_c`, `self.set_c`
+        - 'depth'   -> `self.seabed_z`
 
         **Extensibility:**
 
@@ -2266,9 +2339,9 @@ class Remus100s(AUV):
         if (ocean is not None):
             data = self.readAllSensors(ocean=ocean, i=i, eta=self.eta)
             if ('current' in data):
-                self.V_c, self.beta_V_c = data['current']
+                self.drift_c, self.set_c = data['current']
             if ('depth' in data):
-                self.z_bed = data['depth']
+                self.seabed_z = data['depth']
     
     #--------------------------------------------------------------------------
     def loadPathFollowing(self)->None:
