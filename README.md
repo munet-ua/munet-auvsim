@@ -3,7 +3,7 @@
 [![Latest Release](https://img.shields.io/github/v/release/munet-ua/munet-auvsim?include_prereleases&sort=semver)](https://github.com/munet-ua/munet-auvsim/releases/latest)
 [![DOI](https://zenodo.org/badge/1109695731.svg)](https://doi.org/10.5281/zenodo.18176580)
 
-**Version:** 0.2.0-beta  
+**Version:** 0.3.0-beta  
 **Status:** Beta Release
 
 ## Description
@@ -775,7 +775,7 @@ If you use muNet-AUVsim in your research, please cite:
   author = {Crawford, JP and Qin, Gang and Song, Aijun},
   title = {muNet-AUVsim: Multi-Agent AUV Simulation Framework},
   year = {2026},
-  version = {0.2.0-beta},
+  version = {0.3.0-beta},
   doi = {10.5281/zenodo.18176581},
   url = {https://github.com/munet-ua/munet-auvsim}
 }
@@ -793,7 +793,7 @@ See [CITATION.cff](CITATION.cff) for standard citation formats.
 
 ## Project Status
 
-**Current Version**: 0.2.0-beta  
+**Current Version**: 0.3.0-beta  
 **Status**: Beta Release - Core features stable, API subject to refinement
 
 ### Roadmap
@@ -803,9 +803,9 @@ Short list of bug fixes and features intended for future development:
 **Near Term:**
 
 - [x] **Improved Ocean Modeling** - Removed size limitations in Perlin terrain
-  generation for larger simulation areas ([shipped in 0.2.0-beta](https://github.com/munet-ua/munet-auvsim/releases/latest))
+  generation for larger simulation areas ([shipped in 0.2.0-beta](https://github.com/munet-ua/munet-auvsim/releases/tag/v0.2.0-beta))
 - [x] **APF Performance** - Updated APF design to use subsumption architecture with Mission, Formation, and Survival layers to improve guidance behavior ([shipped in 784e2d3](https://github.com/munet-ua/munet-auvsim/commit/784e2d3ca0f82e92e87130ef641c785f9ea46cf5))
-- [x] **Environment Injection Refactor** - Moved origination of ocean current and depth in the vehicle dynamics function from sensor models to direct simulator injection
+- [x] **Environment Injection Refactor** - Moved origination of ocean current and depth in the vehicle dynamics function from sensor models to direct simulator injection ([shipped in 0.3.0-beta](https://github.com/munet-ua/munet-auvsim/releases/tag/v0.3.0-beta))
 - [ ] **Better Network Tools** - Enhanced node registration and channel
   assignment utilities for muNet
 - [ ] **Visualization Improvements** - Separate 3D plot generation from

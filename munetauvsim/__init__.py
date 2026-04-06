@@ -71,7 +71,7 @@ from .simulator import Simulator
 from .simulator import save, load
 
 # Version info
-__version__ = "0.2.0-beta"
+__version__ = "0.3.0-beta"
 __author__ = "JP Crawford"
 
 # Define what gets imported with "from munetauvsim import *"

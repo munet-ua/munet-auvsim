@@ -14,7 +14,7 @@ authors:
   - family-names: "Song"
     given-names: "Aijun"
     affiliation: "University of Alabama"
-version: "0.2.0-beta"
+version: "0.3.0-beta"
 date-released: "2026-01-07"
 doi: "10.5281/zenodo.18176581"
 license: "MIT"
