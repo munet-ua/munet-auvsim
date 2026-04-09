@@ -95,7 +95,7 @@ class Sensor(ABC):
     """
 
     @abstractmethod
-    def collectData(self)->Any:
+    def collectData(self, **kwargs)->Any:
         """
         Collect sensor measurement data.
         
@@ -115,8 +115,8 @@ class OceanCurrentSensor(Sensor):
     """
 
     def collectData(self, 
-                    ocean:Ocean=None, 
                     i:int=None,
+                    ocean:Ocean=None, 
                     **kwargs)->List[float]:
         """
         Measure ocean current at simulation iteration i.
@@ -124,10 +124,10 @@ class OceanCurrentSensor(Sensor):
 
         Parameters
         ----------
-        ocean : Ocean
-            Ocean object with current.speed and current.angle arrays.
         i : int
             Simulation iteration counter.
+        ocean : Ocean
+            Ocean object with current.speed and current.angle arrays.
         **kwargs
             Unused. Required for AUV sensor interface compatibility.
             

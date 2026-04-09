@@ -143,8 +143,8 @@ class Model(Vehicle):
             
     Notes
     -----
-    - Uses __slots__ to minimize memory overhead. New attributes cannot
-      by dynamically added, they must be defined in the class and added to the
+    - Uses __slots__ to minimize memory overhead. New attributes cannot be
+      dynamically added, they must be defined in the class and added to the
       __slots__ declaration.
     - When logs reach capacity, both are automatically doubled in size by the
       communication.writeEtaVelLogs() function.
@@ -238,7 +238,7 @@ class AUV(Vehicle):
         Install a sensor on the vehicle.
     readSensor(name, kwargs)
         Read data from a specific sensor.
-    collectSensorData(ocean, i)
+    collectSensorData(i, ocean)
         Update vehicle state from sensors (abstract method).
     """
 
@@ -1199,12 +1199,12 @@ class AUV(Vehicle):
 
             Common kwargs:
 
+            - i : int
+                Simulation iteration counter for time-dependent sensing
             - ocean : env.Ocean
                 Ocean environment object for current and depth data
             - eta : ndarray
                 Vehicle position for location-dependent sensing
-            - i : int
-                Simulation iteration counter for time-dependent sensing
             
                 
         Returns
@@ -1418,7 +1418,7 @@ class Remus100s(AUV):
         Convert propeller RPM to vehicle speed (m/s).
     xferU2N(speed):
         Convert vehicle speed (m/s) to propeller RPM.
-    collectSensorData(ocean, i)
+    collectSensorData(i, ocean)
         Read and update environmental sensor data.
     loadPathFollowing():
         Assign GNC for path following guidance system. Default is ALOS.
@@ -2337,7 +2337,7 @@ class Remus100s(AUV):
         
         # Read All Installed Sensors
         if (ocean is not None):
-            data = self.readAllSensors(ocean=ocean, i=i, eta=self.eta)
+            data = self.readAllSensors(i=i, ocean=ocean, eta=self.eta)
             if ('current' in data):
                 self.drift_c, self.set_c = data['current']
             if ('depth' in data):
