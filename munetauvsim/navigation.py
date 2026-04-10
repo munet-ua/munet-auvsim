@@ -188,13 +188,18 @@ class OceanDepthSensor(Sensor):
         Notes
         -----
         Returns -1.0 on error with log message.
+        Returns np.inf when ocean.floor is None (no bathymetry modeled),
+        signalling an unbounded depth below the vehicle.
         """
-        
+
         if (ocean is None) or (eta is None):
             log.error("%s requires 'ocean' and 'eta' arguments.",
                       self.__class__.__name__)
             return -1.0
-        
+
+        if (ocean.floor is None):
+            return np.inf
+
         return ocean.floor(eta[0],eta[1])
 
 ###############################################################################
