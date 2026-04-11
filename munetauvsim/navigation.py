@@ -14,6 +14,8 @@ OceanCurrentSensor
     Measures ocean current speed and direction.
 OceanDepthSensor
     Measures ocean floor depth at vehicle position.
+ForwardLookingSonar
+    Forward-looking Sonar (FLS) for terrain and obstacle detection.
 
     
 Functions
@@ -134,15 +136,13 @@ class OceanCurrentSensor(Sensor):
 
         Returns
         -------
-        speed : float
-            Current speed in m/s.
-        direction : float
-            Current direction in radians.
-            
+        [speed, direction] : list of float
+            where:
 
-        Notes
-        -----
-        Returns [-1.0, -1.0] on error with log message.
+            - speed : float -- Current speed in m/s
+            - direction : float -- Current direction in radians.
+
+            Returns [-1.0, -1.0] on error with log message.
         """
         
         if (ocean is None) or (i is None):
@@ -201,6 +201,319 @@ class OceanDepthSensor(Sensor):
             return np.inf
 
         return ocean.floor(eta[0],eta[1])
+
+###############################################################################
+
+class ForwardLookingSonar(Sensor):
+    """
+    Forward-Looking Sonar (FLS) for terrain and obstacle detection.
+
+    Models the functional behavior of a BlueView ProViewer 450-15 FLS. Detects
+    terrain and vehicle obstacles by sampling the environment along a 2D grid of
+    beams (horizontal azimuths x elevation angles) radiating forward from the
+    vehicle, using body-fixed ray-floor intersection and ray-sphere vehicle
+    intersection.
+
+    The sensor produces a 2D range image indexed by [azimuth, elevation] and a
+    matching 3D beam-direction grid. Per-beam range is the distance to the
+    nearest detected object (floor or vehicle). Each beam direction is a unit
+    vector in the Earth frame, pairing one-to-one with the range image so
+    consumers can reconstruct full 3D obstacle vectors from range[k, m] *
+    beam_dirs[k, m, :].
+
+
+    Parameters
+    ----------
+    nBeamsAz : int, default=11
+        Number of horizontal azimuthal beams across hFov. Should be odd
+        so the center beam aligns with vehicle heading.
+    nBeamsEl : int, default=5
+        Number of vertical elevation beams across vFov. Should be odd so the
+        center beam aligns with tiltAngle.
+    maxRange : float, default=135.0
+        Maximum detection range in meters (~450 ft per BlueView spec).
+    nStepsRange : int, default=27
+        Number of sample points along range per beam. 
+        Spacing = maxRange / nStepsRange (5 m at default settings).
+    tiltAngle : float, default=2.5
+        Angle the sensor is tilted in degrees below horizontal, relative to the
+        vehicle body frame. Positive tilt angle points the sensor downward.
+    hFov : float, default=50.0
+        Horizontal field of view in degrees, centered on vehicle heading.
+        Beams span [-hFov/2, +hFov/2] relative to heading.
+    vFov : float, default=15.0
+        Vertical field of view in degrees, centered on tiltAngle.
+        Beams span [-vFov/2, +vFov/2] relative to tiltAngle.
+    sampleRate : float, default=10.0
+        Sensor update rate in Hz. The host vehicle converts this to a
+        step interval _sampleInterval using its sampleTime when
+        the sensor is installed via addSensor, and re-syncs whenever
+        sampleTime changes. On intermediate steps, collectData
+        returns cached results.
+
+
+    Notes
+    -----
+    **Body-Fixed Mounting:**
+
+    Beam directions are fixed in the vehicle body frame and rotated to the Earth
+    frame using the vehicle's full attitude (roll, pitch, yaw) using the Rzyx
+    function. This models a sensor mounted on the hull: when the vehicle pitches
+    or rolls, the beam fan moves with it.
+
+    **Detectable Objects:**
+
+    The sensor detects any object that reflects acoustic energy. In the
+    simulation this includes:
+
+    - Ocean floor: detected with ray-floor intersection using batched
+      samplePoints() queries.
+    - Other vehicles: detected with ray-sphere intersection using vehicle
+      length L as the detection radius.
+
+    The sensor does not distinguish between floor and vehicle returns;
+    beam_ranges reports the nearest object of either type per beam. When
+    ocean.floor is None, floor detection is skipped and beam_ranges reflects
+    vehicle detections only.
+
+    **Ray-Floor Intersection:**
+
+      - Each beam is parameterized as `p(r) = origin + r * d`. 
+      - Evenly-spaced ranges `nStepsRange` are sampled and
+        `ocean.floor.samplePoints` is queried for the seabed depth at each
+        sample's `(x, y)`.
+      - A hit is any sample where `floor_z <= z_beam` (seabed at or above the
+        beam's `z`, since `z` is positive down).
+      - The nearest hit along the beam is the reported `range`.
+      - This is a discrete approximation, where range resolution is 
+        `maxRange / nStepsRange`.
+
+    **Ray-Sphere Intersection:**
+
+      - Each other vehicle is a sphere at position `C` with radius `L`. 
+      - For beam origin `O` and direction `d`, let `w = C - O` and 
+        `t = dot(d,w)` (distance along the beam to closest approach). 
+      - The perpendicular distance squared is `perp_sq = ||w||^2 - t^2`.
+      - A hit exists if and only if `perp_sq < L^2` and `0 < t < maxRange`. 
+      - The range to the sphere entry point is 
+        `t_hit = t - sqrt(L^2 - perp_sq)`.
+      - The minimum `t_hit` across vehicles is then min-reduced with the floor
+        range per beam.
+
+    **Vectorized Implementation:**
+
+    All per-beam computations use numpy broadcasting. Floor queries are batched
+    into a single samplePoints() call and vehicle detection uses broadcasted
+    ray-sphere intersection.
+
+    
+    References
+    ----------
+    [1] Healey, A.J. (2004). Obstacle Avoidance While Bottom Following for
+    the REMUS Autonomous Underwater Vehicle. NPS Technical Report.
+
+    [2] Furukawa, T. (2006). Reactive Obstacle Avoidance Using a
+    Forward-Looking Sonar for the REMUS Autonomous Underwater Vehicle.
+    NPS Master's Thesis.
+
+
+    See Also
+    --------
+    Rzyx : Computes 3x3 Euler angle rotation.
+    OceanDepthSensor : Downward-looking depth sensor (DVL analogue).
+    """
+    
+    ## Constructor ===========================================================#
+    def __init__(self,
+                 nBeamsAz:int=11,
+                 nBeamsEl:int=5,
+                 maxRange:float=135.0,
+                 nStepsRange:int=27,
+                 tiltAngle:float=2.5,
+                 hFov:float=50.0,
+                 vFov:float=15.0,
+                 sampleRate:float=10.0)->None:
+
+        self.nBeamsAz = nBeamsAz            # Num Beams in Azimuth
+        self.nBeamsEl = nBeamsEl            # Num Beams in Elevation
+        self.maxRange = maxRange            # Max Beam Range (m)
+        self.nStepsRange = nStepsRange      # Num Sample Points along Beam Range
+        self.tiltAngle = tiltAngle          # Angle of Sensor Tilt (deg)
+        self.hFov = hFov                    # Horizontal FOV (deg)
+        self.vFov = vFov                    # Vertical FOV (deg)
+        self.sampleRate = sampleRate        # Sensor Sample Rate (Hz)
+
+        # Precompute range steps (near to far, excluding zero)
+        self._ranges = np.linspace(maxRange/nStepsRange, maxRange, nStepsRange)
+
+        # Precompute body-frame beam unit directions (fixed to hull)
+        # Body frame: x = forward, y = starboard, z = down
+        # Positive elevation = below horizontal
+        tilt = np.radians(tiltAngle)
+        v_fov = np.radians(vFov)
+        h_fov = np.radians(hFov)
+        elevations = np.linspace(tilt - v_fov/2, tilt + v_fov/2, nBeamsEl) #(M,)
+        azimuths = np.linspace(-h_fov/2, h_fov/2, nBeamsAz)                #(N,)
+
+        # _body_beams[k, m, :] = unit vector for azimuth k, elevation m
+        cos_el = np.cos(elevations)[np.newaxis, :]              # (1, M)
+        sin_el = np.sin(elevations)[np.newaxis, :]              # (1, M)
+        cos_az = np.cos(azimuths)[:, np.newaxis]                # (N, 1)
+        sin_az = np.sin(azimuths)[:, np.newaxis]                # (N, 1)
+
+        self._body_beams = np.empty((nBeamsAz, nBeamsEl, 3))
+        self._body_beams[:, :, 0] = cos_az * cos_el             # forward
+        self._body_beams[:, :, 1] = sin_az * cos_el             # starboard
+        self._body_beams[:, :, 2] = sin_el                      # down
+
+        # Default safe result (no detections; body-frame beam directions)
+        self._emptyResult = [
+            np.full((nBeamsAz, nBeamsEl), maxRange),
+            self._body_beams.copy(),
+        ]
+
+        # Sample rate state
+        self._sampleInterval = 1                # default; set by AUV.addSensor
+        self._cachedResult = self._emptyResult
+
+    ## Methods ===============================================================#
+    def collectData(self,
+                    i:int=None,
+                    ocean:Ocean=None,
+                    vehicles:list=None,
+                    eta:NPFltArr=None,
+                    **kwargs)->List[NPFltArr]:
+        """
+        Inspect environment along beam ranges across the 2D beam grid.
+
+        Detects both ocean floor terrain and vehicles. Per-beam range is the
+        nearest object of either type. Beam directions are body-fixed and
+        rotated to the Earth frame using the vehicle's full attitude (roll,
+        pitch, yaw).
+
+        Recomputes every _sampleInterval steps (set by host vehicle from
+        sampleRate) and returns cached results on intermediate steps.
+
+
+        Parameters
+        ----------
+        i : int, optional
+            Simulation iteration counter. Recomputes when
+            i % _sampleInterval == 0, otherwise returns cached result.
+        ocean : Ocean, optional
+            Ocean environment with floor for terrain detection.
+        vehicles : list of Vehicle, optional
+            All vehicles in the simulation. The sensor excludes the vehicle
+            whose eta matches to prevent self-detection.
+        eta : ndarray, shape (6,), optional
+            Vehicle position/attitude [x, y, z, phi, theta, psi].
+            Full attitude is used to rotate body-fixed beams to Earth frame.
+        **kwargs
+            Unused. Required for AUV sensor interface compatibility.
+
+
+        Returns
+        -------
+        [beam_ranges, beam_dirs] : list of ndarray
+            where:
+
+            - beam_ranges : ndarray, shape (nBeamsAz, nBeamsEl) --
+              range to nearest object per beam; maxRange if no detection.
+            - beam_dirs : ndarray, shape (nBeamsAz, nBeamsEl, 3) --
+              unit 3D direction vectors per beam in the Earth frame.
+              Each beam_dirs[k, m, :] pairs with beam_ranges[k, m].
+        """
+
+        # Return cached result if not at a sample interval
+        if ((i is not None) and (i % self._sampleInterval != 0)):
+            return self._cachedResult
+
+        # Default safe output
+        if (ocean is None) or (eta is None):
+            return self._emptyResult
+
+        # Beam geometry parameters
+        M = self.nBeamsEl
+        N = self.nBeamsAz
+        maxR = self.maxRange
+
+        # Extract position and attitude
+        x, y, z, phi, theta, psi = eta
+
+        # --- Rotate body-fixed beams to Earth frame ------------------------ #
+        R = Rzyx(phi, theta, psi)
+        # einsum does: earth_beams[k, m, :] = R @ _body_beams[k, m, :]
+        earth_beams = np.einsum('ij,kmj->kmi', R, self._body_beams) # (N, M, 3)
+
+        # Export the full 3D beam direction grid. 
+        # Each beam_dirs[k, m, :] pairs with beam_ranges[k, m].
+        # Rotation preserves unit length so no renormalization is required.
+        beam_dirs = earth_beams                                     # (N, M, 3)
+
+        # --- Floor detection ----------------------------------------------- #
+        if (ocean.floor is None):
+            floor_ranges = np.full((N, M), maxR)
+        else:
+            # Sample points along each beam at each range step
+            # pts[k, m, j] = origin + ranges[j] * earth_beams[k, m]
+            ranges = self._ranges[np.newaxis,np.newaxis,:] # (1, 1, nStepsRange)
+            eb_x = earth_beams[:, :, 0, None]              # (N, M, 1)
+            eb_y = earth_beams[:, :, 1, None]              # (N, M, 1)
+            eb_z = earth_beams[:, :, 2, None]              # (N, M, 1)
+            x_s = x + ranges * eb_x                        # (N, M, nStepsRange)
+            y_s = y + ranges * eb_y                        # (N, M, nStepsRange)
+            z_s = z + ranges * eb_z                        # (N, M, nStepsRange)
+
+            # Batch floor query
+            # FLS beam fan is irregular shape so can't use floor grid sampling.
+            # Vectorize the position arrays with ravel, then reshape after
+            floor_z = ocean.floor.samplePoints(x_s.ravel(), y_s.ravel())
+            floor_z = floor_z.reshape(N, M, self.nStepsRange)
+
+            # Dectect obstacle: floor at or above beam (z positive downward)
+            hits = floor_z <= z_s                          # (N, M, nStepsRange)
+
+            # First hit per beam: argmax on bool gives index of first True
+            has_hit = hits.any(axis=2)                                  # (N, M)
+            first_idx = np.argmax(hits, axis=2)                         # (N, M)
+            floor_ranges = np.where(has_hit,ranges[0,0,first_idx],maxR) # (N, M)
+
+        # --- Vehicle detection --------------------------------------------- #
+        beam_ranges = floor_ranges
+
+        if ((vehicles is not None) and (len(vehicles) > 0)):
+            others = [v for v in vehicles if v.eta is not eta]
+
+            if (others):
+                C = np.array([v.eta[:3] for v in others])         # (nVeh, 3)
+                r_det = np.array([v.L for v in others])           # (nVeh,)
+                origin = np.array([x, y, z])
+                w = C - origin                                    # (nVeh, 3)
+
+                # Project w onto each Earth-frame beam direction
+                t = np.einsum('ijk,vk->ijv', earth_beams, w)      # (N, M, nVeh)
+
+                # Perpendicular distance squared
+                w_sq = np.sum(w**2, axis=1)[np.newaxis,np.newaxis,:] #(1,1,nVeh)
+                perp_sq = w_sq - t**2                             # (N, M, nVeh)
+
+                # Valid hits
+                r_det_sq = (r_det ** 2)[np.newaxis, np.newaxis, :]     #(1,1,nV)
+                valid = ((perp_sq < r_det_sq) & (t > 0) & (t < maxR))  #(N,M,nV)
+
+                # Range to sphere entry point
+                perp_sq_safe = np.clip(perp_sq, 0, None)
+                t_hit = t-np.sqrt(np.maximum(r_det_sq-perp_sq_safe,0)) #(N,M,nV)
+
+                veh_ranges = np.where(valid, t_hit, maxR)
+                veh_min = veh_ranges.min(axis=2)                  # (N, M)
+
+                # Take nearest hit from vehicles and terrain
+                beam_ranges = np.minimum(floor_ranges, veh_min)
+
+        self._cachedResult = [beam_ranges, beam_dirs]
+
+        return self._cachedResult
 
 ###############################################################################
 

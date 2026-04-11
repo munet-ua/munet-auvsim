@@ -1621,8 +1621,8 @@ class Simulator:
                 v.syncEnvironmentState(i, self.ocean)
 
                 # Collect Sensor Data
-                v.collectSensorData(i, self.ocean)
-                
+                v.collectSensorData(i, self.ocean, self.vehicles)
+
                 # Compute Control Commands
                 u_control = v.GuidSystem(v)
 
@@ -1685,8 +1685,8 @@ class Simulator:
                 v.CommSched(v)
 
                 # Collect Sensor Data
-                v.collectSensorData(i, self.ocean)
-                
+                v.collectSensorData(i, self.ocean, self.vehicles)
+
                 # Compute Control Commands
                 u_control = v.GuidSystem(v)
 
@@ -1755,8 +1755,8 @@ class Simulator:
                 v.CommSched(v)
 
                 # Collect Sensor Data
-                v.collectSensorData(i, self.ocean)
-                
+                v.collectSensorData(i, self.ocean, self.vehicles)
+
                 # Compute Control Commands
                 u_control = v.GuidSystem(v)
 

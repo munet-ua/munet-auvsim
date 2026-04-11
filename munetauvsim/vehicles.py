@@ -335,6 +335,7 @@ class AUV(Vehicle):
 
         ## Environment
         self.z_safe = 5                 # safety distance from ocean floor (m)
+        self.r_fls = 40.0               # FLS obstacle reaction distance (m)
 
         #---------------------------------------------------------------------#
         #   Navigation                                                        #
@@ -365,6 +366,8 @@ class AUV(Vehicle):
         self.drift_c = 0                # sensed ocean current speed (m/s)
         self.set_c = 0                  # sensed ocean current direction (rad)
         self.seabed_z = 6000            # sensed ocean floor depth (m)
+        self.ranges_fls = None          # FLS per-beam ranges (m) (nAz, nEl)
+        self.dirs_fls = None            # FLS beam unit vectors (nAz, nEl, 3)
 
         #---------------------------------------------------------------------#
         #   Physics                                                           #
@@ -445,10 +448,17 @@ class AUV(Vehicle):
     
     @sampleTime.setter
     def sampleTime(self, n:float)->None:
-        """Set the time step for simulation iteration loop (seconds)"""
+        """Set the time step and propagate to dependent parameters."""
         self._sampleTime = n
         self.wn_d_z = 1/n              #NOTE: This may be unique to Remus100s
-    
+        # Propagate to installed sensors with a sampleRate
+        for sensor in self.sensors.values():
+            if (hasattr(sensor, 'sampleRate')):
+                sensor._sampleInterval = max(
+                    1, 
+                    round(1.0 / (sensor.sampleRate * n))
+                )
+
     #--------------------------------------------------------------------------
     @property
     def Delta(self):
@@ -670,6 +680,13 @@ class AUV(Vehicle):
         - Return sensor measurement(s) in appropriate format
         - Handle missing parameters gracefully (return None or raise ValueError)
 
+        **Sample Rate Synchronization:**
+
+        If the sensor defines a sampleRate attribute (Hz), its _sampleInterval
+        is computed at install time from the vehicle's current sampleTime. If
+        sampleTime is later changed (e.g. by the Simulator), the interval is
+        automatically re-synced via the sampleTime property setter.
+
         **Data Collection Timing:**
 
         Sensors are automatically read during simulation via the vehicle's
@@ -725,6 +742,14 @@ class AUV(Vehicle):
         >>> print(f"Current: {speed:.2f} m/s at {np.degrees(angle):.1f} deg")
         """
 
+        # Set sensor sample interval (i) from sample rate (Hz)
+        if hasattr(sensor, 'sampleRate'):
+            sensor._sampleInterval = max(
+                1, 
+                round(1.0 / (sensor.sampleRate * self._sampleTime))
+            )
+        
+        # Add sensor to dictionary
         self.sensors[name] = sensor
         self._updateSensorInfo()
 
@@ -1244,7 +1269,7 @@ class AUV(Vehicle):
         removeAllSensors : Remove all sensors at
         readSensor : Read data from specific sensor
         readSelectedSensors : Read multiple sensors by name list
-        collectSensorData : Main sensor data collection method called by simulator
+        collectSensorData : Main data collection method called by simulator
         updateSensorInfo : Helper that updates info dictionary
 
         
@@ -1254,7 +1279,7 @@ class AUV(Vehicle):
 
         >>> auv.Remus100s()
         >>> ocean = env.Ocean(spd=0.5, ang=np.pi/4)
-        >>> data = auv.readAllSensors(ocean=ocean, eta=auv.eta, i=100)
+        >>> data = auv.readAllSensors(i=100, ocean=ocean, eta=auv.eta)
         >>> for sensor,value in data.items():
         ...     print(f"{sensor}: {value}")
         current: [0.50, 0.79]
@@ -1266,15 +1291,30 @@ class AUV(Vehicle):
     
     #--------------------------------------------------------------------------
     @abstractmethod
-    def collectSensorData(self)->None:
+    def collectSensorData(self, 
+                          i:int=None,
+                          ocean=None,
+                          vehicles:list=None)->None:
         """
-        Collect data from installed sensors and update the vehicle state.
-        
+        Collect data from installed sensors and store in vehicle attributes.
+
+
+        Parameters
+        ----------
+        i : int, optional
+            Current simulation iteration counter.
+        ocean : Ocean, optional
+            Ocean environment object.
+        vehicles : list of Vehicle, optional
+            All vehicles in the simulation; passed through to sensors that
+            require vehicle awareness.
+
 
         Notes
         -----
         This method should be implemented by each vehicle class to collect data
-        from and update the vehicle state accordingly.
+        from the external environment and update the sensor-derived vehicle
+        attributes accordingly.
         """
     
     ## Helper Methods ========================================================#
@@ -2255,7 +2295,10 @@ class Remus100s(AUV):
         return (m*speed + b)
 
     #--------------------------------------------------------------------------
-    def collectSensorData(self, i:int, ocean:env.Ocean)->None:
+    def collectSensorData(self, 
+                          i:int, 
+                          ocean:env.Ocean,
+                          vehicles:list=None)->None:
         """
         Update vehicle environmental state from installed sensors.
 
@@ -2264,14 +2307,14 @@ class Remus100s(AUV):
         environmental measurements. This is the primary interface between the
         simulation environment and the vehicle's internal state representation.
 
-        
+
         Parameters
         ----------
         i : int
             Current simulation iteration counter. Used for time-dependent
             sensing, logging, and sensor dynamics. Typically ranges from 0 to
             N-1 where N is total simulation iterations.
-            
+
         ocean : env.Ocean
             Ocean environment object containing:
 
@@ -2281,37 +2324,26 @@ class Remus100s(AUV):
                 Ocean floor depth model (bathymetry)
             - Additional environment features as available
 
+        vehicles : list of Vehicle, optional
+            All vehicles in the simulation, passed through to sensors
+            that require vehicle awareness.
+
             
         Notes
         -----
-        **Side Effects:**
-
-        Updates the following vehicle attributes based on sensor readings:
-
-        - drift_c : float
-            Ocean current speed in m/s (from 'current' sensor if installed)
-        - set_c : float
-            Ocean current direction in radians (from 'current' sensor if
-            installed)
-        - seabed_z : float
-            Ocean floor depth in meters (from 'depth' sensor if installed)
-
         **Implementation:**
 
-        Calls `readAllSensors` with the current environment kwargs, then maps
-        the returned data dictionary to the corresponding vehicle attributes.
-        Only sensors that are installed and return data will update vehicle
-        state. The default sensors and their state mappings are:
-
-        - 'current' -> `self.drift_c`, `self.set_c`
-        - 'depth'   -> `self.seabed_z`
+        Calls readAllSensors with the current environment kwargs, then maps the
+        returned data dictionary to the corresponding vehicle attributes. Only
+        sensors that are installed and return data will update vehicle
+        attributes.
 
         **Extensibility:**
 
         To add additional sensors and state updates:
 
-        1. Define a sensor that inherits `nav.Sensor`
-        2. Install sensor via `addSensor()`
+        1. Define a sensor that inherits nav.Sensor
+        2. Install sensor via addSensor()
         3. Add a corresponding attribute update below
 
         **Simulator Integration:**
@@ -2337,12 +2369,15 @@ class Remus100s(AUV):
         
         # Read All Installed Sensors
         if (ocean is not None):
-            data = self.readAllSensors(i=i, ocean=ocean, eta=self.eta)
+            data = self.readAllSensors(i=i, ocean=ocean, vehicles=vehicles,
+                                       eta=self.eta)
             if ('current' in data):
                 self.drift_c, self.set_c = data['current']
             if ('depth' in data):
                 self.seabed_z = data['depth']
-    
+            if ('fls' in data):
+                self.ranges_fls, self.dirs_fls = data['fls']
+
     #--------------------------------------------------------------------------
     def loadPathFollowing(self)->None:
         """
