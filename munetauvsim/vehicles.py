@@ -2497,7 +2497,7 @@ class Remus100s(AUV):
                            law:str='APF',
                            mission:str='targetFeedforward',
                            formation:str='targetNormPoly',
-                           survival:str='groupNormPoly',
+                           survival:str='composite',
                            )->None:
         """
         Configure vehicle for swarm target tracking.
@@ -2530,7 +2530,11 @@ class Remus100s(AUV):
         survival : str
             APF Collision avoidance component:
 
-            - 'groupNormPoly': Repulsion from all swarm group vehicles.
+            - 'composite' (default): Composite repulsion from swarm group
+              members and FLS-detected terrain and obstacles. Requires an FLS
+              sensor for the forward-looking term; otherwise that term returns
+              zero and the function degrades to group repulsion.
+            - 'groupNormPoly': Group-only repulsion.
 
             
         Notes
@@ -2612,7 +2616,9 @@ class Remus100s(AUV):
         guidance.velCB : Constant bearing velocity guidance law
         guidance.missionTargetFeedForwardAPF : Target velociy feed-forward
         guidance.formationTargetNormPolyAPF : Target attraction & repulsion
-        guidance.survivalGroupNormPolyAPF : Group member repulsion
+        guidance.survivalCompositeAPF : Default composite survival layer
+        guidance.survivalGroupNormPolyAPF : Group-only survival component
+        guidance.flsRepulsionAPF : FLS survival component
         control.pitchPID : Direct pitch controller
         control.headingPID : Heading autopilot
         loadPathFollowing : Alternative guidance for waypoint following
@@ -2626,8 +2632,8 @@ class Remus100s(AUV):
         >>> leader = Remus100s(groupId='A', isLeader=True)
         >>> leader.wpt = guid.Waypoint([0, 100], [0, 0], [0, 20])
         >>> leader.loadPathFollowing()
-        >>> follwer = Remus100s()
-        >>> follwer.loadTargetTracking(leader)
+        >>> follower = Remus100s()
+        >>> follower.loadTargetTracking(leader)
         >>> print(follower.info['Target'])
         A01-LEADER
         """
@@ -2645,7 +2651,10 @@ class Remus100s(AUV):
                 self.GuidLaw.mission = guid.missionTargetFeedForwardAPF
             if (formation == 'targetNormPoly'):
                 self.GuidLaw.formation = guid.formationTargetNormPolyAPF
-            if (survival == 'groupNormPoly'):
+            if (survival == 'composite'):
+                self.addSensor('fls', nav.ForwardLookingSonar())
+                self.GuidLaw.survival = guid.survivalCompositeAPF
+            elif (survival == 'groupNormPoly'):
                 self.GuidLaw.survival = guid.survivalGroupNormPolyAPF
         ## Constant Bearing
         elif (law == 'CB'):

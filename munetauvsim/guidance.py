@@ -36,7 +36,9 @@ Functions
 
 **APF Survival Functions:**
 
+    - survivalCompositeAPF : Survival layer combining repulsion contributions.
     - survivalGroupNormPolyAPF : Repulsion from group vehicles.
+    - flsRepulsionAPF : Repulsion from FLS-detected terrain and obstacles.
 
 **Depth Governing Functions**
 
@@ -1692,10 +1694,11 @@ def survivalGroupNormPolyAPF(vehicle:Vehicle)->NPFltArr:
 
     See Also
     --------
+    survivalCompositeAPF : Wraps this with additional repulsion contributors.
+    flsRepulsionAPF : Survival term from FLS beam data.
     velocitySubsumptionCascadeAPF : Subsumption guidance law
     formationTargetNormPolyAPF : Formation keeping layer
     missionTargetFeedForwardAPF : Control layer
-    depthSafetyLimit : Depth safety constraint applied after collision avoidance
     """
 
     # Vehicle Parameters
@@ -1733,7 +1736,181 @@ def survivalGroupNormPolyAPF(vehicle:Vehicle)->NPFltArr:
     u_ca = np.linalg.norm(v_ca)
     if (u_ca > u_max):
         return u_max * (v_ca / u_ca)
-    
+
+    return v_ca
+
+################################################################################
+
+def flsRepulsionAPF(vehicle:Vehicle)->NPFltArr:
+    """
+    Compute APF repulsion vector from Forward-Looking Sonar beam data.
+
+    Generates a summed repulsive velocity vector from every FLS beam whose range
+    falls within r_fls. Each beam contributes a vector pointing from the
+    detected obstacle back toward the vehicle (the negative of the beam
+    direction), scaled by a proximity factor. Designed to be used as a term in
+    the survival layer of an APF guidance law, or as a standalone repulsion
+    contribution for any guidance system that wants active terrain push-away
+    behavior.
+
+    Parameters
+    ----------
+    vehicle : Vehicle
+        Vehicle computing terrain repulsion. Must have:
+
+        - u_max : float
+            Maximum vehicle speed in m/s. Sets repulsion ceiling.
+        - r_fls : float
+            Distance threshold for FLS obstacle repulsion (m).
+        - ranges_fls : ndarray, shape (nBeamsAz, nBeamsEl), or None
+            Per-beam obstacle ranges from FLS. None if no FLS is installed or no
+            data has been collected yet.
+        - dirs_fls : ndarray, shape (nBeamsAz, nBeamsEl, 3), or None
+            Per-beam 3D unit direction vectors in the Earth frame, paired
+            one-to-one with ranges_fls.
+
+    Returns
+    -------
+    v_fls : ndarray, shape (3,)
+        Total FLS repulsion velocity vector in END frame (m/s). Magnitude
+        clamped to u_max. Returns a zero vector if no FLS data is available or
+        no beams are within reaction range.
+
+    Notes
+    -----
+    **Repulsion Function:**
+
+    For each beam `(k, m)` with range `r_km < reaction_range`, the per-beam
+    contribution is:
+
+        - v_km = -u_max * prox_km^p_rep * beam_dirs[k, m, :]
+        - prox_km = (reaction_range - r_km) / reaction_range
+
+    The total repulsion is the sum over all active beams:
+
+        - v_fls = sum_{(k, m) active} v_km
+
+    The exponent `p_rep = 3` produces a smooth cubic onset.
+
+    **Vectorized Implementation:**
+
+    The beam grid is flattened to shape `(nBeamsAz * nBeamsEl, 3)` and the
+    active-beam mask selects contributing rows. The summed repulsion is
+    computed with a single `scales @ dirs` matrix-vector reduction.
+
+    **Output Clamping:**
+
+    When many beams see the same obstacle cluster, the summed magnitude can
+    exceed `u_max`. The total is clamped to `u_max` while preserving
+    direction.
+
+    **Sign Convention:**
+
+    `dirs_fls` point from the vehicle toward detected obstacles, so
+    the repulsion vector negates them to push the vehicle away from the
+    obstacle.
+
+    See Also
+    --------
+    survivalCompositeAPF : Wraps this with additional repulsion contributors.
+    survivalGroupNormPolyAPF : Group-member repulsion..
+    flsSafetyLimit : Velocity-projection clamp using the same FLS data.
+    navigation.ForwardLookingSonar : Sensor providing FLS beam data.
+    """
+
+    # Default to zero if FLS is not installed or has not collected data
+    beam_ranges = vehicle.ranges_fls
+    beam_dirs   = vehicle.dirs_fls
+    if ((beam_ranges is None) or (beam_dirs is None)):
+        return np.zeros(3)
+
+    # Repulsion parameters
+    u_max = vehicle.u_max
+    reaction_range = vehicle.r_fls
+    p_rep = 3
+
+    # Flatten beam grid for vectorized implementation
+    dirs_flat   = beam_dirs.reshape(-1, 3)              # (K, 3)
+    ranges_flat = beam_ranges.ravel()                   # (K,)
+
+    # Select from beams with obstacles detected within reaction range
+    active = ranges_flat < reaction_range
+    if not (np.any(active)):
+        return np.zeros(3)
+
+    d = dirs_flat[active]                               # (K_a, 3)
+    r = ranges_flat[active]                             # (K_a,)
+    proximity = (reaction_range - r) / reaction_range   # (K_a,) in [0, 1]
+
+    # Per-beam scalar repulsion responses.
+    u_reps = -u_max * proximity**p_rep                  # (K_a,)
+
+    # Sum of contribution vectors: (K_a,) @ (K_a, 3) -> (3,)
+    v_fls = u_reps @ d
+
+    # Clamp Total FLS Repulsion to Maximum Vehicle Speed
+    u_fls = np.linalg.norm(v_fls)
+    if (u_fls > u_max):
+        return u_max * (v_fls / u_fls)
+
+    return v_fls
+
+################################################################################
+
+def survivalCompositeAPF(vehicle:Vehicle)->NPFltArr:
+    """
+    Composite survival APF vector combining repulsion from obstacles.
+
+    Sums independent survival contributions into a single velocity vector
+    suitable for assignment to GuidLaw.survival in an APF guidance law. Each
+    sub-layer contributes only when its respective hazard is present:
+
+    1. survivalGroupNormPolyAPF -- repulsion from reported vehicle positions
+    2. flsRepulsionAPF -- repulsion from FLS-detected terrain/obstacles
+
+    The summed vector is clamped to u_max while preserving direction.
+
+    Parameters
+    ----------
+    vehicle : Vehicle
+        Vehicle computing composite survival velocity component. Must satisfy
+        the requirements of all sub-functions.
+
+    Returns
+    -------
+    v_ca : ndarray, shape (3,)
+        Composite survival velocity vector in END frame (m/s). Magnitude
+        clamped to vehicle.u_max.
+
+    Notes
+    -----
+    **Composition Order:**
+
+    All sub-functions are independent pure functions of vehicle state, so the
+    composition is simple vector summation with no order dependence. Each
+    sub-function handles its own "no hazard" case by returning a zero vector
+    (e.g., `flsRepulsionAPF` returns zero when no FLS is installed), so
+    `survivalCompositeAPF` degrades gracefully on vehicles with partial sensor
+    suites.
+
+    See Also
+    --------
+    survivalGroupNormPolyAPF : Group-member APF repulsion.
+    flsRepulsionAPF : Forward-looking sonar APF repulsion.
+    velocitySubsumptionCascadeAPF : Consumer of this function as the
+        survival layer.
+    """
+
+    # Sum independent survival contributions
+    v_ca = (survivalGroupNormPolyAPF(vehicle)
+            + flsRepulsionAPF(vehicle))
+
+    # Clamp Total Survival Velocity to Maximum Vehicle Speed
+    u_max = vehicle.u_max
+    u_ca = np.linalg.norm(v_ca)
+    if (u_ca > u_max):
+        return u_max * (v_ca / u_ca)
+
     return v_ca
 
 ################################################################################
@@ -1753,10 +1930,9 @@ def depthSafetyLimit(vehicle:Vehicle, vel:NPFltArr)->NPFltArr:
 
         - z_max: Maximum operating depth (m).
         - seabed_z: Sensed ocean floor depth (m).
-        - z_safe: Safety distance from ocean floor (m).
+        - z_safe: Safety Distance from maximum depth limit (m) 
         - eta : [x, y, z, phi, theta, psi], vehicle position / attitude vector
         - velocity : [vx, vy, vz], vehicle velocity vector (m/s)
-        - z_safe: Safety Distance from maximum depth limit (m) 
 
     vel : ndarray, shape (3,)
         Desired velocity vector [vx, vy, vz] in END.
@@ -1777,7 +1953,7 @@ def depthSafetyLimit(vehicle:Vehicle, vel:NPFltArr)->NPFltArr:
     and any velocity the vehicle has in the downward direction is opposed in
     proportion to how far past the Safety Distance threshold the vehicle has
     travelled.
-    
+
         v_z = -velocity_command_z - (gamma * velocity_z),
         gamma = (z - safety_depth) / safety_distance
     """
@@ -1790,7 +1966,7 @@ def depthSafetyLimit(vehicle:Vehicle, vel:NPFltArr)->NPFltArr:
     vel_z = vel_copy[2]         # z-component of proposed velocity
 
     # Depth control geometry
-    hard_floor = nav.maxDepthLimit(vehicle, vehicle.z_max)
+    hard_floor = min(vehicle.z_max, vehicle.seabed_z)
     safety_depth = hard_floor - dz_safe
 
     # Apply depth filtering if vehicle below safety depth and moving down
@@ -1939,7 +2115,9 @@ def velocitySubsumptionCascadeAPF(vehicle:Vehicle)->NPFltArr:
 
     See Also
     --------
-    survivalGroupNormPolyAPF : Collision avoidance from group vehicles
+    survivalCompositeAPF : Default survival layer combining repulsion terms.
+    survivalGroupNormPolyAPF : Group-only collision avoidance term.
+    flsRepulsionAPF : Forward-looking sonar repulsion term.
     formationTargetNormPolyAPF : Formation keeping with leader vehicle
     missionTargetFeedForwardAPF : Control/tracking vector from leader velocity
     depthSafetyLimit : Depth safety constraint enforcement
@@ -1975,11 +2153,8 @@ def velocitySubsumptionCascadeAPF(vehicle:Vehicle)->NPFltArr:
     u_tot = np.linalg.norm(v_tot)
     if (u_tot > u_max):
         v_tot = u_max * (v_tot / u_tot)
-    
-    # APF Depth Constraints
-    v_d = depthSafetyLimit(vehicle,v_tot)
 
-    return v_d
+    return depthSafetyLimit(vehicle, v_tot)
 
 ################################################################################
 
