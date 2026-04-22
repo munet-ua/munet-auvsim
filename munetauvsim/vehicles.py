@@ -344,11 +344,11 @@ class AUV(Vehicle):
         """
         eta=[e,n,d,phi,theta,psi]:      x, y, z, roll, pitch, yaw
         nu=[u,v,w,p,q,r]:               linear & angular velocities: BODY frame
-        velocity=[x_dot,y_dot,z_dot]    linear velocities: NED frame
+        velocity=[x_dot,y_dot,z_dot]    linear velocities: END frame
         """
         self.eta = np.zeros(6)              # position & attitude vector
         self.nu = np.zeros(6)               # BODY velocity vector
-        self.velocity = np.zeros(3)         # NED velocity vector
+        self.velocity = np.zeros(3)         # END velocity vector
         self.clock = 0                      # simulation time
         self.immobilized = False            # mobility status flag
         self.sensors = {}                   # installed sensors

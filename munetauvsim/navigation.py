@@ -686,9 +686,9 @@ def statePT(vehicle:Vehicle,
         Vehicle with eta attribute.
         eta : [x, y, z, phi, theta, psi], vehicle position/attitude vector
     pt1 : list of float, [x, y, z]
-        Start point in NED coordinates (m).
+        Start point in END coordinates (m).
     pt2 : list of float, [x, y, z]
-        End point in NED coordinates (m).
+        End point in END coordinates (m).
 
         
     Returns
