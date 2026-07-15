@@ -723,7 +723,7 @@ file for details.
 
 ### Authors
 
-- **JP Crawford** -- *Primary developer and maintainer*  
+- **JP Crawford** -- *Original developer*  
   [@jpcrawford](https://github.com/jpcrawford)
 
   - Restructured and extended single-vehicle dynamics and design into a
@@ -741,11 +741,11 @@ file for details.
   - Created the muNet acoustic network simulator with physical layer models
     (BER, PLR, collision) and multiple MAC protocols (FDMA, TDMA).
 
-### Contributors
+- **Gang Qin** -- *Developer and maintainer*  
+  [@kai3hu](https://github.com/kai3hu)
 
-- **Gang Qin** -- *Developed the 'Pollution' object for representing a static
-  Gaussian plume dispersion*  
-  [Michael](https://munet-gitlab.eng.ua.edu/Michael)
+  - Developed the 'Pollution' object for representing a static Gaussian plume 
+    dispersion
 
 ### Acknowledgments
 

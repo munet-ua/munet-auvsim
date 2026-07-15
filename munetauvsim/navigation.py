@@ -14,6 +14,8 @@ OceanCurrentSensor
     Measures ocean current speed and direction.
 OceanDepthSensor
     Measures ocean floor depth at vehicle position.
+ForwardLookingSonar
+    Forward-looking Sonar (FLS) for terrain and obstacle detection.
 
     
 Functions
@@ -139,15 +141,13 @@ class OceanCurrentSensor(Sensor):
 
         Returns
         -------
-        speed : float
-            Current speed in m/s.
-        direction : float
-            Current direction in radians.
-            
+        [speed, direction] : list of float
+            where:
 
-        Notes
-        -----
-        Returns [-1.0, -1.0] on error with log message.
+            - speed : float -- Current speed in m/s
+            - direction : float -- Current direction in radians.
+
+            Returns [-1.0, -1.0] on error with log message.
         """
         
         if (ocean is None) or (i is None):
@@ -209,553 +209,316 @@ class OceanDepthSensor(Sensor):
 
 ###############################################################################
 
-class PollutionSensor(Sensor):
+class ForwardLookingSonar(Sensor):
     """
-    Sensor for measuring pollutant concentration level at vehicle position.
+    Forward-Looking Sonar (FLS) for terrain and obstacle detection.
 
-    Queries Ocean.pollution.calculate_concentration() at the vehicle's (x, y)
-    coordinates, returning a discrete concentration level used by the SUSD
-    source-seeking guidance law. Requires a pollution field on the ocean (see
-    Ocean(createPlume=True)) with num_levels configured.
+    Models the functional behavior of a BlueView ProViewer 450-15 FLS. Detects
+    terrain and vehicle obstacles by sampling the environment along a 2D grid of
+    beams (horizontal azimuths x elevation angles) radiating forward from the
+    vehicle, using body-fixed ray-floor intersection and ray-sphere vehicle
+    intersection.
+
+    The sensor produces a 2D range image indexed by [azimuth, elevation] and a
+    matching 3D beam-direction grid. Per-beam range is the distance to the
+    nearest detected object (floor or vehicle). Each beam direction is a unit
+    vector in the Earth frame, pairing one-to-one with the range image so
+    consumers can reconstruct full 3D obstacle vectors from range[k, m] *
+    beam_dirs[k, m, :].
+
+
+    Parameters
+    ----------
+    nBeamsAz : int, default=11
+        Number of horizontal azimuthal beams across hFov. Should be odd
+        so the center beam aligns with vehicle heading.
+    nBeamsEl : int, default=5
+        Number of vertical elevation beams across vFov. Should be odd so the
+        center beam aligns with tiltAngle.
+    maxRange : float, default=135.0
+        Maximum detection range in meters (~450 ft per BlueView spec).
+    nStepsRange : int, default=27
+        Number of sample points along range per beam. 
+        Spacing = maxRange / nStepsRange (5 m at default settings).
+    tiltAngle : float, default=2.5
+        Angle the sensor is tilted in degrees below horizontal, relative to the
+        vehicle body frame. Positive tilt angle points the sensor downward.
+    hFov : float, default=50.0
+        Horizontal field of view in degrees, centered on vehicle heading.
+        Beams span [-hFov/2, +hFov/2] relative to heading.
+    vFov : float, default=15.0
+        Vertical field of view in degrees, centered on tiltAngle.
+        Beams span [-vFov/2, +vFov/2] relative to tiltAngle.
+    sampleRate : float, default=10.0
+        Sensor update rate in Hz. The host vehicle converts this to a
+        step interval _sampleInterval using its sampleTime when
+        the sensor is installed via addSensor, and re-syncs whenever
+        sampleTime changes. On intermediate steps, collectData
+        returns cached results.
+
+
+    Notes
+    -----
+    **Body-Fixed Mounting:**
+
+    Beam directions are fixed in the vehicle body frame and rotated to the Earth
+    frame using the vehicle's full attitude (roll, pitch, yaw) using the Rzyx
+    function. This models a sensor mounted on the hull: when the vehicle pitches
+    or rolls, the beam fan moves with it.
+
+    **Detectable Objects:**
+
+    The sensor detects any object that reflects acoustic energy. In the
+    simulation this includes:
+
+    - Ocean floor: detected with ray-floor intersection using batched
+      samplePoints() queries.
+    - Other vehicles: detected with ray-sphere intersection using vehicle
+      length L as the detection radius.
+
+    The sensor does not distinguish between floor and vehicle returns;
+    beam_ranges reports the nearest object of either type per beam. When
+    ocean.floor is None, floor detection is skipped and beam_ranges reflects
+    vehicle detections only.
+
+    **Ray-Floor Intersection:**
+
+      - Each beam is parameterized as `p(r) = origin + r * d`. 
+      - Evenly-spaced ranges `nStepsRange` are sampled and
+        `ocean.floor.samplePoints` is queried for the seabed depth at each
+        sample's `(x, y)`.
+      - A hit is any sample where `floor_z <= z_beam` (seabed at or above the
+        beam's `z`, since `z` is positive down).
+      - The nearest hit along the beam is the reported `range`.
+      - This is a discrete approximation, where range resolution is 
+        `maxRange / nStepsRange`.
+
+    **Ray-Sphere Intersection:**
+
+      - Each other vehicle is a sphere at position `C` with radius `L`. 
+      - For beam origin `O` and direction `d`, let `w = C - O` and 
+        `t = dot(d,w)` (distance along the beam to closest approach). 
+      - The perpendicular distance squared is `perp_sq = ||w||^2 - t^2`.
+      - A hit exists if and only if `perp_sq < L^2` and `0 < t < maxRange`. 
+      - The range to the sphere entry point is 
+        `t_hit = t - sqrt(L^2 - perp_sq)`.
+      - The minimum `t_hit` across vehicles is then min-reduced with the floor
+        range per beam.
+
+    **Vectorized Implementation:**
+
+    All per-beam computations use numpy broadcasting. Floor queries are batched
+    into a single samplePoints() call and vehicle detection uses broadcasted
+    ray-sphere intersection.
+
+    
+    References
+    ----------
+    [1] Healey, A.J. (2004). Obstacle Avoidance While Bottom Following for
+    the REMUS Autonomous Underwater Vehicle. NPS Technical Report.
+
+    [2] Furukawa, T. (2006). Reactive Obstacle Avoidance Using a
+    Forward-Looking Sonar for the REMUS Autonomous Underwater Vehicle.
+    NPS Master's Thesis.
+
+
+    See Also
+    --------
+    Rzyx : Computes 3x3 Euler angle rotation.
+    OceanDepthSensor : Downward-looking depth sensor (DVL analogue).
     """
+    
+    ## Constructor ===========================================================#
+    def __init__(self,
+                 nBeamsAz:int=11,
+                 nBeamsEl:int=5,
+                 maxRange:float=135.0,
+                 nStepsRange:int=27,
+                 tiltAngle:float=2.5,
+                 hFov:float=50.0,
+                 vFov:float=15.0,
+                 sampleRate:float=10.0)->None:
 
+        self.nBeamsAz = nBeamsAz            # Num Beams in Azimuth
+        self.nBeamsEl = nBeamsEl            # Num Beams in Elevation
+        self.maxRange = maxRange            # Max Beam Range (m)
+        self.nStepsRange = nStepsRange      # Num Sample Points along Beam Range
+        self.tiltAngle = tiltAngle          # Angle of Sensor Tilt (deg)
+        self.hFov = hFov                    # Horizontal FOV (deg)
+        self.vFov = vFov                    # Vertical FOV (deg)
+        self.sampleRate = sampleRate        # Sensor Sample Rate (Hz)
+
+        # Precompute range steps (near to far, excluding zero)
+        self._ranges = np.linspace(maxRange/nStepsRange, maxRange, nStepsRange)
+
+        # Precompute body-frame beam unit directions (fixed to hull)
+        # Body frame: x = forward, y = starboard, z = down
+        # Positive elevation = below horizontal
+        tilt = np.radians(tiltAngle)
+        v_fov = np.radians(vFov)
+        h_fov = np.radians(hFov)
+        elevations = np.linspace(tilt - v_fov/2, tilt + v_fov/2, nBeamsEl) #(M,)
+        azimuths = np.linspace(-h_fov/2, h_fov/2, nBeamsAz)                #(N,)
+
+        # _body_beams[k, m, :] = unit vector for azimuth k, elevation m
+        cos_el = np.cos(elevations)[np.newaxis, :]              # (1, M)
+        sin_el = np.sin(elevations)[np.newaxis, :]              # (1, M)
+        cos_az = np.cos(azimuths)[:, np.newaxis]                # (N, 1)
+        sin_az = np.sin(azimuths)[:, np.newaxis]                # (N, 1)
+
+        self._body_beams = np.empty((nBeamsAz, nBeamsEl, 3))
+        self._body_beams[:, :, 0] = cos_az * cos_el             # forward
+        self._body_beams[:, :, 1] = sin_az * cos_el             # starboard
+        self._body_beams[:, :, 2] = sin_el                      # down
+
+        # Default safe result (no detections; body-frame beam directions)
+        self._emptyResult = [
+            np.full((nBeamsAz, nBeamsEl), maxRange),
+            self._body_beams.copy(),
+        ]
+
+        # Sample rate state
+        self._sampleInterval = 1                # default; set by AUV.addSensor
+        self._cachedResult = self._emptyResult
+
+    ## Methods ===============================================================#
     def collectData(self,
+                    i:int=None,
                     ocean:Ocean=None,
+                    vehicles:list=None,
                     eta:NPFltArr=None,
-                    **kwargs)->float:
+                    **kwargs)->List[NPFltArr]:
         """
-        Measure pollutant concentration level at vehicle position.
+        Inspect environment along beam ranges across the 2D beam grid.
+
+        Detects both ocean floor terrain and vehicles. Per-beam range is the
+        nearest object of either type. Beam directions are body-fixed and
+        rotated to the Earth frame using the vehicle's full attitude (roll,
+        pitch, yaw).
+
+        Recomputes every _sampleInterval steps (set by host vehicle from
+        sampleRate) and returns cached results on intermediate steps.
 
 
         Parameters
         ----------
-        ocean : Ocean
-            Ocean object with a pollution model exposing
-            calculate_concentration([x, y]).
-        eta : ndarray, shape (6,)
+        i : int, optional
+            Simulation iteration counter. Recomputes when
+            i % _sampleInterval == 0, otherwise returns cached result.
+        ocean : Ocean, optional
+            Ocean environment with floor for terrain detection.
+        vehicles : list of Vehicle, optional
+            All vehicles in the simulation. The sensor excludes the vehicle
+            whose eta matches to prevent self-detection.
+        eta : ndarray, shape (6,), optional
             Vehicle position/attitude [x, y, z, phi, theta, psi].
+            Full attitude is used to rotate body-fixed beams to Earth frame.
         **kwargs
             Unused. Required for AUV sensor interface compatibility.
 
 
         Returns
         -------
-        concentration : float
-            Concentration level at position (eta[0], eta[1]).
+        [beam_ranges, beam_dirs] : list of ndarray
+            where:
 
-
-        Notes
-        -----
-        Returns 0.0 when the ocean has no pollution model or on missing
-        arguments (logged as an error).
+            - beam_ranges : ndarray, shape (nBeamsAz, nBeamsEl) --
+              range to nearest object per beam; maxRange if no detection.
+            - beam_dirs : ndarray, shape (nBeamsAz, nBeamsEl, 3) --
+              unit 3D direction vectors per beam in the Earth frame.
+              Each beam_dirs[k, m, :] pairs with beam_ranges[k, m].
         """
 
+        # Return cached result if not at a sample interval
+        if ((i is not None) and (i % self._sampleInterval != 0)):
+            return self._cachedResult
+
+        # Default safe output
         if (ocean is None) or (eta is None):
-            log.error("%s requires 'ocean' and 'eta' arguments.",
-                      self.__class__.__name__)
-            return 0.0
+            return self._emptyResult
 
-        if (getattr(ocean, 'pollution', None) is None):
-            return 0.0
+        # Beam geometry parameters
+        M = self.nBeamsEl
+        N = self.nBeamsAz
+        maxR = self.maxRange
 
-        return ocean.pollution.calculate_concentration(eta[:2])
+        # Extract position and attitude
+        x, y, z, phi, theta, psi = eta
 
-###############################################################################
+        # --- Rotate body-fixed beams to Earth frame ------------------------ #
+        R = Rzyx(phi, theta, psi)
+        # einsum does: earth_beams[k, m, :] = R @ _body_beams[k, m, :]
+        earth_beams = np.einsum('ij,kmj->kmi', R, self._body_beams) # (N, M, 3)
 
-class SonarSensor(Sensor):
-    """
-    Acoustic sonar sensor for inter-vehicle ranging and data sharing.
+        # Export the full 3D beam direction grid. 
+        # Each beam_dirs[k, m, :] pairs with beam_ranges[k, m].
+        # Rotation preserves unit length so no renormalization is required.
+        beam_dirs = earth_beams                                     # (N, M, 3)
 
-    Simulates the physical acoustic link used by the SUSD source-seeking
-    swarm: each vehicle periodically transmits an LFM chirp pulse train whose
-    pulse gaps encode its measured pollutant concentration level. Receiving
-    vehicles matched-filter the (attenuated, delayed, noisy) signal to decode:
-
-    - Range, from the time of arrival of the first correlation peak. Clock
-      drift between vehicles (vehicle.timedrift) injected by the channel
-      produces realistic ranging errors.
-    - Neighbor concentration, from the interval between the last two peaks.
-    - Bearing (relative position direction), via beamforming on two
-      orthogonal receiver arrays.
-
-    Decoded values are written into ``rx_vehicle.neighbors[tx_vehicle.id]``
-    for consumption by the SUSD guidance law (guidance.velSUSD).
-
-
-    Notes
-    -----
-    Unlike environmental sensors, this sensor is not read through
-    collectSensorData/readAllSensors; it is driven by the Simulator's
-    TDMA-scheduled loop (Simulator._simulateSonarTDMA) through the
-    transmit/receive pair. Its collectData method is a no-op returning None
-    for Sensor interface compatibility.
-
-
-    //GQ 11/2024 (ported to munetauvsim 07/2026)
-    """
-
-    def __init__(self):
-        # Acoustic signal parameters
-        self.sample_rate = 8e3          # sampling rate (Hz)
-        self.f_carrier = 0.024e6        # carrier frequency (Hz)
-        self.pulse_duration = 0.02      # pulse duration (s)
-        self.c = 1500                   # speed of sound in water (m/s)
-        self.tx_power = 1000            # transmit power (W)
-        self.f0 = 6.75e4                # chirp start frequency (Hz)
-        self.f1 = 7.25e4                # chirp end frequency (Hz)
-        self.N = 10000                  # number of samples
-        self.bw = 8e3                   # bandwidth (Hz)
-        self.AOA_error = np.pi/48       # angle-of-arrival error bound (rad)
-        self.TOA_error = 0.0            # time-of-arrival jitter bound (s)
-
-        # Pre-calculate the matched filter reference chirp
-        self.ref_chirp = self.lfm_baseband(self.pulse_duration, self.bw,
-                                           self.sample_rate)
-        self._matched_filter_kernel = np.flip(self.ref_chirp.conj())
-
-    #--------------------------------------------------------------------------
-    def collectData(self, **kwargs)->None:
-        """No-op for Sensor interface compatibility. Returns None."""
-        return None
-
-    #--------------------------------------------------------------------------
-    @staticmethod
-    def lfm_baseband(T_lfm:float, bw:float, sampling_rate:float)->NPFltArr:
-        """
-        Generate a baseband Linear Frequency Modulated (LFM) chirp signal.
-
-
-        Parameters
-        ----------
-        T_lfm : float
-            LFM signal duration (s).
-        bw : float
-            Nominal passband signal bandwidth, fmax - fmin (Hz).
-        sampling_rate : float
-            Sampling rate of the LFM (Hz).
-
-
-        Returns
-        -------
-        sigx : ndarray
-            Complex LFM signal at the baseband.
-
-
-        References
-        ----------
-        [1] A. Hein, Processing of SAR data: Fundamentals, Signal Processing,
-        Interferometry, Springer, New York, 2004.
-        """
-
-        mu = bw / T_lfm                                 # frequency sweep rate
-        ttl_samples = round(sampling_rate * T_lfm)
-        t_lfm = ((np.arange(0, ttl_samples) - ttl_samples / 2) / sampling_rate)
-        sigx = np.exp(1j * np.pi * mu * t_lfm**2)
-        return sigx
-
-    #--------------------------------------------------------------------------
-    def matched_filter_complex_correlation(self,
-                                           rx:NPFltArr,
-                                           tx:NPFltArr,
-                                           cir_length:int=None,
-                                           toa_error:float=None,
-                                           )->Tuple[NPFltArr,NPFltArr]:
-        """
-        Perform matched filtering via complex correlation.
-
-        Correlates the received signal with the time-reversed conjugate of
-        the transmitted signal to maximize SNR and detect signal arrival.
-
-
-        Parameters
-        ----------
-        rx : ndarray
-            Received signal.
-        tx : ndarray
-            Transmitted (reference) signal.
-        cir_length : int, optional
-            Desired length of the channel impulse response output.
-        toa_error : float, optional
-            Time-of-arrival error bound in seconds. Each call samples a
-            random value uniformly from [-toa_error, toa_error]. Defaults to
-            self.TOA_error.
-
-
-        Returns
-        -------
-        mf_result : ndarray
-            Matched filter output (complex correlation result).
-        cir_cmplx : ndarray
-            Complex envelope (Hilbert magnitude for real signals).
-        """
-
-        rx = np.asarray(rx).ravel()
-        tx = np.asarray(tx).ravel()
-        iscomplex = np.iscomplexobj(rx) or np.iscomplexobj(tx)
-
-        # Matched filter: normalized time-reversed conjugate of tx
-        matched_filter = np.conj(tx[::-1])
-        matched_filter = matched_filter / np.sqrt(
-            np.sum(np.abs(matched_filter) ** 2))
-
-        # Matched filtering via convolution; drop initial transient samples
-        mf_result = np.convolve(matched_filter, rx, mode='full')
-        start_idx = len(matched_filter) - 1
-        mf_result = mf_result[start_idx:]
-
-        # Inject TOA error sampled uniformly from [-toa_error, toa_error]
-        if (toa_error is None):
-            toa_error = self.TOA_error
-        toa_error = abs(float(toa_error))
-        if (toa_error > 0):
-            toa_error_sample = np.random.uniform(-toa_error, toa_error)
-            signed_shift = int(round(toa_error_sample * self.sample_rate))
-            if (signed_shift != 0):
-                shifted = np.zeros_like(mf_result)
-                if (signed_shift > 0):
-                    shifted[signed_shift:] = mf_result[:-signed_shift]
-                else:
-                    n = abs(signed_shift)
-                    shifted[:-n] = mf_result[n:]
-                mf_result = shifted
-
-        if (cir_length is not None):
-            mf_result = mf_result[:cir_length]
-
-        if (iscomplex):
-            cir_cmplx = mf_result
+        # --- Floor detection ----------------------------------------------- #
+        if (ocean.floor is None):
+            floor_ranges = np.full((N, M), maxR)
         else:
-            cir_cmplx = np.abs(hilbert(mf_result))
+            # Sample points along each beam at each range step
+            # pts[k, m, j] = origin + ranges[j] * earth_beams[k, m]
+            ranges = self._ranges[np.newaxis,np.newaxis,:] # (1, 1, nStepsRange)
+            eb_x = earth_beams[:, :, 0, None]              # (N, M, 1)
+            eb_y = earth_beams[:, :, 1, None]              # (N, M, 1)
+            eb_z = earth_beams[:, :, 2, None]              # (N, M, 1)
+            x_s = x + ranges * eb_x                        # (N, M, nStepsRange)
+            y_s = y + ranges * eb_y                        # (N, M, nStepsRange)
+            z_s = z + ranges * eb_z                        # (N, M, nStepsRange)
 
-        return mf_result, cir_cmplx
+            # Batch floor query
+            # FLS beam fan is irregular shape so can't use floor grid sampling.
+            # Vectorize the position arrays with ravel, then reshape after
+            floor_z = ocean.floor.samplePoints(x_s.ravel(), y_s.ravel())
+            floor_z = floor_z.reshape(N, M, self.nStepsRange)
 
-    #--------------------------------------------------------------------------
-    def transmit(self, vehicle:Vehicle)->dict:
-        """
-        Build the vehicle's sonar pulse train encoding its concentration.
+            # Dectect obstacle: floor at or above beam (z positive downward)
+            hits = floor_z <= z_s                          # (N, M, nStepsRange)
 
-        Creates a train of LFM chirp pulses. The gaps between the final
-        pulses are stretched to (concentration + 3) ms, physically encoding
-        the vehicle's measured concentration level in the signal timing so
-        receivers can decode it after matched filtering.
+            # First hit per beam: argmax on bool gives index of first True
+            has_hit = hits.any(axis=2)                                  # (N, M)
+            first_idx = np.argmax(hits, axis=2)                         # (N, M)
+            floor_ranges = np.where(has_hit,ranges[0,0,first_idx],maxR) # (N, M)
 
+        # --- Vehicle detection --------------------------------------------- #
+        beam_ranges = floor_ranges
 
-        Parameters
-        ----------
-        vehicle : Vehicle
-            The transmitting vehicle. Must carry a ``concentration``
-            attribute (discrete level, see Pollution.num_levels).
+        if ((vehicles is not None) and (len(vehicles) > 0)):
+            others = [v for v in vehicles if v.eta is not eta]
 
+            if (others):
+                C = np.array([v.eta[:3] for v in others])         # (nVeh, 3)
+                r_det = np.array([v.L for v in others])           # (nVeh,)
+                origin = np.array([x, y, z])
+                w = C - origin                                    # (nVeh, 3)
 
-        Returns
-        -------
-        dict
-            ``{vehicle.id: {'signal': ndarray, 'sample_num': int}}`` suitable
-            for merging into the module-level ``signal`` registry.
-        """
+                # Project w onto each Earth-frame beam direction
+                t = np.einsum('ijk,vk->ijv', earth_beams, w)      # (N, M, nVeh)
 
-        num_pulses = 3
-        concentration = vehicle.concentration
-        sample_rate = self.sample_rate
-        num_samples = self.N
-        pulse_duration = self.pulse_duration
-        bandwidth = self.bw
+                # Perpendicular distance squared
+                w_sq = np.sum(w**2, axis=1)[np.newaxis,np.newaxis,:] #(1,1,nVeh)
+                perp_sq = w_sq - t**2                             # (N, M, nVeh)
 
-        # Chirp signal scaled to 180 dB source level
-        t = np.arange(0, pulse_duration, 1/sample_rate)
-        chirp_signal = self.lfm_baseband(pulse_duration, bandwidth,
-                                         sample_rate)
-        signal_power = 10 ** (180 / 10)
-        chirp_signal = chirp_signal * np.sqrt(
-            signal_power / np.mean(np.abs(chirp_signal) ** 2))
+                # Valid hits
+                r_det_sq = (r_det ** 2)[np.newaxis, np.newaxis, :]     #(1,1,nV)
+                valid = ((perp_sq < r_det_sq) & (t > 0) & (t < maxR))  #(N,M,nV)
 
-        # Pulse gaps: last two intervals encode concentration as
-        # (concentration + 3) ms instead of the default 40 ms
-        default_gap_ms = 40
-        pulse_gaps_ms = []
-        for i in range(num_pulses - 1):
-            if (i >= num_pulses - 2):
-                pulse_gaps_ms.append(concentration + 3)
-            else:
-                pulse_gaps_ms.append(default_gap_ms)
-        pulse_gaps_samples = [int(ms / 1000 * sample_rate)
-                              for ms in pulse_gaps_ms]
-        total_samples = len(t) * num_pulses + sum(pulse_gaps_samples)
+                # Range to sphere entry point
+                perp_sq_safe = np.clip(perp_sq, 0, None)
+                t_hit = t-np.sqrt(np.maximum(r_det_sq-perp_sq_safe,0)) #(N,M,nV)
 
-        # Assemble the pulse train
-        s_tx = np.zeros(total_samples, dtype=complex)
-        current_idx = 0
-        for i in range(num_pulses):
-            s_tx[current_idx:current_idx + len(t)] = chirp_signal
-            current_idx += len(t)
-            if (i < num_pulses - 1):
-                current_idx += pulse_gaps_samples[i]
+                veh_ranges = np.where(valid, t_hit, maxR)
+                veh_min = veh_ranges.min(axis=2)                  # (N, M)
 
-        return {
-            vehicle.id: {
-                'signal': s_tx,
-                'sample_num': num_samples,
-            }
-        }
+                # Take nearest hit from vehicles and terrain
+                beam_ranges = np.minimum(floor_ranges, veh_min)
 
-    #--------------------------------------------------------------------------
-    def receive(self,
-                s_rx:NPFltArr,
-                rx_vehicle:Vehicle,
-                tx_vehicle:Vehicle,
-                delay_samples:int,
-                )->None:
-        """
-        Process a received sonar transmission and update neighbor data.
+        self._cachedResult = [beam_ranges, beam_dirs]
 
-        Matched-filters the received signal to decode range (first peak time
-        of arrival) and the transmitter's concentration level (interval
-        between the last two peaks), then estimates the bearing to the
-        transmitter via beamforming. Results are written into
-        ``rx_vehicle.neighbors[tx_vehicle.id]``.
-
-
-        Parameters
-        ----------
-        s_rx : ndarray
-            Received signal (already delayed, attenuated, and noisy; see
-            Simulator._apply_channel_effects).
-        rx_vehicle : Vehicle
-            Receiving vehicle whose neighbor table is updated.
-        tx_vehicle : Vehicle
-            Transmitting vehicle (used for ground-truth signal direction in
-            the beamforming geometry).
-        delay_samples : int
-            Channel propagation delay in samples (informational).
-        """
-
-        sample_rate = self.sample_rate
-        num_samples = self.N
-        pulse_duration = self.pulse_duration
-
-        signal_direction = tx_vehicle.eta[0:2] - rx_vehicle.eta[0:2]
-
-        # Matched filter via correlation against the reference chirp
-        mf_result, cir_cmplx = self.matched_filter_complex_correlation(
-            s_rx, self.ref_chirp, cir_length=num_samples)
-
-        # Time axis for the correlation output (ms)
-        t_mf_length = 16000
-        lag_samples = np.arange(t_mf_length)
-        t_mf = lag_samples / sample_rate * 1000
-
-        # Peak detection on the correlation output
-        peaks, properties = find_peaks(
-            np.abs(mf_result),
-            height=0.9 * np.max(np.abs(mf_result)),
-            distance=100
-        )
-
-        peak_times = t_mf[peaks] if (len(peaks) > 0) else []
-        first_peak_time = peak_times[0] if (len(peak_times) > 0) else None
-
-        if (len(peak_times) >= 2):
-            last_peak_interval = peak_times[-1] - peak_times[-2]
-        else:
-            # Not enough peaks decoded; skip this reception
-            return None
-
-        # Skip updates when this transmitter is not in the receiver's
-        # neighbor map
-        neighbor_data = rx_vehicle.neighbors.get(tx_vehicle.id)
-        if (neighbor_data is None):
-            return None
-
-        # Decode range from time of arrival, concentration from the encoded
-        # pulse gap (23 ms = 20 ms pulse + 3 ms base gap offset)
-        neighbor_data['range'] = ((first_peak_time + pulse_duration * 1000)
-                                  * self.c / 1000)
-        neighbor_data['concentration'] = last_peak_interval - 23
-
-        # Isolate the first pulse for beamforming
-        signal_energy = np.abs(s_rx)**2
-        threshold = 0.1 * np.max(signal_energy)
-        pulse_start = np.where(signal_energy > threshold)[0][0]
-        pulse_duration_samples = int(0.002 * self.sample_rate)
-        signal_for_beamforming = s_rx[pulse_start:
-                                      pulse_start + pulse_duration_samples]
-
-        # Receiver array orientation: vehicle velocity direction, falling
-        # back to the heading vector when nearly stationary
-        array1_direction = np.asarray(rx_vehicle.velocity[0:2], dtype=float)
-        if (np.linalg.norm(array1_direction) < 1e-6):
-            psi = float(rx_vehicle.eta[5])
-            array1_direction = np.array([np.cos(psi), np.sin(psi)])
-
-        # Estimate relative position direction via beamforming
-        neighbor_data['rel_pos'] = self.beam_forming(
-            signal_for_beamforming,
-            signal_direction,
-            array1_direction
-        )
-
-    #--------------------------------------------------------------------------
-    def receive_direct(self, rx_vehicle:Vehicle, tx_vehicle:Vehicle)->None:
-        """
-        Update neighbor data from ground truth, bypassing signal processing.
-
-        Same result as transmit/receive through an ideal channel: exact
-        range, exact relative direction, and the transmitter's current
-        concentration are written into
-        ``rx_vehicle.neighbors[tx_vehicle.id]``.
-
-
-        Parameters
-        ----------
-        rx_vehicle : Vehicle
-            Receiving vehicle whose neighbor data will be updated.
-        tx_vehicle : Vehicle
-            Transmitting vehicle whose info is written into the neighbor
-            entry.
-        """
-
-        neighbor_data = rx_vehicle.neighbors.get(tx_vehicle.id)
-        if (neighbor_data is None):
-            return
-
-        rel_vec = tx_vehicle.eta[0:2] - rx_vehicle.eta[0:2]
-        dist = float(np.linalg.norm(rel_vec))
-
-        neighbor_data['range'] = dist
-        neighbor_data['concentration'] = float(
-            getattr(tx_vehicle, 'concentration', 0.0))
-        if (dist > 1e-9):
-            neighbor_data['rel_pos'] = tuple(rel_vec / dist)
-
-    #--------------------------------------------------------------------------
-    def beam_forming(self,
-                     delayed_signal:NPFltArr,
-                     signal_direction:NPFltArr,
-                     array1_direction:NPFltArr,
-                     aoa_error:float=None,
-                     )->NPFltArr:
-        """
-        Estimate the relative position direction of a transmitter.
-
-        Simulates two orthogonal uniform linear receiver arrays and sweeps
-        candidate steering angles to find the angle of arrival on each. The
-        two estimates are combined into a 2-D direction vector, with uniform
-        AOA error injected.
-
-
-        Parameters
-        ----------
-        delayed_signal : ndarray
-            Received signal segment used for the response power estimate.
-        signal_direction : ndarray, shape (2,)
-            Ground-truth direction from receiver to transmitter (sets the
-            true arrival angles on the arrays).
-        array1_direction : ndarray, shape (2,)
-            Orientation of the first receiver array (typically the vehicle
-            velocity direction). Must be nonzero.
-        aoa_error : float, optional
-            Angle-of-arrival error bound in radians. Each estimated angle
-            samples a random value uniformly from [-aoa_error, aoa_error].
-            Defaults to self.AOA_error.
-
-
-        Returns
-        -------
-        ndarray, shape (2,)
-            Estimated relative position direction vector (not normalized).
-        """
-
-        # Second array is orthogonal to the first
-        rotation_90 = np.array([[0, 1], [-1, 0]])
-        array2_direction = array1_direction @ rotation_90
-
-        norm_signal_direction = np.linalg.norm(signal_direction)
-        norm_array1_direction = np.linalg.norm(array1_direction)
-        norm_array2_direction = np.linalg.norm(array2_direction)
-
-        dot_sig_arr1 = np.dot(signal_direction, array1_direction)
-        dot_sig_arr2 = np.dot(signal_direction, array2_direction)
-
-        d = 0.5                     # half wavelength element spacing
-        Nr1 = 6                     # array 1 element count
-        Nr2 = 4                     # array 2 element count
-
-        # True arrival angles on each array
-        theta1 = np.arccos(dot_sig_arr1 /
-                           (norm_signal_direction * norm_array1_direction))
-        theta2 = np.arccos(dot_sig_arr2 /
-                           (norm_signal_direction * norm_array2_direction))
-        if (theta1 > np.pi / 2):
-            theta1 -= np.pi
-        if (theta2 > np.pi / 2):
-            theta2 -= np.pi
-
-        # True steering vectors for the incoming signal angle
-        n1 = np.arange(Nr1, dtype=float)
-        n2 = np.arange(Nr2, dtype=float)
-        v1 = np.exp(-2j * np.pi * d * n1 * np.sin(theta1))
-        v2 = np.exp(-2j * np.pi * d * n2 * np.sin(theta2))
-
-        # Vectorized angle search:
-        #   y(a) = signal * c(a), c(a) = v_true @ conj(w(a)) / Nr
-        #   var(y(a)) = |c(a)|^2 * var(signal)
-        thetas     = np.arange(-90, 90.1, 0.5)
-        thetas_rad = np.radians(thetas)
-
-        W_1 = np.exp(-2j * np.pi * d * n1[None, :]
-                     * np.sin(thetas_rad[:, None]))
-        W_2 = np.exp(-2j * np.pi * d * n2[None, :]
-                     * np.sin(thetas_rad[:, None]))
-
-        c1 = (W_1 @ v1.conj()) / Nr1
-        c2 = (W_2 @ v2.conj()) / Nr2
-
-        var_sig = float(np.var(delayed_signal))
-        eps     = float(np.finfo(float).eps)
-
-        responses_1 = 10 * np.log10(np.abs(c1) ** 2 * var_sig + eps)
-        responses_2 = 10 * np.log10(np.abs(c2) ** 2 * var_sig + eps)
-        responses_1 = responses_1 - np.max(responses_1)
-        responses_2 = responses_2 - np.max(responses_2)
-
-        # Angles of maximum response
-        aoa_1 = thetas[np.argmax(responses_1)]
-        if (aoa_1 < 0):
-            aoa_1 += 180
-        aoa_2 = thetas[np.argmax(responses_2)]
-        if (aoa_2 < 0):
-            aoa_2 += 180
-
-        # Convert to radians and inject uniform AOA error
-        if (aoa_error is None):
-            aoa_error = self.AOA_error
-        aoa_error = abs(float(aoa_error))
-        aoa_1_rad = np.radians(aoa_1) + np.random.uniform(-aoa_error,
-                                                          aoa_error)
-        aoa_2_rad = np.radians(aoa_2) + np.random.uniform(-aoa_error,
-                                                          aoa_error)
-
-        # Candidate directions: array orientations rotated by +/- each AOA;
-        # pick the rotation pair that agrees best between the two arrays
-        c1r, s1r = np.cos(aoa_1_rad), np.sin(aoa_1_rad)
-        c2r, s2r = np.cos(aoa_2_rad), np.sin(aoa_2_rad)
-
-        R1 = np.array([[ c1r, -s1r], [ s1r, c1r]])
-        R2 = np.array([[ c1r,  s1r], [-s1r, c1r]])
-        R3 = np.array([[ c2r, -s2r], [ s2r, c2r]])
-        R4 = np.array([[ c2r,  s2r], [-s2r, c2r]])
-
-        rot1_1 = R1 @ array1_direction
-        rot1_2 = R2 @ array1_direction
-        rot2_1 = R3 @ array2_direction
-        rot2_2 = R4 @ array2_direction
-
-        min_dist_1 = min(np.linalg.norm(rot1_1 - rot2_1),
-                         np.linalg.norm(rot1_1 - rot2_2))
-        min_dist_2 = min(np.linalg.norm(rot1_2 - rot2_1),
-                         np.linalg.norm(rot1_2 - rot2_2))
-
-        return rot1_1 if (min_dist_1 < min_dist_2) else rot1_2
+        return self._cachedResult
 
 ###############################################################################
 
@@ -928,9 +691,9 @@ def statePT(vehicle:Vehicle,
         Vehicle with eta attribute.
         eta : [x, y, z, phi, theta, psi], vehicle position/attitude vector
     pt1 : list of float, [x, y, z]
-        Start point in NED coordinates (m).
+        Start point in END coordinates (m).
     pt2 : list of float, [x, y, z]
-        End point in NED coordinates (m).
+        End point in END coordinates (m).
 
         
     Returns
