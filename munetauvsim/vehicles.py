@@ -352,6 +352,8 @@ class AUV(Vehicle):
         self.clock = 0                      # simulation time
         self.immobilized = False            # mobility status flag
         self.sensors = {}                   # installed sensors
+        self.neighbors = {}                 # sonar-tracked neighbor table
+        self.timedrift = 0.0                # clock drift rate (s/s)
 
         ## State Estimators
         self.sampleTime = 0.02              # simulation iteration time step
@@ -2680,6 +2682,88 @@ class Remus100s(AUV):
         self.info.update([("Target", f"{self.target.callSign}")])
 
     #--------------------------------------------------------------------------
+    def loadSUSD(self, episode:float=30.0)->None:
+        """
+        Configure vehicle for SUSD distributed source-seeking guidance.
+
+        SUSD (Speeding-Up / Slowing-Down) drives a swarm to climb a scalar
+        concentration field toward its source using only inter-vehicle bearings
+        and shared concentration measurements. Each vehicle blends a
+        source-seeking ("perpendicular") velocity with an inter-vehicle spacing
+        ("parallel") velocity, converted to control commands by the shared
+        targetTrack() coordinator.
+
+        Parameters
+        ----------
+        episode : float, default=30.0
+            Effective communication episode length (originally
+            ``nVeh * transmission_time``). Sets the fixed parallel-spacing gain
+            via a linear schedule -- larger ``episode`` yields a smaller gain.
+
+        Notes
+        -----
+        **Side Effects:**
+
+        - Assigns guidance/autopilot handles:
+
+          - ``self.GuidSystem`` = ``guidance.targetTrack``
+          - ``self.GuidLaw`` = ``guidance.velSUSD``
+          - ``self.DepthAP`` = ``control.pitchPID``
+          - ``self.HeadingAP`` = ``control.headingPID``
+
+        - Installs a ``'pollution'`` sensor that updates
+          ``self.concentration`` (and ``self.prev_concentration``) from
+          ``ocean.pollution.calculate_concentration`` on every
+          collectSensorData call (once per TDMA slot under the scheduled
+          loop, see Simulator.loadSonarSchedule).
+        - Installs a ``'sonar'`` sensor (navigation.SonarSensor) providing
+          the acoustic inter-vehicle link that refreshes ``self.neighbors``.
+        - Initializes SUSD state (``concentration``, ``prev_concentration``,
+          ``n_unit``, ``susd_episode``).
+
+        **Requirements:**
+
+        The ocean must carry a pollution field with ``num_levels`` configured
+        (see ``environment.Ocean(createPlume=True)`` and
+        ``ocean.pollution.num_levels``). Neighbor concentrations, ranges and
+        bearings arrive over the acoustic sonar link under the simulator's
+        TDMA schedule (Simulator.loadSonarSchedule); build the swarm with
+        vehicles.buildGroup(initPos=...) so each vehicle carries the
+        required ``neighbors`` topology.
+
+        See Also
+        --------
+        guidance.targetTrack : Velocity-to-control coordinator
+        guidance.velSUSD : SUSD source-seeking velocity guidance law
+        navigation.PollutionSensor : Concentration sensor installed here
+        loadTargetTracking : APF-based swarm target tracking
+        """
+
+        # Load Vehicle Modules
+        self.GuidSystem = guid.targetTrack
+        self.DepthAP = ctrl.pitchPID
+        self.HeadingAP = ctrl.headingPID
+
+        # Load Guidance Law
+        self.GuidLaw = guid.velSUSD
+
+        # Initialize SUSD State
+        self.concentration = 0.0
+        self.prev_concentration = 0.0
+        self.n_unit = np.array([-1.0, -1.0])
+        self.susd_episode = episode
+        self._susd_ready = False
+
+        # Install Concentration Sensor
+        self.addSensor('pollution', nav.PollutionSensor())
+
+        # Install Acoustic Sonar (inter-vehicle ranging & data sharing)
+        self.addSensor('sonar', nav.SonarSensor())
+
+        # Generate Information Parameters
+        self.info.update([("Guidance System", "SUSD source seeking")])
+
+    #--------------------------------------------------------------------------
     def loadConstantProp(self,n_setpt:float=1200)->None:
         """
         Configure constant propeller RPM command.
@@ -2862,11 +2946,15 @@ def buildGroup(num:int,
                gid:str,
                hasLeader:bool=True,
                vehType:Vehicle=Remus100s,
+               formation:str='circle',
+               distance:float=200.0,
+               initPos:Optional[List[float]]=None,
+               timedrift:float=0.0,
                **kwargs)->List[Vehicle]:
     """
     Create a list of vehicle instances for swarm simulation.
-    
-    
+
+
     Parameters
     ----------
     num : int
@@ -2877,6 +2965,22 @@ def buildGroup(num:int,
         If True, first vehicle in list is generated with isLeader=True.
     vehType : type
         Vehicle class to instantiate (default: Remus100s).
+    formation : {'circle', 'line'}
+        Formation shape used when initPos is given. 'circle' places the
+        vehicles on a regular polygon with side length ``distance``; 'line'
+        places them along the x-axis with ``distance`` spacing.
+    distance : float
+        Spacing between adjacent vehicles in meters (used with initPos).
+    initPos : list of float, optional
+        Formation center [x, y] in meters. When given, vehicles are placed
+        in the requested formation and a swarm neighbor topology is built on
+        each vehicle (see Notes). When omitted (default), vehicles are left
+        at the origin and no topology is built, matching the previous
+        behavior.
+    timedrift : float
+        Clock drift rate bound in s/s. Each vehicle's ``timedrift`` is drawn
+        uniformly from [-timedrift, timedrift]; used by the acoustic channel
+        to inject ranging errors (see Simulator._apply_channel_effects).
     **kwargs : dict
         Optional keyword arguments to pass to vehicle constructor.
         
@@ -2900,6 +3004,22 @@ def buildGroup(num:int,
 
     Vehicle IDs are assigned sequentially based on the class counter to avoid
     any duplicate vehicle IDs in a single session.
+
+    **Neighbor Topology (initPos given):**
+
+    Every non-leader vehicle receives a ``neighbors`` dict with an entry for
+    each other non-leader vehicle::
+
+        neighbors[id] = {'rel_pos':       unit direction to neighbor,
+                         'range':         distance to neighbor (m),
+                         'ini_range':     initial distance set-point (m),
+                         'is_target':     spacing-link flag,
+                         'concentration': neighbor's shared level}
+
+    Only ring-constrained links (previous/next in the formation) are marked
+    ``is_target``; the SUSD guidance law uses target links for both gradient
+    voting and formation spacing. Entries are refreshed at runtime by the
+    sonar link (navigation.SonarSensor.receive) under the TDMA schedule.
 
     
     Examples
@@ -2945,6 +3065,111 @@ def buildGroup(num:int,
         num -= 1
     for _ in range(num):
         group.append(vehType(groupId=gid, **kwargs))
+
+    # Formation placement and swarm neighbor topology (opt-in via initPos)
+    if (initPos is not None):
+        _placeGroupFormation(group, hasLeader, formation, distance,
+                             initPos, timedrift)
     return group
+
+#------------------------------------------------------------------------------
+def _placeGroupFormation(group:List[Vehicle],
+                         hasLeader:bool,
+                         formation:str,
+                         distance:float,
+                         initPos:List[float],
+                         timedrift:float,
+                         )->None:
+    """
+    Place group vehicles in formation and build the swarm neighbor topology.
+
+    Helper for buildGroup. Positions the non-leader vehicles in a circle or
+    line centered on initPos, assigns each a random clock drift, and builds
+    the persistent ``neighbors`` table used by the SUSD guidance law and the
+    sonar link (see buildGroup Notes).
+
+
+    Parameters
+    ----------
+    group : list of Vehicle
+        Vehicles from buildGroup; group[0] is the leader when hasLeader.
+    hasLeader : bool
+        True when group[0] is a leader placed at the formation center.
+    formation : {'circle', 'line'}
+        Formation shape.
+    distance : float
+        Spacing between adjacent vehicles (m).
+    initPos : list of float
+        Formation center [x, y] (m).
+    timedrift : float
+        Clock drift rate bound (s/s); per-vehicle drift is drawn uniformly
+        from [-timedrift, timedrift].
+    """
+
+    num = len(group) - (1 if hasLeader else 0)
+    if (num < 1):
+        return
+
+    # Leader sits at the formation center
+    if (hasLeader):
+        group[0].eta[0] = initPos[0]
+        group[0].eta[1] = initPos[1]
+
+    # Circumradius giving 'distance' between adjacent polygon vertices
+    radius = (distance / (2 * np.sin(np.pi / num)) if (num > 2)
+              else distance)
+    angle_step = 2 * np.pi / max(num, 1)
+    offset = 1 if hasLeader else 0
+
+    for i in range(num):
+        vehicle = group[offset + i]
+        vehicle.timedrift = np.random.uniform(-timedrift, timedrift)
+        vehicle.info.update([("Time Drift", f"{vehicle.timedrift}")])
+
+        if (formation == 'line'):
+            start_x = initPos[0] - (num - 1) * distance / 2.0
+            vehicle.eta[0] = start_x + i * distance
+            vehicle.eta[1] = initPos[1]
+        else:
+            angle = i * angle_step
+            vehicle.eta[0] = initPos[0] + radius * np.cos(angle)
+            vehicle.eta[1] = initPos[1] + radius * np.sin(angle)
+
+    # Neighbor topology: every non-leader is listed on every other
+    # non-leader; only ring-constrained links (prev, next) are targets
+    for i, vehicle_i in enumerate(group):
+        vehicle_i.neighbors = {}
+
+        if (hasLeader and i == 0):
+            continue                        # leader has no neighbor table
+
+        actual_index = i - offset
+
+        if (formation == 'line'):
+            target_neighbor_indices = set()
+            if (actual_index > 0):
+                target_neighbor_indices.add(offset + actual_index - 1)
+            if (actual_index < num - 1):
+                target_neighbor_indices.add(offset + actual_index + 1)
+        else:
+            prev_idx = offset + (actual_index - 1) % num
+            next_idx = offset + (actual_index + 1) % num
+            target_neighbor_indices = {prev_idx, next_idx}
+
+        for neighbor_idx, neighbor in enumerate(group):
+            if (neighbor_idx == i) or (hasLeader and neighbor_idx == 0):
+                continue
+
+            dist = np.linalg.norm(vehicle_i.eta[:2] - neighbor.eta[:2])
+            rel_pos = ((neighbor.eta[:2] - vehicle_i.eta[:2]) / dist
+                       if (dist > 0) else (0.0, 0.0))
+
+            vehicle_i.neighbors[neighbor.id] = {
+                'rel_pos': tuple(rel_pos),
+                'range': dist,
+                'ini_range': dist,
+                'is_target': neighbor_idx in target_neighbor_indices,
+                'concentration': 0.0,
+            }
 
 ###############################################################################

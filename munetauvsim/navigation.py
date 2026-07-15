@@ -66,6 +66,7 @@ if (TYPE_CHECKING):
     from munetauvsim.environment import Ocean
 import numpy as np
 import math
+from scipy.signal import hilbert, find_peaks
 from munetauvsim import gnc
 from munetauvsim import logger
 
@@ -76,6 +77,10 @@ NPFltArr = NDArray[np.float64]
 
 # Globarl Variables
 log = logger.addLog('nav')
+signal = {}
+"""Module-level registry of in-flight sonar transmissions, keyed by the
+transmitting vehicle's id. Updated by SonarSensor.transmit and consumed by
+Simulator._apply_channel_effects."""
 
 ###############################################################################
 
