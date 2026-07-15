@@ -23,12 +23,13 @@ def mainMenu() -> str:
     options = {
         '1': 'Basic Path Following (ALOS Guidance)',
         '2': 'Multi-Vehicle Swarm with APF Target Tracking',
+        '3': 'Multi-Vehicle Source Seeking (SUSD Guidance)',
         'q': 'Exit'
     }
 
     for key, desc in options.items():
         print(f"  ({key}) {desc}")
-    
+
     print("\n" + "─"*74)
     print("  COMING SOON:")
     print("    * Communication Network Customization")
@@ -38,10 +39,10 @@ def mainMenu() -> str:
     print("="*74)
 
     while True:
-        choice = input("\nEnter your choice (1-2 or q): ").strip().lower()
+        choice = input("\nEnter your choice (1-3 or q): ").strip().lower()
         if choice in options:
             return choice
-        print("Invalid choice. Please select 1-2 or q.")
+        print("Invalid choice. Please select 1-3 or q.")
 
 ##############################################################################
 
@@ -680,6 +681,316 @@ def demoSwarmTargetTracking() -> None:
     else:
         print("> Scenario cancelled.")
 
+##############################################################################
+
+def demoSourceSeeking() -> None:
+    """Scenario 3: Multi-vehicle source seeking with SUSD guidance"""
+    printd("""
+
+    ╔════════════════════════════════════════════════════════════════════════╗
+    ║ SCENARIO 3: MULTI-VEHICLE SOURCE SEEKING (SUSD)                        ║
+    ╚════════════════════════════════════════════════════════════════════════╝
+
+    This scenario demonstrates a leaderless swarm locating a pollution source
+    using the SUSD (Speeding-Up / Slowing-Down) distributed source-seeking law.
+    Each vehicle senses the local pollutant concentration and, using only the
+    bearings to its neighbors and their shared concentration measurements,
+    cooperatively climbs the concentration gradient toward the source while
+    holding an even formation spacing.
+
+    Vehicles share data over a simulated acoustic sonar link on a TDMA
+    schedule: each vehicle owns a periodic transmission slot in which it
+    samples the field and broadcasts a chirp pulse train encoding its
+    concentration. Neighbors decode range, bearing, and concentration from
+    the received signal after real channel effects -- absorption, ambient
+    noise, propagation delay, and clock-drift-induced ranging errors.
+    """)
+
+    print("="*74)
+    print("SIMULATION CONFIGURATION")
+    print("="*74)
+    print("Input new values or press Enter to accept the default value.")
+
+    name = "Source_Seeking_SUSD"
+
+    # ------------------------------------------------------------------------
+    # SWARM CONFIGURATION
+    # ------------------------------------------------------------------------
+    printd("""
+    SWARM CONFIGURATION
+    -------------------
+    SUSD needs at least two vehicles so that each can compare its own
+    concentration against its neighbors to estimate the gradient direction.
+    More vehicles improve the gradient estimate and formation stability.
+    """)
+
+    nVeh = int(input("Number of vehicles (2-6) [4]: ").strip() or 4)
+    nVeh = max(2, min(nVeh, 6))
+    print(f"> {nVeh}")
+
+    gid = input("Swarm group identifier (A-Z) [A]: ").strip().upper() or "A"
+    print(f"> {gid}")
+
+    # ------------------------------------------------------------------------
+    # POLLUTION FIELD CONFIGURATION
+    # ------------------------------------------------------------------------
+    printd("""
+    POLLUTION FIELD CONFIGURATION
+    -----------------------------
+    A Gaussian plume disperses a pollutant downstream of a fixed source. The
+    swarm starts downstream, where the concentration is low, and seeks upstream
+    toward the source. The concentration is discretized into levels: a higher
+    level count gives the swarm a finer-grained gradient to follow.
+    """)
+
+    conc = int(input("Concentration levels [100]: ").strip() or 100)
+    conc = max(1, conc)
+    print(f"> {conc}")
+
+    depth = float(input("Swarm operating depth in meters [30]: ").strip() or 30)
+    depth = max(1.0, depth)
+    print(f"> {depth}")
+
+    # ------------------------------------------------------------------------
+    # COMMUNICATION SCHEDULE
+    # ------------------------------------------------------------------------
+    printd("""
+    COMMUNICATION SCHEDULE
+    ----------------------
+    Vehicles share measurements over an acoustic sonar link on a TDMA
+    schedule: each vehicle transmits once per communication episode
+    (nVeh x transmission time). Every vehicle's clock also drifts at a
+    random rate within the drift bound; drifting clocks corrupt the signal
+    time of arrival, producing realistic inter-vehicle ranging errors.
+    """)
+
+    transmissionTime = float(
+        input("Transmission slot time in seconds [5]: ").strip() or 5)
+    transmissionTime = max(0.1, transmissionTime)
+    print(f"> {transmissionTime}")
+
+    drift = float(
+        input("Clock drift bound in s/s [0.00002]: ").strip() or 0.00002)
+    drift = abs(drift)
+    print(f"> {drift}")
+
+    # ------------------------------------------------------------------------
+    # SCENARIO GEOMETRY
+    # ------------------------------------------------------------------------
+    printd("""
+    SCENARIO GEOMETRY
+    -----------------
+    Classic large-scale source seeking on a 20 km x 20 km ocean domain: the
+    pollutant is released at the origin and its plume drifts northeast with
+    the current. The swarm is deployed as a ring roughly 10 km downstream
+    and must climb the concentration gradient back toward the source.\
+    """)
+
+    # 20 km domain, nominal release at the origin, plume drifting northeast,
+    # swarm deployed ~10 km downstream (matching the legacy demo scenario).
+    size = 20000
+    origin = [0, 0]
+    source_x, source_y = 0.0, 0.0
+    plumeSpeed = 1.5                    # plume drift speed (m/s)
+    plumeDir = np.radians(36.0)         # plume drift direction (rad)
+    x0, y0 = 10000.0, 11000.0           # swarm deployment center
+    vehSpacing = 200.0
+
+    # ------------------------------------------------------------------------
+    # CREATE SWARM
+    # ------------------------------------------------------------------------
+    printd("""
+    BUILDING SWARM VEHICLES
+    -----------------------
+    buildGroup places the vehicles in a ring formation, assigns each a
+    random clock drift within the drift bound, and constructs the swarm
+    neighbor topology: each vehicle keeps a table of its neighbors, with
+    its two adjacent ring members marked as formation spacing targets. The
+    table is refreshed at runtime only by decoded sonar receptions.\
+    """)
+
+    vehicles = mn.vehicles.buildGroup(num=nVeh, gid=gid, hasLeader=False,
+                                      formation='circle',
+                                      distance=vehSpacing,
+                                      initPos=[x0, y0],
+                                      timedrift=drift)
+
+    # SUSD episode length: one full TDMA communication cycle.
+    episode = nVeh * transmissionTime
+
+    for v in vehicles:
+        v.eta[2] = depth
+        # Initial motion seed: heading south at low speed, matching the
+        # initial SUSD gradient-direction estimate n_unit = [-1, -1].
+        v.velocity[0] = -0.5
+        v.velocity[1] = -0.5
+        v.eta[5] = -np.pi/2
+        v.loadSUSD(episode=episode)
+        print(f"> Vehicle: \"{v.callSign}\" SUSD source seeking "
+              f"(clock drift {v.timedrift:+.2e} s/s)")
+
+    # ------------------------------------------------------------------------
+    # OCEAN ENVIRONMENT
+    # ------------------------------------------------------------------------
+    printd("""
+    OCEAN ENVIRONMENT
+    -----------------
+    A calm ocean carries a Gaussian plume pollution field. The plume direction
+    and source location are set explicitly for a clean, repeatable gradient.\
+    """)
+
+    ocean = mn.environment.Ocean.calm_ocean(
+        size=size,
+        origin=origin,
+        randomFloor=False,
+    )
+
+    # Gaussian plume with spatially varying (meandering) ocean currents --
+    # the classic source-seeking field. Constructed with its final
+    # parameters: the source position references (field maximum) are
+    # computed at construction time.
+    pollution = mn.environment.Pollution_With_Current(
+        source=[source_x, source_y, 30],
+        u=plumeSpeed,
+        v=plumeDir,
+        oceanSize=size,
+        oceanOrigin=origin,
+        oceanDepth=(ocean.floor.z if (ocean.floor is not None) else 200),
+    )
+    pollution.num_levels = conc
+    ocean.pollution = pollution
+    print("> Created calm ocean with meandering-current plume pollution field")
+
+    # The measurable concentration maximum lies downwind of the release
+    # point (the plume needs distance to disperse to the sensing plane);
+    # this field maximum is the effective source-seeking target.
+    fieldMax = pollution.source_pos
+    seekDist = float(np.linalg.norm(np.array([x0, y0]) - np.array(fieldMax)))
+    print(f"> Nominal release point:  ({source_x:.0f}, {source_y:.0f})")
+    print(f"> Field maximum (target): ({fieldMax[0]:.0f}, {fieldMax[1]:.0f})")
+    print(f"> Seeking distance:       {seekDist:.0f} m")
+
+    # Seed each vehicle's initial concentration reading.
+    for v in vehicles:
+        v.concentration = pollution.calculate_concentration(v.eta[:2])
+        v.prev_concentration = 0.0
+
+    # ------------------------------------------------------------------------
+    # SIMULATOR CONFIGURATION
+    # ------------------------------------------------------------------------
+    printd("""
+    SIMULATOR CONFIGURATION
+    -----------------------
+
+    SIMULATION RUN TIME
+
+    Each simulation runs a number of discrete time-steps. The estimated run
+    time is the time to traverse the source-seeking distance at cruise speed;
+    the true time varies with the gradient climb and formation dynamics.
+    """)
+
+    # SUSD zig-zags while climbing the gradient, so its net approach speed
+    # is well below the vehicle cruise speed. The simulation terminates
+    # early as soon as a vehicle reaches the source (within 200 m).
+    netApproachSpeed = 0.75
+    estimatedRunTime = round(int(seekDist / netApproachSpeed), -2)
+    runTime = int(input(f"Simulation run time in seconds "
+                        f"[estimated {estimatedRunTime}]: ").strip()
+                  or estimatedRunTime)
+    runTime = max(10, min(runTime, 36000))
+    print(f"> {runTime}")
+
+    printd("""
+    SIMULATION NAME
+
+    Simulations can be assigned unique names that appear on the output files
+    generated for each run (with time stamps for uniqueness).
+    """)
+
+    generatedName = f"{name}_n{nVeh}_conc{conc}"
+    name = input(f"Simulation name [{generatedName}]: ").strip()
+    name = name.replace(' ', '_') if name else generatedName
+    print(f"> {name}")
+
+    # ------------------------------------------------------------------------
+    # SUMMARY & CONFIRMATION
+    # ------------------------------------------------------------------------
+    print("\n" + "-"*74)
+    print("SELECTED SIMULATION PARAMETERS")
+    print("-"*74)
+    print(f"  Name:                   {name}")
+    print(f"  Number of vehicles:     {nVeh}")
+    print(f"  Guidance:               SUSD source seeking")
+    print(f"  Concentration levels:   {conc}")
+    print(f"  Operating depth:        {depth} m")
+    print(f"  Source position:        ({source_x:.0f}, {source_y:.0f})")
+    print(f"  Swarm start:            ({x0:.0f}, {y0:.0f})")
+    print(f"  Seeking distance:       {seekDist:.0f} m")
+    print(f"  Ocean:                  Calm with plume")
+    print(f"  Communication:          Sonar TDMA, {transmissionTime:g} s slots"
+          f" ({nVeh*transmissionTime:g} s episode)")
+    print(f"  Clock drift bound:      {drift:g} s/s")
+    print(f"  Run time:               {runTime} s (stops early at source)")
+    print("-"*74)
+
+    printSimRunEndInfo()
+
+    confirm = input("\nRun this scenario? (y/n) [y]: ").strip().lower()
+    if confirm != 'n':
+        print("> Running simulation scenario...\n")
+
+        # Create simulator (vehicles are pre-positioned; no leader to deploy).
+        sim = mn.simulator.Simulator(
+            name = name,
+            runTime = runTime,
+            vehicles = vehicles,
+            ocean = ocean,
+        )
+
+        # SUSD formations legitimately compress along the gradient; disable
+        # the contact immobilizer so brushes do not freeze the swarm.
+        sim.vehProxImmobilize = False
+
+        # TDMA sonar schedule with early termination at the source.
+        sim.loadSonarSchedule(transmissionTime=transmissionTime,
+                              stopAtSourceRadius=200.0)
+
+        # Run simulation
+        sim.run()
+
+        # Classic 2-D figure set: trajectory overview over concentration
+        # contours (+ CSV export) and time-lapse snapshots.
+        print("> Generating 2D trajectory and snapshot figures...")
+        sim.plot2D()
+
+        printSimSummary(sim)
+
+        # Report the source-seeking outcome against the field maximum.
+        print("\n" + "-"*74)
+        print("SOURCE SEEKING RESULT")
+        print("-"*74)
+        target = np.array(fieldMax)
+        print(f"  Effective source (field maximum): "
+              f"({target[0]:.0f}, {target[1]:.0f})")
+        dists = [np.linalg.norm(v.eta[0:2] - target) for v in vehicles]
+        for v, d in zip(vehicles, dists):
+            print(f"  {v.callSign}: {d:7.1f} m from source")
+        if (min(dists) <= 200.0):
+            print(f"  >> Source located after {sim.runTime:.0f} s "
+                  f"of simulated time.")
+        else:
+            print(f"  >> Source not yet reached after {sim.runTime:.0f} s; "
+                  f"closest approach {min(dists):.1f} m.")
+        print("-"*74)
+
+        # Keep data?
+        saveData = input("Save simulation data file (pickle)? (y/n) [n]: ").strip().lower()
+        if saveData == 'y':
+            print("> Saving simulation data.")
+            mn.simulator.save(sim)
+    else:
+        print("> Scenario cancelled.")
+
 # ============================================================================
 # HELPER FUNCTIONS - PRINTING
 # ============================================================================
@@ -943,6 +1254,8 @@ def main() -> None:
                 demoPathFollowing()
             elif choice == '2':
                 demoSwarmTargetTracking()
+            elif choice == '3':
+                demoSourceSeeking()
 
             input("\nPress Enter to return to main menu...")
 

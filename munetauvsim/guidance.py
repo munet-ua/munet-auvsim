@@ -2130,3 +2130,269 @@ def targetTrack(vehicle:Vehicle)->NPFltArr:
     return np.array([delta_r, delta_s, n], float)
 
 ################################################################################
+#   SUSD Source-Seeking Guidance                                              #
+################################################################################
+
+def _susdInit(vehicle:Vehicle)->None:
+    """
+    One-time setup of the persistent SUSD neighbor table for a vehicle.
+
+    Fallback used when the swarm was not built with
+    ``vehicles.buildGroup(initPos=...)`` (which constructs the topology at
+    build time). Populates ``vehicle.neighbors`` from the simulator-linked
+    ``vehicle.group`` list: every group member gets an entry, the (up to)
+    two nearest members are marked as spacing "targets", and the current
+    inter-vehicle ranges are recorded as spacing set-points. Called lazily
+    on the first SUSD guidance evaluation.
+
+    The table is subsequently refreshed by the acoustic sonar link
+    (navigation.SonarSensor.receive / receive_direct) under the simulator's
+    TDMA schedule -- the guidance law itself never reads live neighbor
+    positions.
+
+    Parameters
+    ----------
+    vehicle : Vehicle
+        Vehicle whose ``group`` list has been linked by the simulator.
+    """
+
+    group = getattr(vehicle, 'group', None) or []
+    my_xy = np.asarray(vehicle.eta[:2], dtype=float)
+
+    if (not getattr(vehicle, 'neighbors', None)):
+        ranges = []
+        for nb in group:
+            rel = np.asarray(nb.eta[:2], dtype=float) - my_xy
+            ranges.append((nb.id, rel, float(np.linalg.norm(rel))))
+        ranges.sort(key=lambda item: item[2])
+        targets = set(nid for nid, _, _ in ranges[:2])
+
+        vehicle.neighbors = {}
+        for nid, rel, rng in ranges:
+            rel_unit = tuple(rel / rng) if (rng > 1e-9) else (0.0, 0.0)
+            vehicle.neighbors[nid] = {
+                'rel_pos': rel_unit,
+                'range': rng,
+                'ini_range': rng,
+                'is_target': nid in targets,
+                'concentration': float(getattr(vehicle, 'concentration',
+                                               0.0)),
+            }
+
+    if (not hasattr(vehicle, 'n_unit')):
+        vehicle.n_unit = np.array([-1.0, -1.0])
+    vehicle._susd_ready = True
+
+
+def _velSUSDPerpendicular(vehicle:Vehicle, neighbors:dict)->NPFltArr:
+    """
+    SUSD source-seeking (perpendicular) velocity component.
+
+    Chooses a climb direction using only neighbor bearings and pairwise
+    concentration comparisons, then scales the speed based on this vehicle's
+    concentration relative to its neighbors. Writes the resolved gradient-
+    direction estimate back to ``vehicle.n_unit``.
+
+    Parameters
+    ----------
+    vehicle : Vehicle
+        Vehicle carrying ``concentration``, ``prev_concentration``, ``id`` and
+        ``n_unit`` state.
+    neighbors : dict
+        Neighbor table (``vehicle.neighbors``) maintained by the sonar link.
+
+    Returns
+    -------
+    ndarray, shape (3,)
+        Source-seeking velocity ``[vx, vy, 0]``.
+    """
+
+    v_base = 2.0
+    v_min = 1.0
+    v_step = 0.1
+    c_max = 100.0
+    c_min = 1.0
+    k = (v_base - v_min) / (c_max - c_min)
+
+    my_c = float(vehicle.concentration)
+    my_prev_c = float(getattr(vehicle, 'prev_concentration', 0.0))
+    my_id = vehicle.id
+    n_sum = np.zeros(2, dtype=float)
+
+    max_c = my_c
+    min_c = my_c
+    has_neighbors = False
+
+    for nid, nd in neighbors.items():
+        if (not nd.get('is_target', True)):
+            continue
+
+        has_neighbors = True
+        u = np.asarray(nd['rel_pos'], dtype=float)
+        un = np.linalg.norm(u)
+        if (un < 1e-9):
+            continue
+        u = u / un
+
+        nb_c = float(nd.get('concentration', my_c))
+        if (nb_c > max_c):
+            max_c = nb_c
+        if (nb_c < min_c):
+            min_c = nb_c
+
+        # Break the comparison symmetry using prev_concentration for the
+        # higher-id neighbor so paired vehicles vote consistently.
+        if (nid > my_id) and (my_prev_c != 0):
+            if (nb_c > my_prev_c):
+                n_sum += u
+            elif (nb_c < my_prev_c):
+                n_sum -= u
+        else:
+            if (nb_c > my_c):
+                n_sum += u
+            elif (nb_c < my_c):
+                n_sum -= u
+
+    n_norm = np.linalg.norm(n_sum)
+    if (n_norm < 1e-9):
+        # Fall back to the previous gradient estimate.
+        n_unit = np.asarray(getattr(vehicle, 'n_unit', np.zeros(2)), dtype=float)
+        hn = np.linalg.norm(n_unit)
+        if (hn < 1e-9):
+            return np.array([0.0, 0.0, 0.0], dtype=float)
+        n_unit = n_unit / hn
+    else:
+        n_unit = n_sum / n_norm
+
+    vehicle.n_unit = n_unit
+
+    vmag = v_base - k * (my_c - c_min)
+    if (has_neighbors):
+        eps = 1e-10
+        if (my_c >= max_c - eps):
+            vmag -= v_step
+        elif (my_c <= min_c + eps):
+            vmag += v_step
+
+    vmag = np.clip(vmag, v_min, v_base)
+    v_perp = vmag * n_unit
+    return np.array([v_perp[0], v_perp[1], 0.0], dtype=float)
+
+
+def _velSUSDParallel(vehicle:Vehicle, neighbors:dict)->NPFltArr:
+    """
+    SUSD inter-vehicle spacing (parallel) velocity component.
+
+    Applies a proportional spacing force toward each target neighbor's initial
+    range, projected orthogonal to the gradient direction ``n_unit`` so it does
+    not fight the source-seeking climb. The gain follows a fixed schedule set
+    by ``vehicle.susd_episode``.
+
+    Parameters
+    ----------
+    vehicle : Vehicle
+        Vehicle carrying ``n_unit`` and ``susd_episode`` state.
+    neighbors : dict
+        Neighbor table (``vehicle.neighbors``) maintained by the sonar link.
+
+    Returns
+    -------
+    ndarray, shape (3,)
+        Spacing velocity ``[vx, vy, 0]``.
+    """
+
+    ep = float(getattr(vehicle, 'susd_episode', 0.0))
+    ep_min, ep_max = 20.0, 400.0
+    kp_max, kp_min = 0.008, 0.0005
+    if (ep <= ep_min):
+        kp = kp_max
+    elif (ep >= ep_max):
+        kp = kp_min
+    else:
+        kp = kp_max - (kp_max - kp_min) * ((ep - ep_min) / (ep_max - ep_min))
+
+    v_para = np.zeros(2)
+    n_unit = np.asarray(getattr(vehicle, 'n_unit', np.zeros(2)), dtype=float)
+    nn = np.linalg.norm(n_unit)
+    n_unit = n_unit / nn if (nn > 1e-9) else np.zeros(2)
+
+    for nid, nd in neighbors.items():
+        if (not nd.get('is_target', False)):
+            continue
+
+        a0 = nd['ini_range']
+        r_ij = nd['range']
+        if (r_ij <= 0):
+            continue
+
+        r_raw = np.asarray(nd['rel_pos'], dtype=float)
+        rn = np.linalg.norm(r_raw)
+        if (rn > 1e-9):
+            r_raw = r_raw / rn
+
+        # Project onto the direction orthogonal to the gradient.
+        r_perp = r_raw - np.dot(r_raw, n_unit) * n_unit
+        rp = np.linalg.norm(r_perp)
+        if (rp <= 1e-9):
+            continue
+        r_perp = r_perp / rp
+
+        v_para += kp * (r_ij - a0) * r_perp
+
+    return np.array([v_para[0], v_para[1], 0.0], dtype=float)
+
+
+def velSUSD(vehicle:Vehicle)->NPFltArr:
+    """
+    SUSD source-seeking velocity guidance law (2-D).
+
+    Blends a source-seeking ("perpendicular") velocity that climbs the shared
+    concentration gradient with an inter-vehicle spacing ("parallel") velocity.
+    Designed to be assigned to ``vehicle.GuidLaw`` and driven by
+    ``targetTrack`` (single-argument convention).
+
+    Neighbor state is read from the persistent ``vehicle.neighbors`` table,
+    which is built by ``vehicles.buildGroup(initPos=...)`` (or lazily by
+    ``_susdInit``) and refreshed at runtime by the acoustic sonar link under
+    the simulator's TDMA schedule (Simulator.loadSonarSchedule). The law
+    therefore only ever sees information that has physically arrived over
+    the communication channel -- including ranging errors from clock drift.
+
+    Parameters
+    ----------
+    vehicle : Vehicle
+        Vehicle configured via ``loadSUSD``. Must have ``concentration``,
+        ``prev_concentration``, ``n_unit``, ``susd_episode``, ``u_max`` and a
+        ``neighbors`` table.
+
+    Returns
+    -------
+    ndarray, shape (3,)
+        Desired velocity ``[vx, vy, 0]``, magnitude-limited to
+        ``vehicle.u_max``.
+
+    See Also
+    --------
+    targetTrack : Coordinator that converts this velocity into control commands
+    vehicles.Remus100s.loadSUSD : Assigns use of velSUSD
+    vehicles.buildGroup : Builds the swarm neighbor topology
+    navigation.SonarSensor : Acoustic link that refreshes the neighbor table
+    """
+
+    if (not getattr(vehicle, '_susd_ready', False)):
+        _susdInit(vehicle)
+
+    neighbors = vehicle.neighbors
+
+    v_p = _velSUSDPerpendicular(vehicle, neighbors)
+    v_a = _velSUSDParallel(vehicle, neighbors)
+    v_tot = v_p + v_a
+
+    u = np.linalg.norm(v_tot[:2])
+    u_max = float(vehicle.u_max)
+    if (u > u_max) and (u > 1e-9):
+        v_tot[:2] = u_max * v_tot[:2] / u
+
+    return v_tot
+
+################################################################################

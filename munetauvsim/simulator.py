@@ -39,6 +39,7 @@ import numpy as np
 from munetauvsim import vehicles as veh
 from munetauvsim import communication as comm
 from munetauvsim import environment as env
+from munetauvsim import navigation as nav
 from munetauvsim import plotTimeSeries as pltTS
 from munetauvsim import logger
 
@@ -1021,8 +1022,10 @@ class Simulator:
 
         # Simulation Loop
         self._simLoop(simData)
-        
-        return simData
+
+        # Truncate to current N (early-terminating loops shrink N; no-op
+        # when the loop ran to completion)
+        return simData[:, :self.N+1, :]
     
     #--------------------------------------------------------------------------
     def plot3D(self,
@@ -1102,6 +1105,78 @@ class Simulator:
                      showFloor=showFloor)
         plt.show()
         plt.close()
+
+    #--------------------------------------------------------------------------
+    def plot2D(self,
+               numDataPoints:Optional[int]=None,
+               vehicles:Optional[List[veh.Vehicle]]=None,
+               figNo:Optional[int]=None,
+               showTraj:bool=True,
+               showPos:bool=True,
+               numSnapshots:int=5,
+               )->None:
+        """
+        Create 2-D top-down visualizations over the pollution field.
+
+        Produces the classic source-seeking figure set:
+
+        1. A trajectory overview (``<saveFile>.png``): smoothed vehicle
+           paths over labeled concentration contours, with start markers,
+           final positions, and the pollution source (field maximum), plus
+           a CSV export of the full state history (``<saveFile>.csv``).
+        2. Time-lapse snapshots (``<saveFile>_t<step>.png``): vehicle
+           positions at evenly spaced times on the concentration color map.
+
+
+        Parameters
+        ----------
+        numDataPoints : int, optional
+            Number of trajectory points to display (default:
+            self.numDataPoints).
+        vehicles : list of Vehicle, optional
+            Vehicles to plot (default: all vehicles).
+        figNo : int, optional
+            Figure number used by Matplotlib for window reference.
+        showTraj : bool
+            Show vehicle trajectory paths on the overview figure.
+        showPos : bool
+            Show final position markers on the overview figure.
+        numSnapshots : int
+            Number of time-lapse snapshot figures.
+
+
+        Notes
+        -----
+        - Wrapper for plotTimeSeries.plot2Dtrajectory / plot2DSnapshots.
+        - Requires an ocean with a pollution field.
+        """
+
+        if (getattr(self.ocean, 'pollution', None) is None):
+            self.log.warning("plot2D requires an ocean pollution field.")
+            return
+
+        if (numDataPoints is None):
+            numDataPoints = self.numDataPoints
+        if (vehicles is None):
+            vehicles = self.vehicles
+        if (figNo is None):
+            figNo = len(self.vehicles)*2 + 1
+
+        pltTS.plot2Dtrajectory(self.simData,
+                               self.ocean,
+                               numDataPoints,
+                               f"{self.saveFile}.png",
+                               vehicles,
+                               figNo,
+                               traj=showTraj,
+                               pos=showPos)
+
+        pltTS.plot2DSnapshots(self.simData,
+                              self.ocean,
+                              f"{self.saveFile}.png",
+                              vehicles,
+                              figNo + 1,
+                              num_snapshots=numSnapshots)
 
     #--------------------------------------------------------------------------
     def deployAtWpt(self, vehicle:veh.Vehicle, posOnly:bool=False)->None:
@@ -1405,6 +1480,72 @@ class Simulator:
                 self.log.info("")
 
     #--------------------------------------------------------------------------
+    def loadSonarSchedule(self,
+                          transmissionTime:float=5.0,
+                          stopAtSourceRadius:Optional[float]=None,
+                          receiveProbability:float=1.0,
+                          )->None:
+        """
+        Select the TDMA-scheduled direct-access simulation loop.
+
+        Replaces the default every-step direct-access loop with a
+        time-division schedule modeled on physical acoustic communication:
+        each vehicle is assigned a periodic transmission slot of
+        ``transmissionTime`` seconds. Only in its own slot does a vehicle
+        sample its sensors (pollutant concentration, current, depth) and
+        broadcast a sonar pulse train to its target neighbors, who decode
+        range, bearing, and the transmitted concentration from the received
+        signal (see navigation.SonarSensor). Between slots, vehicles operate
+        on their last received neighbor information.
+
+        This cadence is required by the SUSD source-seeking guidance law:
+        concentration comparisons are only meaningful when measurements are
+        separated in time and space by a full communication episode
+        (nVeh x transmissionTime).
+
+
+        Parameters
+        ----------
+        transmissionTime : float
+            Duration of each vehicle's transmission slot in seconds. One
+            full communication episode lasts nVeh * transmissionTime.
+        stopAtSourceRadius : float, optional
+            When set and the ocean carries a pollution field, the simulation
+            terminates early as soon as any vehicle comes within this radius
+            (m) of the effective source -- the field concentration maximum
+            (pollution.source_pos), which for a dispersing plume lies
+            downwind of the nominal release point. runTime/N are truncated
+            to the stop time. None (default) disables early termination.
+        receiveProbability : float
+            Probability in [0, 1] that a transmitted sonar signal is
+            successfully received by each neighbor (probabilistic packet
+            drop). Default 1.0 receives everything.
+
+
+        Notes
+        -----
+        - Call after construction and after assigning vehicles/ocean.
+        - Vehicles participating in the sonar exchange need a 'sonar' sensor
+          and a ``neighbors`` topology (see vehicles.loadSUSD and
+          vehicles.buildGroup with initPos).
+        - Clock drift (vehicle.timedrift) and channel absorption/noise are
+          applied to every transmission by _apply_channel_effects.
+
+
+        See Also
+        --------
+        _simulateSonarTDMA : The scheduled iteration loop
+        vehicles.buildGroup : Builds the swarm neighbor topology
+        guidance.velSUSD : SUSD guidance law driven by this schedule
+        """
+
+        self._transmissionTime = float(transmissionTime)
+        self._stopAtSourceRadius = stopAtSourceRadius
+        self.sonarReceiveProbability = float(receiveProbability)
+        self._simLoop = self._simulateSonarTDMA
+        self._comm = "Direct-Access (sonar TDMA)"
+
+    #--------------------------------------------------------------------------
     def initVehicleContactMonitor(self)->None:
         """
         Initialize vehicle proximity collision detection system.
@@ -1636,7 +1777,245 @@ class Simulator:
             
             # Monitor vehicle contact
             self.monitorContact()
-    
+
+    #--------------------------------------------------------------------------
+    def _simulateSonarTDMA(self, simData:NPFltArr)->None:
+        """
+        Simulation loop for TDMA-scheduled direct access over a sonar link.
+
+        Time-division variant of the direct-access loop used by the SUSD
+        source-seeking swarm. Vehicles take turns on a fixed schedule: the
+        j-th vehicle owns the j-th slot of ``transmissionTime`` seconds in a
+        repeating episode of nVeh slots. In its slot a vehicle:
+
+        1. Samples its sensors (pollutant concentration level, current,
+           depth), updating ``concentration``/``prev_concentration``.
+        2. Broadcasts a sonar pulse train encoding its concentration.
+        3. Each target neighbor receives the signal after channel effects
+           (absorption, ambient noise, propagation delay, clock drift) and
+           decodes range, bearing, and concentration into its ``neighbors``
+           table.
+
+        Guidance, dynamics, and contact monitoring run every iteration for
+        every vehicle, operating on the last received neighbor information.
+
+
+        Parameters
+        ----------
+        simData : ndarray
+            Preallocated array to store simulation data.
+
+
+        Notes
+        -----
+        - Configure via loadSonarSchedule (sets transmission slot duration,
+          optional early termination radius, and receive probability).
+        - When early termination triggers, self.N (and thereby runTime and
+          simTime) is truncated to the stop iteration; simulate() then
+          returns the correspondingly truncated data array.
+        """
+
+        tt = getattr(self, '_transmissionTime', 5.0)
+        stopRadius = getattr(self, '_stopAtSourceRadius', None)
+        rxProb = np.clip(getattr(self, 'sonarReceiveProbability', 1.0),
+                         0.0, 1.0)
+
+        # Effective source (field concentration maximum) for early
+        # termination checks -- the point the swarm actually converges on
+        pollution = getattr(self.ocean, 'pollution', None)
+        source = (np.asarray(pollution.source_pos, dtype=float)
+                  if (pollution is not None) else None)
+
+        # Integer slot arithmetic: vehicle j transmits when the step index
+        # enters its slot within the repeating episode
+        stepsPerSlot = max(1, int(round(tt / self.sampleTime)))
+        cycle = stepsPerSlot * self.nVeh
+
+        # Vehicle lookup by id for neighbor resolution
+        vehById = {v.id: v for v in self.vehicles}
+
+        # Pre-roll: prime the sonar signal registry and seed each vehicle's
+        # neighbor concentrations from the field so the first guidance
+        # evaluations have meaningful comparisons
+        for v in self.vehicles:
+            if ('sonar' in v.sensors):
+                nav.signal.update(v.sensors['sonar'].transmit(v))
+            if (pollution is not None):
+                for nid, nd in v.neighbors.items():
+                    nv = vehById.get(nid)
+                    if (nv is not None):
+                        nd['concentration'] = (
+                            pollution.calculate_concentration(nv.eta[:2]))
+
+        for i in range(0, self.N+1):
+            # Simulation time
+            currentTime = self.simTime[i][0]
+            logger.simTime = f'{currentTime:.2f}'
+
+            # Early termination on source arrival
+            if (source is not None) and (stopRadius is not None):
+                for v in self.vehicles:
+                    if (np.linalg.norm(v.eta[0:2] - source) < stopRadius):
+                        self.log.info('Vehicle %s reached the source '
+                                      '(within %.0f m)',
+                                      v.callSign, stopRadius)
+                        self.log.info('Terminating simulation at %.1f s',
+                                      currentTime)
+                        # Truncate runTime/simTime to the last fully
+                        # recorded iteration
+                        self.N = max(i - 1, 0)
+                        return
+
+            for j in range(self.nVeh):
+                v = self.vehicles[j]
+
+                # Clock
+                v.clock = currentTime
+
+                # Synchronize Environment State
+                v.syncEnvironmentState(i, self.ocean)
+
+                # TDMA slot: sense, then transmit to target neighbors
+                if ((i % cycle) == j * stepsPerSlot):
+
+                    # Collect Sensor Data (updates concentration state)
+                    v.collectSensorData(i, self.ocean)
+
+                    if ('sonar' in v.sensors):
+                        sonar = v.sensors['sonar']
+                        nav.signal.update(sonar.transmit(v))
+
+                        for nid, nd in v.neighbors.items():
+                            if (not nd.get('is_target', True)):
+                                continue
+                            nv = vehById.get(nid)
+                            if (nv is None) or ('sonar' not in nv.sensors):
+                                continue
+
+                            # Physical channel: absorption, noise, delay,
+                            # and clock-drift-induced ranging error
+                            s_rx, delay_samples = self._apply_channel_effects(
+                                tx_signal_dict=nav.signal,
+                                tx_vehicle=v,
+                                rx_vehicle=nv,
+                                clock=v.clock,
+                                c=sonar.c,
+                                sample_rate=sonar.sample_rate,
+                            )
+
+                            # Probabilistic packet drop on reception
+                            if (np.random.random() <= rxProb):
+                                nv.sensors['sonar'].receive(
+                                    s_rx, nv, v, delay_samples)
+
+                # Compute Control Commands
+                u_control = v.GuidSystem(v)
+
+                # Store Simulation Data
+                signals = np.concatenate([v.eta, v.nu, u_control,
+                                          v.u_actual])
+                simData[j,i,:] = signals
+
+                # Advance Position and Attitude Dynamics
+                v.nu, v.u_actual = v.dynamics(u_control)
+                v.eta, v.velocity = v.Attitude(v)
+
+            # Monitor vehicle contact
+            self.monitorContact()
+
+    #--------------------------------------------------------------------------
+    def _apply_channel_effects(self,
+                               tx_signal_dict:dict,
+                               tx_vehicle:veh.Vehicle,
+                               rx_vehicle:veh.Vehicle,
+                               clock:float,
+                               c:float,
+                               sample_rate:float,
+                               )->Tuple[NPFltArr,int]:
+        """
+        Apply acoustic channel effects to a transmitted sonar signal.
+
+        Models the underwater acoustic channel between two vehicles:
+
+        1. Absorption attenuation from Thorp's model (ocean.channel).
+        2. Propagation delay from range plus a clock-drift error term
+           ``(rx.timedrift + tx.timedrift) * clock`` -- drifting clocks
+           corrupt the time-of-arrival and therefore the decoded range.
+        3. Additive complex Gaussian ambient noise at a fixed noise level.
+
+
+        Parameters
+        ----------
+        tx_signal_dict : dict
+            Signal registry keyed by transmitter id (see navigation.signal).
+        tx_vehicle : Vehicle
+            Transmitting vehicle.
+        rx_vehicle : Vehicle
+            Receiving vehicle.
+        clock : float
+            Current simulation time in seconds (scales the drift error).
+        c : float
+            Speed of sound in water (m/s).
+        sample_rate : float
+            Receiver sample rate (Hz).
+
+
+        Returns
+        -------
+        signal_with_noise : ndarray
+            Received signal after attenuation, delay, and noise.
+        delay_samples : int
+            Total arrival delay in samples.
+        """
+
+        # Original transmitted signal
+        original_signal = tx_signal_dict[tx_vehicle.id]['signal']
+
+        # Absorption attenuation over the true range
+        range_m = np.linalg.norm(rx_vehicle.eta[0:2] - tx_vehicle.eta[0:2])
+        absorption_db = self.ocean.channel.thorp_absorption_loss(
+            self.ocean.channel.f, range_m)
+        attenuation_factor = 10 ** (-absorption_db / 20.0)
+        attenuated_signal = original_signal * attenuation_factor
+
+        # Propagation delay plus clock-drift error
+        time_drift = (rx_vehicle.timedrift + tx_vehicle.timedrift) * clock
+        total_delay_sec = range_m/c + time_drift
+        if (total_delay_sec < 0.001):       # prevent zero/negative delays
+            total_delay_sec = 0.001
+        delay_samples = int(total_delay_sec * sample_rate)
+
+        # Place the delayed signal into the receive buffer
+        signal_length = len(attenuated_signal)
+        total_buffer_length = int(10 * sample_rate)
+        delayed_signal = np.zeros(total_buffer_length,
+                                  dtype=attenuated_signal.dtype)
+
+        if (delay_samples >= total_buffer_length):
+            # Delay too large; signal arrives after the buffer ends
+            self.log.warning(
+                'Sonar delay too large: %.1f ms exceeds %.1f ms buffer',
+                total_delay_sec*1000, total_buffer_length/sample_rate*1000)
+        elif (delay_samples + signal_length <= total_buffer_length):
+            delayed_signal[delay_samples:
+                           delay_samples + signal_length] = attenuated_signal
+        else:
+            samples_to_copy = total_buffer_length - delay_samples
+            delayed_signal[delay_samples:total_buffer_length] = (
+                attenuated_signal[:samples_to_copy])
+
+        # Additive complex Gaussian ambient noise at fixed noise level
+        target_nl_db = 170.0
+        target_noise_power_linear = 10**(target_nl_db / 10.0)
+        noise_std_dev = np.sqrt(target_noise_power_linear)
+        noise_signal = noise_std_dev * (
+            np.random.normal(0, 1, total_buffer_length) +
+            1j * np.random.normal(0, 1, total_buffer_length)) / np.sqrt(2)
+
+        signal_with_noise = delayed_signal + noise_signal
+
+        return signal_with_noise, delay_samples
+
     #--------------------------------------------------------------------------
     def _simulateMuNet(self, simData:NPFltArr)->None:
         """

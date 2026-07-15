@@ -93,9 +93,12 @@ from typing import Dict, KeysView, List, Optional, Tuple, Union
 from numpy.typing import NDArray
 from collections.abc import Generator
 from dataclasses import dataclass
+import os
+from pathlib import Path
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+from scipy.optimize import minimize_scalar
 from munetauvsim.guidance import Waypoint
 from munetauvsim import logger
 
@@ -738,7 +741,10 @@ class Ocean:
                                     **kwargs)
         else:
             self.pollution = None
-    
+
+        # Acoustic channel instance
+        self.channel = Channel(w=10, s=0.5)
+
     ## Properties ============================================================#
     @property
     def N(self)->int:
@@ -6888,6 +6894,19 @@ class Pollution:
         self.oceanOrigin = oceanOrigin
         self.oceanDepth = oceanDepth
 
+        # Dispersion coefficients: sigma = coeff * |x|^exp. Configurable so
+        # scenarios can select plume spreading rates (e.g. the legacy
+        # source-seeking scenario uses sigma_z_coeff = 0.055, which pushes
+        # the surface concentration maximum kilometers downwind).
+        self.sigma_y_coeff = 1.36
+        self.sigma_y_exp = 0.82
+        self.sigma_z_coeff = 0.275
+        self.sigma_z_exp = 0.69
+
+        # Discrete concentration levels for source-seeking guidance (SUSD).
+        # 0 disables level mapping; set > 0 (e.g. 100) to enable.
+        self.num_levels = 0
+
     ## Properties ============================================================#
     @property
     def u(self) -> float:
@@ -6987,8 +7006,8 @@ class Pollution:
         He = self.z_s + delta_h
 
         # Calculate dispersion coefficients
-        sigma_y = 1.36 * np.abs(x_rot)**0.82
-        sigma_z = 0.275 * np.abs(x_rot)**0.69
+        sigma_y = self.sigma_y_coeff * np.abs(x_rot)**self.sigma_y_exp
+        sigma_z = self.sigma_z_coeff * np.abs(x_rot)**self.sigma_z_exp
 
         # Calculate concentration
         coeff = self.Q / (2 * np.pi * self.u * sigma_y * sigma_z)
@@ -7035,8 +7054,162 @@ class Pollution:
             f"{' Seed:':{cw}} {self.seed}\n"
         )
     
+    ## Concentration Levels (SUSD source-seeking support) ====================#
+    def _ensureConcReference(self) -> None:
+        """
+        Lazily compute and cache the reference concentrations used to normalize
+        raw plume values into discrete levels.
+
+        Caches ``self._sourceConc`` (peak concentration along the downwind
+        centerline, z = 0) and ``self._minConc`` (background concentration far
+        downwind). Computed once, then reused. Cleared implicitly only by
+        constructing a new Pollution instance.
+        """
+        if ('_sourceConc' in self.__dict__):
+            return
+
+        # Peak concentration: the field maximum on the z = 0 slice.
+        self._sourceConc = self._get_raw_concentration(self.source_pos)
+
+        # Background floor: a point well downwind of the domain.
+        span = max(float(self.oceanSize), 1.0)
+        far_x = self.x_s + 4.0 * span * np.cos(self.v)
+        far_y = self.y_s + 4.0 * span * np.sin(self.v)
+        self._minConc = float(self(far_x, far_y, 0.0))
+
+    def _get_raw_concentration(self, position) -> float:
+        """
+        Raw Gaussian-plume concentration (g/m^3) at a horizontal position,
+        evaluated on the z = 0 slice (the 2-D field used for source seeking).
+
+        Parameters
+        ----------
+        position : sequence of float
+            Horizontal position ``[x, y]`` (further elements ignored).
+        """
+        return float(self(position[0], position[1], 0.0))
+
+    @property
+    def source_pos(self) -> Tuple[float, float]:
+        """
+        (x, y) position of the actual concentration maximum on the z = 0
+        slice -- the effective target of source-seeking guidance.
+
+        For a Gaussian plume observed away from the release depth, the
+        measurable maximum lies downwind of the nominal release point
+        (x_s, y_s): at the source itself the plume has not yet dispersed to
+        the observation plane. Source-seeking swarms therefore converge on
+        this field maximum, and arrival checks (see
+        Simulator.loadSonarSchedule stopAtSourceRadius) measure against it.
+
+        Computed lazily by sampling the downwind centerline (where the
+        maximum lies by lateral symmetry) and cached; construct a new
+        Pollution instance after changing plume parameters.
+        """
+        if ('_source_pos' not in self.__dict__):
+            span = max(float(self.oceanSize), 1.0)
+            d = np.linspace(self._R_MIN, span, 2000)
+            cx = self.x_s + d * np.cos(self.v)
+            cy = self.y_s + d * np.sin(self.v)
+            centerline = self(cx, cy, 0.0)
+            k = int(np.argmax(centerline))
+            self._source_pos = (float(cx[k]), float(cy[k]))
+        return self._source_pos
+
+    def calculate_concentration(self, position) -> float:
+        """
+        Map the raw plume concentration at ``position`` onto a discrete level
+        in ``[0, num_levels]`` for the SUSD source-seeking guidance law.
+
+        Linearly normalizes between a background floor (``_minConc``) and
+        twice the peak field concentration (``2 * _sourceConc``), rounded to
+        0.1 increments -- matching the legacy source-seeking level mapping,
+        under which the level observed at the field maximum is about half of
+        ``num_levels``. Returns ``0.0`` when ``num_levels`` is not
+        configured (``<= 0``).
+
+        Parameters
+        ----------
+        position : sequence of float
+            Horizontal position ``[x, y]``.
+
+        Returns
+        -------
+        float
+            Concentration level in ``[0, num_levels]``.
+        """
+        if (self.num_levels <= 0):
+            return 0.0
+
+        self._ensureConcReference()
+        raw = self._get_raw_concentration(position)
+        ref = 2.0 * self._sourceConc
+
+        if (raw <= self._minConc):
+            return 0.0
+        if (raw >= ref):
+            return float(self.num_levels)
+
+        norm = (raw - self._minConc) / (ref - self._minConc)
+        return round(norm * self.num_levels, 1)
+
+    def save_concentration_field(self,
+                                 res:int = 100,
+                                 size:Optional[float] = None,
+                                 save_path:Optional[str] = None,
+                                 z:float = 0.0,
+                                 ) -> Optional[str]:
+        """
+        Sample the concentration field on a regular grid and save it to a
+        compressed ``.npz`` file.
+
+        Parameters
+        ----------
+        res : int, default=100
+            Number of grid points per axis.
+        size : float, optional
+            Side length of the sampled square domain (defaults to
+            ``self.oceanSize``).
+        save_path : str, optional
+            Output path. ``.npz`` is appended if missing. Parent directories
+            are created. If ``None``, nothing is written.
+        z : float, default=0.0
+            Depth slice to sample (surface by default).
+
+        Returns
+        -------
+        str or None
+            The path written, or ``None`` if no ``save_path`` was given.
+
+        Notes
+        -----
+        Saved keys: ``X``, ``Y``, ``C`` (all ``res`` x ``res``), plus the 1-D
+        ``x_coords`` and ``y_coords`` axes.
+        """
+        if (size is None):
+            size = self.oceanSize
+
+        coords = np.linspace(0.0, float(size), int(res))
+        X, Y = np.meshgrid(coords, coords)
+        C = self(X, Y, z)
+
+        if (save_path is None):
+            return None
+
+        save_path = str(save_path)
+        if (not save_path.endswith('.npz')):
+            save_path += '.npz'
+        directory = os.path.dirname(save_path)
+        if (directory):
+            os.makedirs(directory, exist_ok=True)
+
+        np.savez_compressed(save_path, X=X, Y=Y, C=C,
+                            x_coords=coords, y_coords=coords)
+        log.info("Saved concentration field (%dx%d) to %s", res, res, save_path)
+        return save_path
+
     ## Methods ===============================================================#
-    def get2D(self, 
+    def get2D(self,
               x:Optional[List[float]] = None,
               y:Optional[List[float]] = None,
               z:Optional[float] = None,
@@ -7331,3 +7504,1201 @@ class Pollution:
         plt.savefig('pollution_concentration_3D.png', bbox_inches='tight')
 
 ###############################################################################
+class Channel:
+    """
+    Underwater acoustic channel model for signal propagation effects.
+
+    Encapsulates Thorp's model for frequency-dependent acoustic absorption
+    and an empirical ambient noise power spectral density model. Used by the
+    Simulator to apply attenuation and delay to inter-vehicle sonar
+    transmissions (see Simulator._apply_channel_effects).
+
+
+    Parameters
+    ----------
+    w : float
+        Wind speed in m/s (ambient noise model input).
+    s : float
+        Shipping activity factor in [0, 1] (ambient noise model input).
+
+
+    Attributes
+    ----------
+    f : float
+        Default carrier frequency in Hz used for absorption calculations.
+    """
+
+    def __init__(self, w:float=10, s:float=0.5):
+        self.w = w          # wind speed (m/s)
+        self.s = s          # shipping activity factor (0 to 1)
+        self.f = 2.4e4      # carrier frequency (Hz)
+
+    #--------------------------------------------------------------------------
+    def thorp_model(self,
+                    freq_hertz:float,
+                    range_vec:NPFltArr,
+                    spreadingfactor:float=2,
+                    )->Tuple[NPFltArr,float]:
+        """
+        Acoustic transmission loss over multiple ranges using Thorp's model.
+
+
+        Parameters
+        ----------
+        freq_hertz : float
+            Acoustic frequency in Hz.
+        range_vec : ndarray
+            Ranges in meters.
+        spreadingfactor : float
+            Spreading factor between 1 (cylindrical) and 2 (spherical).
+
+
+        Returns
+        -------
+        tl_db : ndarray
+            Transmission loss in dB for each range.
+        absorption_dB : float
+            Absorption coefficient in dB/km.
+        """
+
+        tl_db = np.zeros(len(range_vec))
+
+        # Absorption coefficient (dB/km), Thorp's formula
+        freq_khz = freq_hertz / 1000
+        absorption_dB = (0.11 * freq_khz**2 / (1 + freq_khz**2) +
+                         44 * freq_khz**2 / (4100 + freq_khz**2) +
+                         2.75 * freq_khz**2 / 10**4 + 0.003)
+
+        for i, range_m in enumerate(range_vec):
+            if (range_m <= 0):
+                tl_db[i] = -np.inf
+            else:
+                tl_db[i] = (spreadingfactor * 10 * np.log10(range_m) +
+                            (range_m/1000) * absorption_dB)
+
+        return tl_db, absorption_dB
+
+    #--------------------------------------------------------------------------
+    def thorp_absorption_loss(self, freq_hertz:float, range_m:float)->float:
+        """
+        Acoustic absorption loss in dB at one frequency and range.
+
+
+        Parameters
+        ----------
+        freq_hertz : float
+            Acoustic frequency in Hz.
+        range_m : float
+            Range in meters.
+
+
+        Returns
+        -------
+        float
+            Absorption loss in dB (positive number).
+        """
+
+        if (range_m <= 0):
+            return np.inf
+
+        freq_khz = freq_hertz / 1000
+        absorption_coefficient_db_per_km = (
+            0.11 * freq_khz**2 / (1 + freq_khz**2) +
+            44 * freq_khz**2 / (4100 + freq_khz**2) +
+            2.75 * freq_khz**2 / 10**4 + 0.003)
+
+        return (range_m / 1000) * absorption_coefficient_db_per_km
+
+    #--------------------------------------------------------------------------
+    def uwnoise_psd(self, f_hertz)->NPFltArr:
+        """
+        Ambient noise power spectral density for underwater acoustics.
+
+
+        Parameters
+        ----------
+        f_hertz : float or ndarray
+            Frequency in Hz.
+
+
+        Returns
+        -------
+        ndarray
+            Noise power spectral density in dB re micro Pa.
+        """
+
+        f = np.atleast_1d(np.asarray(f_hertz, dtype=float)) / 1000  # kHz
+
+        # Turbulence, shipping, wind, and thermal noise components
+        noise_turb = 17 - 30 * np.log10(f)
+        noise_ship = 40 + 20 * (self.s - 0.5) + 26 * np.log10(f) \
+                     - 60 * np.log10(f + 0.03)
+        noise_wind = 50 + 7.5 * np.sqrt(self.w) + 20 * np.log10(f) \
+                     - 40 * np.log10(f + 0.4)
+        noise_thermal = -15 + 20 * np.log10(f)
+
+        noise_total = 10 * np.log10(10**(noise_turb/10) +
+                                    10**(noise_ship/10) +
+                                    10**(noise_wind/10) +
+                                    10**(noise_thermal/10))
+        return noise_total
+
+###############################################################################
+
+###############################################################################
+
+class Pollution_With_Current:
+    """
+    A class to represent underwater pollution source using a Gaussian plume model.
+
+    Attributes
+    ----------
+    x_s : float
+        x-coordinate of the pollution source
+    y_s : float
+        y-coordinate of the pollution source
+    z_s : float
+        z-coordinate of the pollution source (depth, negative value)
+    Q : float
+        Source strength (emission rate) in g/s
+    u : float
+        Ocean current speed in m/s
+    v : float
+        Ocean current direction in radians
+
+    Methods
+    -------
+    __call__(x, y, z)
+        Calculate the concentration at given (x, y, z) coordinates
+    display2D(size, resolution)
+        Display 2D image of pollution concentration.
+    display3D(size, resolution)
+        Display 3D representation of pollution concentration.
+
+    Notes
+    -----
+    - Q is the source strength (emission rate)
+    - u is the ocean current speed
+    - σy and σz are the dispersion coefficients
+    - He is the effective release height
+    - hs is the source depth, same as z_s
+
+    The underwater pollution plume is simulated using a Gaussian plume model with
+    spatially varying ocean currents. Assuming current along the x-axis, the 
+    pollutant concentration C at any point (x, y, z) is given by:
+
+        C(x, y, z) = (Q / (2πuσyσz)) * exp(-y²/(2σy²)) * 
+                     [exp(-(z-He)²/(2σz²)) + exp(-(z+He)²/(2σz²))]
+             
+    Where:
+    - He = hs + Δh(x)                   is the effective release height
+    - Δh(x) = 2.126 × 10⁻⁴ · x^(2/3)    is the plume elevation
+    - σy = 1.36 · |x|^0.82              is the horizontal dispersion coefficient
+    - σz = 0.055 · |x|^0.69             is the vertical dispersion coefficient
+
+    Ocean Current Model:
+    - Current direction varies spatially in a wave-like pattern
+    - Current speed varies along the flow direction
+    - Models realistic oceanic turbulence and eddy effects
+    
+    //GQ 09/2024, JPC 11/2024, Updated 02/2026
+    """
+
+    ## Class Constants =======================================================#
+    _U_MIN = 0.1                      # Minimum ocean current speed in m/s
+    _U_MAX = 3.0                      # Maximum ocean current speed in m/s
+    _V_MIN = 0                        # Minimum current direction in radians
+    _V_MAX = 2 * np.pi                # Maximum current direction in radians
+    _R_MIN = 1e-6                     # Minimum source distance for dispersion
+
+    ## Constructor ===========================================================#
+    def __init__(self,
+                 source:Union[NPFltArr,List[float]] = [0, 0, 30],
+                 Q:float=1.59,
+                 u:Number=1.5,
+                 v:Number=np.pi/5,
+                 random:bool=False,
+                 randomU:Union[bool, List[float]]=False,
+                 randomV:Union[bool, List[float]]=False,
+                 oceanSize:int = 1000,
+                 oceanOrigin:List[float] = [500, 500],
+                 oceanDepth:float = 125,
+                 **kwargs,
+                 ):
+        """
+        Initialize the Pollution source with given parameters.
+
+        Parameters
+        ----------
+        source : list[float], optional
+            Coordinates of the pollution source (default is [0, 0, 30]). Input
+            value of z is positive, representing depth below surface, but it is
+            stored and used as a negative value.
+        Q : float, optional
+            Source strength (emission rate) in g/s (default is 1.59)
+        u : float, optional
+            Ocean current speed in m/s (default is 1.5)
+        v : float, optional
+            Ocean current direction in radians (default is π/5)
+        random : bool, optional
+            Set to True to generate random current speed and direction from default
+            limits (default is False)
+        randomU : Union[bool, list[float]], optional
+            Set to True to generate random current speed from default limits, or
+            provide a list of [min, max] values (default is False)
+        randomV : Union[bool, list[float]], optional
+            Set to True to generate random current direction from default limits,
+            or provide a list of [min, max] values (default is False)
+        oceanSize : int, optional
+            Size of the ocean floor area (default is 1000)
+        oceanOrigin : list[float], optional
+            Coordinates of origin in the ocean floor array (default is
+            [500,500])
+        oceanDepth : float, optional
+            Depth of the ocean floor (default is 125)
+        """
+
+        self.x_s = source[0]
+        self.y_s = source[1]
+        self.z_s = -abs(source[2])
+        self.Q = Q
+        self.bc = 1e-6 # background concentration
+
+        # Set ocean current speed
+        if ((random) or (randomU is True)):
+            self.u = np.random.uniform(self._U_MIN, self._U_MAX)
+        if (isinstance(randomU, list)):
+            self.u = np.random.uniform(randomU[0], randomU[1])
+        if ('_u' not in self.__dict__):
+            self.u = u
+
+        # Set ocean current direction
+        if ((random) or (randomV is True)):
+            self.v = np.random.uniform(self._V_MIN, self._V_MAX)
+        if (isinstance(randomV, list)):
+            self.v = np.random.uniform(randomV[0], randomV[1])
+        if ('_v' not in self.__dict__):
+            self.v = v
+
+        self.oceanSize = oceanSize
+        self.oceanOrigin = oceanOrigin
+        self.oceanDepth = oceanDepth
+        
+        self.phase_u = -np.pi
+        self.phase_v1 = np.pi
+        self.phase_v2 = -np.pi / 8
+
+        # self.phase_u = np.random.uniform(-np.pi, np.pi)
+        # self.phase_v1 = np.random.uniform(-np.pi, np.pi)
+        # self.phase_v2 = np.random.uniform(-np.pi, np.pi)
+
+        self.num_levels = 0
+        self.x_max = self._find_max_concentration_distance()
+        
+        # Calculate pollution source position accounting for current curvature
+        # Use same parameters as real-time plot for consistency
+        self.source_pos = self._find_max_concentration_position(
+            perturb=False, 
+            sigma_v=np.deg2rad(5), 
+            wave_length=10000.0
+        )
+        
+        self.source_conc = self._get_raw_concentration(self.source_pos)
+        self.min_conc = self._get_raw_concentration((40000,20000))
+
+    ## Properties =============================================================#
+    @property
+    def u(self) -> float:
+        """Ocean current speed in m/s"""
+        return self._u
+    
+    @u.setter
+    def u(self, u:float) -> None:
+        """Set ocean current speed with bounds check"""
+        u_clip = np.clip(u, self._U_MIN, self._U_MAX)
+        if (u != u_clip):
+            warnings.warn(
+                f"Current speed out of bounds, clipping to {u_clip:.2f} m/s")
+        self._u = u_clip
+
+    #. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 
+    @property
+    def v(self) -> float:
+        """Ocean current direction in radians"""
+        return self._v
+    
+    @v.setter
+    def v(self, v:float) -> None:
+        """Set ocean current direction with bounds check"""
+        v_norm = v % (2 * np.pi)
+        v_clip = np.clip(v_norm, self._V_MIN, self._V_MAX)
+        if (v != v_clip):
+            warnings.warn(
+                f"Current direction out of bounds, clipping to {v_clip:.2f} radians")
+        self._v = v_clip
+    
+    ## Special Methods =======================================================#
+    def __call__(self, 
+                 x: Union[Number, NPFltArr], 
+                 y: Union[Number, NPFltArr], 
+                 z: Union[Number, NPFltArr],
+                 *,
+                 perturb: bool = False,
+                 sigma_u_rel: float = 0.10,
+                 sigma_v: float = np.deg2rad(5),
+                 wave_length: float = 10000.0,
+                 sigma_c_rel: float = 0.10,
+                 return_current: bool = False,
+                 currentDirection: str = "to",
+                 current_iter: int = 3
+                 ) -> Union[NPFltArr, Tuple[NPFltArr, NPFltArr, NPFltArr]]:
+        """
+        Return the concentration at given (x, y, z) coordinates.
+
+        Parameters
+        ----------
+        x : float or array
+            x-coordinate of the point(s)
+        y : float or array
+            y-coordinate of the point(s)
+        z : float or array
+            z-coordinate of the point(s)
+        perturb : bool, optional
+            Whether to apply spatial modulation to dispersion coefficients (default False)
+            Note: Ocean current curvature is always applied based on sigma_v and wave_length
+        sigma_u_rel : float, optional
+            Relative current speed variation amplitude (default 0.10 = 10%)
+        sigma_v : float, optional
+            Ocean current direction curvature amplitude in radians (default 5 degrees)
+            Set to 0 for straight current field
+        wave_length : float, optional
+            Spatial scale of current curvature in meters (default 10000)
+            Represents the wavelength of meandering ocean currents
+        sigma_c_rel : float, optional
+            Deprecated parameter, no longer used (kept for backward compatibility)
+
+        Returns
+        -------
+        NPFltArr
+            Concentration values at the given coordinates
+        """
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        z = np.asarray(z, dtype=float)
+
+        # Coordinates relative to the pollution source
+        x = x - self.x_s
+        y = y - self.y_s
+
+        u_base = float(self.u)
+        v_base = float(self.v)
+
+        phase_u = -np.pi
+        phase_v1 = np.pi
+        phase_v2 = -np.pi / 8
+
+        # phase_u = self.phase_u
+        # phase_v1 = self.phase_v1
+        # phase_v2 = self.phase_v2
+
+        def rot_xy(xx, yy, ang):
+            xr = xx * np.cos(ang) + yy * np.sin(ang)
+            yr = -xx * np.sin(ang) + yy * np.cos(ang)
+            return xr, yr
+
+        # --- CURRENT FIELD (fixed-point refinement) ---
+        v_eff = np.full_like(x, v_base, dtype=float)
+        for _ in range(max(1, int(current_iter))):
+            x1, y1 = rot_xy(x, y, v_eff)
+            v_var_main = sigma_v * np.sin(2 * np.pi * x1 / wave_length + phase_v1)
+            v_var_cross = 0.3 * sigma_v * np.sin(2 * np.pi * y1 / (wave_length * 2) + phase_v2)
+            v_eff = v_base + (v_var_main + v_var_cross)
+
+        x_rot, y_rot = rot_xy(x, y, v_eff)
+
+        u_variation = sigma_u_rel * np.sin(2 * np.pi * x_rot / wave_length + phase_u)
+        u_eff = u_base * (1.0 + u_variation)
+        u_eff = np.clip(u_eff, self._U_MIN, self._U_MAX)
+
+        # Avoid divide by zero errors near source
+        x_rot = np.where(np.abs(x_rot) < self._R_MIN,
+                         np.sign(x_rot) * self._R_MIN + self._R_MIN,
+                         x_rot)
+
+        # Calculate effective release height
+        delta_h = 2.126e-4 * np.abs(x_rot)**(2/3)
+        He = self.z_s + delta_h
+
+        # Calculate dispersion coefficients
+        sigma_y = 1.36 * np.abs(x_rot)**0.82
+        sigma_z = 0.055 * np.abs(x_rot)**0.69
+        
+        if perturb:
+            phase_sy = 0
+            phase_sz = 0
+
+            sigma_y_mod = 1.0 + 0.12 * np.sin(2*np.pi * x_rot / (wave_length * 0.8) + phase_sy)
+            sigma_y = sigma_y * sigma_y_mod
+
+            sigma_z_mod = 1.0 + 0.08 * np.sin(2*np.pi * x_rot / (wave_length * 1.2) + phase_sz)
+            sigma_z = sigma_z * sigma_z_mod
+
+        # Calculate concentration
+        coeff = self.Q / (2 * np.pi * u_eff * sigma_y * sigma_z)
+        exp_y = np.exp(-y_rot**2 / (2 * sigma_y**2))
+        exp_z = np.exp(-(z - He)**2 / (2 * sigma_z**2)) + np.exp(-(z + He)**2 / (2 * sigma_z**2))
+        
+        # Set concentration to background for opposite direction of current
+        concentration = np.where(x_rot >= 0, coeff * exp_y * exp_z + self.bc, self.bc)
+
+        # Set ocean surface and floor as boundaries
+        concentration = np.where((z > 0) | (z < -abs(self.oceanDepth)),
+                                 self.bc, concentration)
+
+        # --- CURRENT VECTORS (tangent alignment) ---
+        k = 2 * np.pi / wave_length
+        dv_dxr = sigma_v * k * np.cos(k * x_rot + phase_v1)
+        t_xr = 1.0 - y_rot * dv_dxr
+        t_yr = x_rot * dv_dxr
+        norm = np.sqrt(t_xr**2 + t_yr**2)
+        norm = np.where(norm < 1e-12, 1.0, norm)
+        dir_x = (t_xr * np.cos(v_eff) - t_yr * np.sin(v_eff)) / norm
+        dir_y = (t_xr * np.sin(v_eff) + t_yr * np.cos(v_eff)) / norm
+        u_x = u_eff * dir_x
+        u_y = u_eff * dir_y
+
+        if currentDirection.lower() == "from":
+            u_x = -u_x
+            u_y = -u_y
+
+        if return_current:
+            return concentration, u_x, u_y
+        return concentration
+    #--------------------------------------------------------------------------
+    def __repr__(self) -> str:
+        """Detailed description of Pollution"""
+        fmt = '.2f'
+        return (
+            f"{self.__class__.__name__}("
+            f"x={self.x_s:{fmt}}, "
+            f"y={self.y_s:{fmt}}, "
+            f"z={abs(self.z_s):{fmt}}, "
+            f"Q={self.Q:{fmt}}, "
+            f"u={self.u:{fmt}}, "
+            f"v={self.v:{fmt}})"
+        )
+    
+    #--------------------------------------------------------------------------
+    def __str__(self) -> str:
+        """User friendly description of Pollution"""
+        fmt = '.2f'
+        cw = 14
+        return (
+            f"Underwater Pollution Source\n"
+            f"{' Location:':{cw}} ({self.x_s:{fmt}}, {self.y_s:{fmt}}, "
+            f"{abs(self.z_s):{fmt}} m depth)\n"
+            f"{' Strength:':{cw}} {self.Q:{fmt}} g/s\n"
+            f"{' Current:':{cw}} {self.u:{fmt}} m/s at {np.degrees(self.v):{fmt}}°\n"
+        )
+    
+    ## Methods ================================================================#
+    def get2D(self, 
+              x:Optional[List[float]] = None,
+              y:Optional[List[float]] = None,
+              z:Optional[float] = None,
+              size:Optional[int] = None,
+              perturb:bool = False,
+              sigma_u_rel:float = 0.10,
+              sigma_v:float = np.deg2rad(20),
+              wave_length:float = 300.0,
+              sigma_c_rel:float = 0.10
+              )->Tuple[NPFltArr, NPFltArr, NPFltArr]:
+        """
+        Return a 2D array of pollution concentration at a given depth, and the
+        X,Y meshgrids for coordinates.
+
+        Parameters
+        ----------
+        x : list[float], optional
+            List of [min, max] x-coordinates to determine the area to display
+        y : list[float], optional
+            List of [min, max] y-coordinates to determine the area to display
+        z : float, optional
+            Depth at which to display the concentration (default is 20 m above
+            source)
+        size : int, optional
+            Size of the area to display (default is oceanSize). Only used if x
+            and y are not provided.
+        perturb : bool, optional
+            Whether to apply spatial modulation to dispersion coefficients (default False)
+            Note: Ocean current curvature is always applied
+        sigma_u_rel : float, optional
+            Relative current speed variation amplitude (default 0.10)
+        sigma_v : float, optional
+            Ocean current direction curvature amplitude in radians (default 20 degrees)
+            Set to 0 for straight current
+        wave_length : float, optional
+            Spatial scale of current curvature in meters (default 300)
+        sigma_c_rel : float, optional
+            Deprecated parameter, no longer used (kept for backward compatibility)
+        
+        
+        //JPC 11/2024
+        """
+
+        if ((x is None) or (y is None)):
+            size = self.oceanSize if (size is None) else size
+            o = self.oceanOrigin
+            x = [-o[0], size - o[0]]
+            y = [-o[1], size - o[1]]
+
+        x_l = np.linspace(x[0], x[1], x[1] - x[0])
+        y_l = np.linspace(y[0], y[1], y[1] - y[0])
+
+        dz = 20
+        z = self.z_s + dz if (z is None) else -abs(z)
+        X, Y = np.meshgrid(x_l, y_l)
+
+        return self(X, Y, z, perturb=perturb, sigma_u_rel=sigma_u_rel,
+                    sigma_v=sigma_v, wave_length=wave_length,
+                    sigma_c_rel=sigma_c_rel), X, Y
+
+    #-------------------------------------------------------------------------#
+    def get3D(self, 
+              x:Optional[List[float]] = None,
+              y:Optional[List[float]] = None,
+              z:Optional[List[float]] = None,
+              size:Optional[int] = None,
+              )->Tuple[NPFltArr, NPFltArr, NPFltArr, NPFltArr]:
+        """
+        Return a 3D array of pollution concentration, and the X, Y, and Z
+        meshgrids for coordinates.
+        
+        Parameters
+        ----------
+        x : list[float], optional
+            List of [min, max] x-coordinates to determine the area to display.
+        y : list[float], optional
+            List of [min, max] y-coordinates to determine the area to display.
+        z : list[float], optional
+            List of [min, max] z-coordinates to determine the area to display
+            (default is full depth of ocean)
+        size : int, optional
+            Size of the area to display (default is oceanSize). Only used if x
+            and y are not provided.
+
+        NOTE: This method can easily crash if the area is too large. My system
+        hit it's limit once the arrays reached (1000,1000,70) -- with 4 of these
+        the total data points exceeded ~250E6. Your mileage may vary. But I will
+        keep this method since it can still be used with a smaller area, which
+        may be still be useful for caching maps in local regions. (The intent
+        here, and the reason a resolution parameter isn't used, is to lay the
+        groundwork for a method of sampling the pollution concentration that
+        avoids running the calculations each time.)
+
+        TODO: Check stability if return x,y,z boundary arrays instead of mesh
+        
+
+        //JPC 11/2024
+        """
+
+        if ((x is None) or (y is None)):
+            size = self.oceanSize if (size is None) else size
+            o = self.oceanOrigin
+            x = [-o[0], size - o[0]]
+            y = [-o[1], size - o[1]]
+
+        if (z is None):
+            z = [-self.oceanDepth, 0]
+
+        x_l = np.linspace(x[0], x[1], x[1] - x[0])
+        y_l = np.linspace(y[0], y[1], y[1] - y[0])
+        z_l = np.linspace(z[0], z[1], z[1] - z[0])
+        X, Y, Z = np.meshgrid(x_l, y_l, z_l)
+
+        return self(X, Y, Z), X, Y, Z
+
+    #-------------------------------------------------------------------------#
+    def automesh(self, 
+                 size:Optional[int] = None, 
+                 res:int = 100, 
+                 center:bool = False,
+                 is3d:bool = False,
+                 perturb:bool = True,
+                 sigma_u_rel:float = 0.10,
+                 sigma_v:float = np.deg2rad(20),
+                 wave_length:float = 10000.0,
+                 sigma_c_rel:float = 0.10,
+                 save_mesh:bool = False,
+                 save_path:Optional[str] = None
+                 )->Union[Tuple[NPFltArr, NPFltArr], 
+                          Tuple[NPFltArr, NPFltArr, NPFltArr]]:
+        """
+        Return X, Y, and Z meshgrid arrays around pollution distribution.
+        
+        Parameters
+        ----------
+        size : int, optional
+            Size of the area to display (default is oceanSize)
+        res : int, optional
+            Number of points to sample in each dimension (default is 100)
+        center : bool, optional
+            Set to True to put the pollution source at the center of the area.
+            Otherwise the source is near the edge and the area is centered around
+            the plume.
+        is3d : bool, optional
+            Set to True to return a 3D meshgrid (default is False)
+        perturb : bool, optional
+            Whether to apply spatial modulation to dispersion coefficients (default True)
+            Note: Ocean current curvature is always applied based on sigma_v and wave_length
+        sigma_u_rel : float, optional
+            Relative current speed variation amplitude (default 0.10 = 10%)
+        sigma_v : float, optional
+            Ocean current direction curvature amplitude in radians (default 20 degrees)
+            Set to 0 for straight current field
+        wave_length : float, optional
+            Spatial scale of current curvature in meters (default 10000)
+            Represents the wavelength of meandering ocean currents
+        sigma_c_rel : float, optional
+            Deprecated parameter, no longer used (kept for backward compatibility)
+        save_mesh : bool, optional
+            Whether to save the 2D meshgrid data to file (default False)
+            Only saves when is3d=False
+        save_path : str, optional
+            Path to save the meshgrid data (default None, auto-generates filename)
+            Saves as .npz file (numpy compressed format)
+
+            
+        //JPC 11/2024, Updated 02/2026
+        """
+
+        size = self.oceanSize if (size is None) else size
+        half = size/2
+
+        if (center):
+            x = np.linspace(self.x_s - half, self.x_s + half, res)
+            y = np.linspace(self.y_s - half, self.y_s + half, res)
+        else:
+            o = 0.05                        # source offset from edge
+            x_w = np.cos(self.v)            # weight in x based on current direction
+            y_w = np.sin(self.v)            # weight in y based on current direction
+            x_s = size * (1-2*o) * x_w/2    # center shift in x
+            y_s = size * (1-2*o) * y_w/2    # center shift in y
+            
+            x = np.linspace(self.x_s + x_s - half, self.x_s + x_s + half, res)
+            y = np.linspace(self.y_s + y_s - half, self.y_s + y_s + half, res)
+        
+        if (is3d):
+            z = np.linspace(self.z_s-5, 0, res)
+            return np.meshgrid(x, y, z)
+        
+        # Generate 2D meshgrid
+        X, Y = np.meshgrid(x, y)
+        
+        # Save meshgrid data if requested
+        if save_mesh:
+            import datetime
+            from pathlib import Path
+            
+            # Generate filename if not provided
+            if save_path is None:
+                timestamp = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
+                save_path = f"meshgrid_2D_{res}x{res}_{timestamp}.npz"
+            
+            # Ensure .npz extension
+            save_path = Path(save_path)
+            if save_path.suffix != '.npz':
+                save_path = save_path.with_suffix('.npz')
+            
+            # Create parent directory if needed
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Save data
+            np.savez_compressed(
+                save_path,
+                X=X,
+                Y=Y,
+                x_coords=x,
+                y_coords=y,
+                metadata=np.array([
+                    size, res, self.x_s, self.y_s, self.z_s,
+                    self.u, self.v, self.oceanSize
+                ]),
+                metadata_labels=['size', 'resolution', 'x_s', 'y_s', 'z_s',
+                               'current_speed', 'current_direction', 'oceanSize']
+            )
+            print(f"2D meshgrid data saved to: {save_path}")
+        
+        return X, Y
+    
+    def save_concentration_field(self,
+                                 size:Optional[int] = None,
+                                 res:int = 100,
+                                 perturb:bool = False,
+                                 sigma_u_rel:float = 0.10,
+                                 sigma_v:float = np.deg2rad(5),
+                                 wave_length:float = 10000.0,
+                                 save_path:Optional[str] = None
+                                 )->str:
+        """
+        Calculate and save 2D concentration field data.
+        Grid range: from (0, 0) to (size, size)
+        
+        Parameters
+        ----------
+        size : int, optional
+            Size of the area in meters (default is oceanSize)
+            Grid will span from (0, 0) to (size, size)
+        res : int, optional
+            Resolution - number of points in each dimension (default 100)
+        perturb : bool, optional
+            Apply spatial modulation to dispersion (default False)
+        sigma_u_rel : float, optional
+            Current speed variation amplitude (default 0.10)
+        sigma_v : float, optional
+            Current direction curvature amplitude (default 5 degrees)
+        wave_length : float, optional
+            Spatial scale of current curvature (default 10000 m)
+        save_path : str, optional
+            Path to save the data (default auto-generates filename)
+        
+        Returns
+        -------
+        str
+            Path where the data was saved
+        
+        Example
+        -------
+        >>> filepath = pollution.save_concentration_field(size=14000, res=200, perturb=False)
+        >>> # Grid will span from (0,0) to (14000,14000)
+        >>> # Later load and use:
+        >>> data = Pollution.load_meshgrid(filepath)
+        
+        //Added 02/2026
+        """
+        import datetime
+        from pathlib import Path
+        
+        # Generate simple meshgrid from 0 to size (not centered on source)
+        size = self.oceanSize if size is None else size
+        x = np.linspace(0, size, res)
+        y = np.linspace(0, size, res)
+        X, Y = np.meshgrid(x, y)
+        
+        # Calculate concentration at surface (z=0)
+        Z = np.zeros_like(X)
+        C = self(X, Y, Z, perturb=perturb, sigma_u_rel=sigma_u_rel,
+                sigma_v=sigma_v, wave_length=wave_length)
+        
+        # Generate filename if not provided
+        if save_path is None:
+            timestamp = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
+            save_path = f"concentration_field_{res}x{res}_{timestamp}.npz"
+        
+        # Ensure .npz extension
+        save_path = Path(save_path)
+        if save_path.suffix != '.npz':
+            save_path = save_path.with_suffix('.npz')
+        
+        # Create parent directory if needed
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save data
+        np.savez_compressed(
+            save_path,
+            X=X,
+            Y=Y,
+            C=C,
+            x_coords=X[0, :],
+            y_coords=Y[:, 0],
+            metadata=np.array([
+                size,
+                res,
+                self.x_s,
+                self.y_s,
+                self.z_s,
+                self.u,
+                self.v,
+                self.Q,
+                self.bc,
+                sigma_u_rel,
+                sigma_v,
+                wave_length
+            ]),
+            metadata_labels=np.array([
+                'size', 'resolution', 'x_s', 'y_s', 'z_s',
+                'current_speed', 'current_direction', 'emission_rate',
+                'background_concentration', 'sigma_u_rel', 'sigma_v', 'wave_length'
+            ])
+        )
+        
+        print(f"2D concentration field saved to: {save_path}")
+        print(f"  Grid range: X ∈ [0, {size}] m, Y ∈ [0, {size}] m")
+        print(f"  Grid points: {res} × {res} = {res*res} total points")
+        print(f"  Concentration range: [{C.min():.6e}, {C.max():.6e}] g/m³")
+        print(f"  File size: {save_path.stat().st_size / 1024:.1f} KB")
+        
+        return str(save_path)
+    
+    @staticmethod
+    def load_meshgrid(filepath:str) -> dict:
+        """
+        Load previously saved 2D meshgrid/concentration field data.
+        
+        Parameters
+        ----------
+        filepath : str
+            Path to the .npz file containing meshgrid data
+        
+        Returns
+        -------
+        dict
+            Dictionary containing:
+            - 'X': X meshgrid array (2D)
+            - 'Y': Y meshgrid array (2D)
+            - 'C': Concentration array (2D, if saved with save_concentration_field)
+            - 'x_coords': 1D x coordinate array
+            - 'y_coords': 1D y coordinate array
+            - 'metadata': Dictionary of metadata values
+        
+        Example
+        -------
+        >>> # Load concentration field
+        >>> data = Pollution.load_meshgrid('concentration_field_100x100.npz')
+        >>> X, Y, C = data['X'], data['Y'], data['C']
+        >>> print(f"Grid size: {X.shape}")
+        >>> print(f"Concentration range: [{C.min():.6e}, {C.max():.6e}]")
+        
+        //Added 02/2026
+        """
+        from pathlib import Path
+        npz_data = np.load(filepath, allow_pickle=True)
+        
+        # Build result dictionary
+        result = {
+            'X': npz_data['X'],
+            'Y': npz_data['Y'],
+            'x_coords': npz_data['x_coords'],
+            'y_coords': npz_data['y_coords'],
+        }
+        
+        # Add concentration if available
+        if 'C' in npz_data:
+            result['C'] = npz_data['C']
+        
+        # Parse metadata
+        if 'metadata' in npz_data and 'metadata_labels' in npz_data:
+            metadata_dict = dict(zip(npz_data['metadata_labels'], npz_data['metadata']))
+            result['metadata'] = metadata_dict
+        else:
+            result['metadata'] = {}
+        
+        print(f"Loaded 2D data from: {Path(filepath).name}")
+        print(f"  Grid shape: {result['X'].shape}")
+        if 'C' in result:
+            print(f"  Concentration range: [{result['C'].min():.6e}, {result['C'].max():.6e}] g/m³")
+        if result['metadata']:
+            print(f"  Metadata: {list(result['metadata'].keys())}")
+        
+        return result
+
+    #-------------------------------------------------------------------------#
+    def display2D(self, 
+                  z:Optional[int] = None,
+                  size:Optional[int] = None,
+                  resolution:int = 250,
+                  fromOcean:bool = False,
+                  perturb:bool = True,
+                  sigma_u_rel:float = 0.10,
+                  sigma_v:float = np.deg2rad(5),
+                  wave_length:float = 10000.0,
+                  sigma_c_rel:float = 0.10,
+                  plot_arrows:int = 20,
+                  currentDirection:str = "to",
+                  current_iter:int = 3,
+                  use_log10:bool = True,
+                  c_floor:float = 1e-12,
+                  )->None:
+        """
+        Display 2D plume with meandering current field and velocity vectors.
+
+        Parameters
+        ----------
+        z : float, optional
+            Depth to plot (default surface).
+        size : int, optional
+            Plot span in meters (default oceanSize).
+        resolution : int, optional
+            Grid points per axis (default 250).
+        fromOcean : bool, optional
+            If True, use get2D() bounds instead of 0..size.
+        perturb, sigma_* : see __call__ for definitions.
+        plot_arrows : int, optional
+            Target number of arrows per axis (smaller -> sparser).
+        currentDirection : {"to","from"}
+            Arrow pointing direction.
+        current_iter : int, optional
+            Iterations for current fixed-point refinement.
+        use_log10 : bool, optional
+            Plot log10 concentration for better dynamic range.
+        c_floor : float, optional
+            Minimum concentration used before log10.
+        """
+
+        # Build meshgrid at surface
+        if (not fromOcean):
+            size = self.oceanSize if (size is None) else size
+            x = np.linspace(0, size, resolution)
+            y = np.linspace(0, size, resolution)
+            X, Y = np.meshgrid(x, y)
+            Z = np.zeros_like(X)  # surface
+        else:
+            C_tmp, X, Y = self.get2D(z=z, perturb=perturb, sigma_u_rel=sigma_u_rel,
+                                     sigma_v=sigma_v, wave_length=wave_length,
+                                     sigma_c_rel=sigma_c_rel)
+            Z = np.zeros_like(C_tmp)
+
+        # Evaluate plume and currents
+        C, U, V = self(X, Y, Z,
+                       perturb=perturb,
+                       sigma_u_rel=sigma_u_rel,
+                       sigma_v=sigma_v,
+                       wave_length=wave_length,
+                       sigma_c_rel=sigma_c_rel,
+                       return_current=True,
+                       currentDirection=currentDirection,
+                       current_iter=current_iter)
+
+        # Prepare concentration for plotting
+        if use_log10:
+            c_floor_eff = max(c_floor, 1e-12)
+            C_plot = np.log10(np.maximum(C, c_floor_eff))
+            label_str = "log10(concentration)"
+        else:
+            C_plot = C
+            label_str = "concentration (g/m³)"
+
+        fig, ax = plt.subplots(figsize=(9, 7))
+
+        cf = ax.contourf(X, Y, C_plot, levels=35, cmap='jet', zorder=2)
+        cbar = fig.colorbar(cf, ax=ax)
+        cbar.set_label(label_str)
+
+        # Arrow sparsity based on actual grid
+        nx, ny = X.shape[1], X.shape[0]
+        step_x = max(1, nx // plot_arrows)
+        step_y = max(1, ny // plot_arrows)
+
+        ax.quiver(X[::step_y, ::step_x],
+                  Y[::step_y, ::step_x],
+                  U[::step_y, ::step_x],
+                  V[::step_y, ::step_x],
+                  angles="xy",
+                  scale_units="xy",
+                  scale=None,
+                  width=0.0025,
+                  color='white',
+                  alpha=0.8,
+                  zorder=3)
+
+        ax.set_title(f"Plume")
+        ax.set_xlabel("X (m)")
+        ax.set_ylabel("Y (m)")
+        ax.set_facecolor('#f0f0f0')
+        ax.set_aspect("equal", adjustable="box")
+
+        # Clamp bounds to requested area
+        if not fromOcean:
+            ax.set_xlim(0, size)
+            ax.set_ylim(0, size)
+
+        plt.tight_layout()
+        plt.show()
+        plt.savefig('pollution_concentration_2D.png', bbox_inches='tight')
+
+    #-------------------------------------------------------------------------#
+    def calculate_concentration(self, position, perturb=False, sigma_u_rel=0.10, 
+                                 sigma_v=np.deg2rad(5), wave_length=10000.0, 
+                                 sigma_c_rel=0.10):
+        """
+        Calculate the concentration level at a given point in 2D.
+
+        Parameters
+        ----------
+        position : tuple[float, float]
+            (x, y) coordinates where the concentration is to be computed.
+        perturb : bool, optional
+            Whether to apply spatial modulation to dispersion coefficients (default False).
+        sigma_u_rel : float, optional
+            Relative amplitude for current speed spatial variation (default 0.10).
+        sigma_v : float, optional
+            Amplitude for spatial current direction curvature (radians, default 5 degrees).
+        wave_length : float, optional
+            Wavelength scale for spatial variation of current (meters, default 10000).
+        sigma_c_rel : float, optional
+            Deprecated parameter, no longer used (kept for backward compatibility).
+        
+        Returns
+        -------
+        float
+            Concentration level from 0.0 to num_levels, in 0.1 increments.
+
+        Notes
+        -----
+        - Returns normalized concentration level, not raw concentration in g/m³.
+        - For raw concentration values, call the instance directly with (x, y, z) coordinates.
+        - Default parameters match those used in display2D and initialization for consistency.
+        """
+        x, y = position
+        z = 0  # Surface depth
+        
+        # Get concentration values
+        num_levels = self.num_levels
+        min_conc = self.min_conc
+        source_conc = self.source_conc * 2
+        
+        # Get raw concentration at requested position using base model (no perturbations for consistency)
+        raw_conc = self._get_raw_concentration((x, y))
+
+
+        # Normalize to levels between 0.0 and num_levels, with 0.1 increments
+        if raw_conc <= min_conc:
+            level = 0.0
+        elif raw_conc >= source_conc:
+            level = float(num_levels)
+        else:
+            # Non-linear mapping: use square to make level changes faster at high concentrations
+            # This makes the system more sensitive/responsive in high concentration regions
+            norm_conc = (raw_conc - min_conc) / (source_conc - min_conc)
+            level = (norm_conc ** 1) * num_levels  # Square for higher sensitivity at high concentrations
+            level = round(level, 1)  # Round to 0.1 increments
+        
+        return level
+    
+    def _get_raw_concentration(self, position, perturb=False, sigma_u_rel=0.10, 
+                             sigma_v=np.deg2rad(5), wave_length=10000.0, 
+                             sigma_c_rel=0.10):
+        """
+        Compute raw pollutant concentration at a specified 2D location, evaluated at z=0.
+
+        Parameters
+        ----------
+        position : tuple[float, float]
+            (x, y) coordinates where the concentration is to be computed.
+        perturb : bool, optional
+            Whether to apply spatial modulation to dispersion coefficients (default False).
+        sigma_u_rel : float, optional
+            Relative amplitude for current speed spatial variation (default 0.10).
+        sigma_v : float, optional
+            Amplitude for spatial current direction curvature (radians, default 5 degrees).
+        wave_length : float, optional
+            Wavelength scale for spatial variation of current (meters, default 10000).
+        sigma_c_rel : float, optional
+            Deprecated parameter, no longer used (kept for backward compatibility).
+        
+        Returns
+        -------
+        float
+            The raw concentration at (x, y, z=0) in g/m³.
+
+        Notes
+        -----
+        - Returns the concentration at the ocean surface (z=0).
+        - For concentrations at other depths, call the instance with (x, y, z).
+        - For normalized concentration levels, use calculate_concentration() instead.
+        """
+        x, y = position
+        z = 0  # Surface depth
+
+        conc = self(x, y, z, perturb=perturb,
+                   sigma_u_rel=sigma_u_rel,
+                   sigma_v=sigma_v,
+                   wave_length=wave_length,
+                   sigma_c_rel=sigma_c_rel)
+        return conc
+
+    def _find_max_concentration_distance(self):
+        """
+        Find the downstream distance where concentration is maximum along centerline.
+        
+        Uses numerical optimization since analytical solution is not available.
+        This is used for initialization and normalization purposes.
+        
+        Returns
+        -------
+        float
+            Distance along current direction where concentration is maximum
+        """
+        def centerline_concentration(x_rot):
+            if x_rot <= 0:
+                return 0
+                
+            # Calculate parameters at this distance
+            delta_h = 2.126e-4 * x_rot**(2/3)
+            He = self.z_s + delta_h
+            sigma_y = 1.36 * x_rot**0.82
+            sigma_z = 0.055 * x_rot**0.69
+            
+            # Calculate centerline concentration (y_rot = 0, z = 0)
+            conc = (self.Q / (2 * np.pi * self.u * sigma_y * sigma_z)) * \
+                   np.exp(-(He**2)/(2 * sigma_z**2))
+            
+            return -conc  # Negative since we want to maximize
+            
+        result = minimize_scalar(centerline_concentration, 
+                               bounds=(0, 20000),
+                               method='bounded')
+                               
+        return result.x  # x_rot distance where concentration is maximum
+    
+    def _find_max_concentration_position(self, 
+                                        perturb:bool = False,
+                                        sigma_v:float = np.deg2rad(5),
+                                        wave_length:float = 10000.0):
+        """
+        Find the actual 2D position where concentration is maximum,
+        accounting for current curvature and perturbations.
+        
+        Parameters
+        ----------
+        perturb : bool, optional
+            Whether to include spatial modulation to dispersion coefficients (default False)
+        sigma_v : float, optional
+            Ocean current direction curvature amplitude in radians (default 5 degrees)
+        wave_length : float, optional
+            Spatial scale of current curvature in meters (default 10000)
+        
+        Returns
+        -------
+        tuple[float, float]
+            (x, y) position of maximum concentration
+        """
+        # First get approximate location from basic model
+        x_max_base = self._find_max_concentration_distance()
+        
+        # Create search grid around expected location
+        # Search in a region along the expected plume direction
+        search_radius = 5000  # meters
+        resolution = 50
+        
+        x_center = self.x_s + x_max_base * np.cos(self.v)
+        y_center = self.y_s + x_max_base * np.sin(self.v)
+        
+        x_search = np.linspace(x_center - search_radius, x_center + search_radius, resolution)
+        y_search = np.linspace(y_center - search_radius, y_center + search_radius, resolution)
+        X, Y = np.meshgrid(x_search, y_search)
+        Z = np.zeros_like(X)  # Surface level
+        
+        # Calculate concentration with perturbations
+        C = self(X, Y, Z, perturb=perturb, sigma_v=sigma_v, 
+                wave_length=wave_length)
+        
+        # Find maximum concentration location
+        max_idx = np.unravel_index(np.argmax(C), C.shape)
+        x_max = X[max_idx]
+        y_max = Y[max_idx]
+        
+        return (x_max, y_max)
+
+###############################################################################
+

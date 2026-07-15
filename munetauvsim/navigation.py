@@ -64,6 +64,7 @@ if (TYPE_CHECKING):
     from munetauvsim.environment import Ocean
 import numpy as np
 import math
+from scipy.signal import hilbert, find_peaks
 from munetauvsim import gnc
 from munetauvsim import logger
 
@@ -74,6 +75,10 @@ NPFltArr = NDArray[np.float64]
 
 # Globarl Variables
 log = logger.addLog('nav')
+signal = {}
+"""Module-level registry of in-flight sonar transmissions, keyed by the
+transmitting vehicle's id. Updated by SonarSensor.transmit and consumed by
+Simulator._apply_channel_effects."""
 
 ###############################################################################
 
@@ -201,6 +206,556 @@ class OceanDepthSensor(Sensor):
             return np.inf
 
         return ocean.floor(eta[0],eta[1])
+
+###############################################################################
+
+class PollutionSensor(Sensor):
+    """
+    Sensor for measuring pollutant concentration level at vehicle position.
+
+    Queries Ocean.pollution.calculate_concentration() at the vehicle's (x, y)
+    coordinates, returning a discrete concentration level used by the SUSD
+    source-seeking guidance law. Requires a pollution field on the ocean (see
+    Ocean(createPlume=True)) with num_levels configured.
+    """
+
+    def collectData(self,
+                    ocean:Ocean=None,
+                    eta:NPFltArr=None,
+                    **kwargs)->float:
+        """
+        Measure pollutant concentration level at vehicle position.
+
+
+        Parameters
+        ----------
+        ocean : Ocean
+            Ocean object with a pollution model exposing
+            calculate_concentration([x, y]).
+        eta : ndarray, shape (6,)
+            Vehicle position/attitude [x, y, z, phi, theta, psi].
+        **kwargs
+            Unused. Required for AUV sensor interface compatibility.
+
+
+        Returns
+        -------
+        concentration : float
+            Concentration level at position (eta[0], eta[1]).
+
+
+        Notes
+        -----
+        Returns 0.0 when the ocean has no pollution model or on missing
+        arguments (logged as an error).
+        """
+
+        if (ocean is None) or (eta is None):
+            log.error("%s requires 'ocean' and 'eta' arguments.",
+                      self.__class__.__name__)
+            return 0.0
+
+        if (getattr(ocean, 'pollution', None) is None):
+            return 0.0
+
+        return ocean.pollution.calculate_concentration(eta[:2])
+
+###############################################################################
+
+class SonarSensor(Sensor):
+    """
+    Acoustic sonar sensor for inter-vehicle ranging and data sharing.
+
+    Simulates the physical acoustic link used by the SUSD source-seeking
+    swarm: each vehicle periodically transmits an LFM chirp pulse train whose
+    pulse gaps encode its measured pollutant concentration level. Receiving
+    vehicles matched-filter the (attenuated, delayed, noisy) signal to decode:
+
+    - Range, from the time of arrival of the first correlation peak. Clock
+      drift between vehicles (vehicle.timedrift) injected by the channel
+      produces realistic ranging errors.
+    - Neighbor concentration, from the interval between the last two peaks.
+    - Bearing (relative position direction), via beamforming on two
+      orthogonal receiver arrays.
+
+    Decoded values are written into ``rx_vehicle.neighbors[tx_vehicle.id]``
+    for consumption by the SUSD guidance law (guidance.velSUSD).
+
+
+    Notes
+    -----
+    Unlike environmental sensors, this sensor is not read through
+    collectSensorData/readAllSensors; it is driven by the Simulator's
+    TDMA-scheduled loop (Simulator._simulateSonarTDMA) through the
+    transmit/receive pair. Its collectData method is a no-op returning None
+    for Sensor interface compatibility.
+
+
+    //GQ 11/2024 (ported to munetauvsim 07/2026)
+    """
+
+    def __init__(self):
+        # Acoustic signal parameters
+        self.sample_rate = 8e3          # sampling rate (Hz)
+        self.f_carrier = 0.024e6        # carrier frequency (Hz)
+        self.pulse_duration = 0.02      # pulse duration (s)
+        self.c = 1500                   # speed of sound in water (m/s)
+        self.tx_power = 1000            # transmit power (W)
+        self.f0 = 6.75e4                # chirp start frequency (Hz)
+        self.f1 = 7.25e4                # chirp end frequency (Hz)
+        self.N = 10000                  # number of samples
+        self.bw = 8e3                   # bandwidth (Hz)
+        self.AOA_error = np.pi/48       # angle-of-arrival error bound (rad)
+        self.TOA_error = 0.0            # time-of-arrival jitter bound (s)
+
+        # Pre-calculate the matched filter reference chirp
+        self.ref_chirp = self.lfm_baseband(self.pulse_duration, self.bw,
+                                           self.sample_rate)
+        self._matched_filter_kernel = np.flip(self.ref_chirp.conj())
+
+    #--------------------------------------------------------------------------
+    def collectData(self, **kwargs)->None:
+        """No-op for Sensor interface compatibility. Returns None."""
+        return None
+
+    #--------------------------------------------------------------------------
+    @staticmethod
+    def lfm_baseband(T_lfm:float, bw:float, sampling_rate:float)->NPFltArr:
+        """
+        Generate a baseband Linear Frequency Modulated (LFM) chirp signal.
+
+
+        Parameters
+        ----------
+        T_lfm : float
+            LFM signal duration (s).
+        bw : float
+            Nominal passband signal bandwidth, fmax - fmin (Hz).
+        sampling_rate : float
+            Sampling rate of the LFM (Hz).
+
+
+        Returns
+        -------
+        sigx : ndarray
+            Complex LFM signal at the baseband.
+
+
+        References
+        ----------
+        [1] A. Hein, Processing of SAR data: Fundamentals, Signal Processing,
+        Interferometry, Springer, New York, 2004.
+        """
+
+        mu = bw / T_lfm                                 # frequency sweep rate
+        ttl_samples = round(sampling_rate * T_lfm)
+        t_lfm = ((np.arange(0, ttl_samples) - ttl_samples / 2) / sampling_rate)
+        sigx = np.exp(1j * np.pi * mu * t_lfm**2)
+        return sigx
+
+    #--------------------------------------------------------------------------
+    def matched_filter_complex_correlation(self,
+                                           rx:NPFltArr,
+                                           tx:NPFltArr,
+                                           cir_length:int=None,
+                                           toa_error:float=None,
+                                           )->Tuple[NPFltArr,NPFltArr]:
+        """
+        Perform matched filtering via complex correlation.
+
+        Correlates the received signal with the time-reversed conjugate of
+        the transmitted signal to maximize SNR and detect signal arrival.
+
+
+        Parameters
+        ----------
+        rx : ndarray
+            Received signal.
+        tx : ndarray
+            Transmitted (reference) signal.
+        cir_length : int, optional
+            Desired length of the channel impulse response output.
+        toa_error : float, optional
+            Time-of-arrival error bound in seconds. Each call samples a
+            random value uniformly from [-toa_error, toa_error]. Defaults to
+            self.TOA_error.
+
+
+        Returns
+        -------
+        mf_result : ndarray
+            Matched filter output (complex correlation result).
+        cir_cmplx : ndarray
+            Complex envelope (Hilbert magnitude for real signals).
+        """
+
+        rx = np.asarray(rx).ravel()
+        tx = np.asarray(tx).ravel()
+        iscomplex = np.iscomplexobj(rx) or np.iscomplexobj(tx)
+
+        # Matched filter: normalized time-reversed conjugate of tx
+        matched_filter = np.conj(tx[::-1])
+        matched_filter = matched_filter / np.sqrt(
+            np.sum(np.abs(matched_filter) ** 2))
+
+        # Matched filtering via convolution; drop initial transient samples
+        mf_result = np.convolve(matched_filter, rx, mode='full')
+        start_idx = len(matched_filter) - 1
+        mf_result = mf_result[start_idx:]
+
+        # Inject TOA error sampled uniformly from [-toa_error, toa_error]
+        if (toa_error is None):
+            toa_error = self.TOA_error
+        toa_error = abs(float(toa_error))
+        if (toa_error > 0):
+            toa_error_sample = np.random.uniform(-toa_error, toa_error)
+            signed_shift = int(round(toa_error_sample * self.sample_rate))
+            if (signed_shift != 0):
+                shifted = np.zeros_like(mf_result)
+                if (signed_shift > 0):
+                    shifted[signed_shift:] = mf_result[:-signed_shift]
+                else:
+                    n = abs(signed_shift)
+                    shifted[:-n] = mf_result[n:]
+                mf_result = shifted
+
+        if (cir_length is not None):
+            mf_result = mf_result[:cir_length]
+
+        if (iscomplex):
+            cir_cmplx = mf_result
+        else:
+            cir_cmplx = np.abs(hilbert(mf_result))
+
+        return mf_result, cir_cmplx
+
+    #--------------------------------------------------------------------------
+    def transmit(self, vehicle:Vehicle)->dict:
+        """
+        Build the vehicle's sonar pulse train encoding its concentration.
+
+        Creates a train of LFM chirp pulses. The gaps between the final
+        pulses are stretched to (concentration + 3) ms, physically encoding
+        the vehicle's measured concentration level in the signal timing so
+        receivers can decode it after matched filtering.
+
+
+        Parameters
+        ----------
+        vehicle : Vehicle
+            The transmitting vehicle. Must carry a ``concentration``
+            attribute (discrete level, see Pollution.num_levels).
+
+
+        Returns
+        -------
+        dict
+            ``{vehicle.id: {'signal': ndarray, 'sample_num': int}}`` suitable
+            for merging into the module-level ``signal`` registry.
+        """
+
+        num_pulses = 3
+        concentration = vehicle.concentration
+        sample_rate = self.sample_rate
+        num_samples = self.N
+        pulse_duration = self.pulse_duration
+        bandwidth = self.bw
+
+        # Chirp signal scaled to 180 dB source level
+        t = np.arange(0, pulse_duration, 1/sample_rate)
+        chirp_signal = self.lfm_baseband(pulse_duration, bandwidth,
+                                         sample_rate)
+        signal_power = 10 ** (180 / 10)
+        chirp_signal = chirp_signal * np.sqrt(
+            signal_power / np.mean(np.abs(chirp_signal) ** 2))
+
+        # Pulse gaps: last two intervals encode concentration as
+        # (concentration + 3) ms instead of the default 40 ms
+        default_gap_ms = 40
+        pulse_gaps_ms = []
+        for i in range(num_pulses - 1):
+            if (i >= num_pulses - 2):
+                pulse_gaps_ms.append(concentration + 3)
+            else:
+                pulse_gaps_ms.append(default_gap_ms)
+        pulse_gaps_samples = [int(ms / 1000 * sample_rate)
+                              for ms in pulse_gaps_ms]
+        total_samples = len(t) * num_pulses + sum(pulse_gaps_samples)
+
+        # Assemble the pulse train
+        s_tx = np.zeros(total_samples, dtype=complex)
+        current_idx = 0
+        for i in range(num_pulses):
+            s_tx[current_idx:current_idx + len(t)] = chirp_signal
+            current_idx += len(t)
+            if (i < num_pulses - 1):
+                current_idx += pulse_gaps_samples[i]
+
+        return {
+            vehicle.id: {
+                'signal': s_tx,
+                'sample_num': num_samples,
+            }
+        }
+
+    #--------------------------------------------------------------------------
+    def receive(self,
+                s_rx:NPFltArr,
+                rx_vehicle:Vehicle,
+                tx_vehicle:Vehicle,
+                delay_samples:int,
+                )->None:
+        """
+        Process a received sonar transmission and update neighbor data.
+
+        Matched-filters the received signal to decode range (first peak time
+        of arrival) and the transmitter's concentration level (interval
+        between the last two peaks), then estimates the bearing to the
+        transmitter via beamforming. Results are written into
+        ``rx_vehicle.neighbors[tx_vehicle.id]``.
+
+
+        Parameters
+        ----------
+        s_rx : ndarray
+            Received signal (already delayed, attenuated, and noisy; see
+            Simulator._apply_channel_effects).
+        rx_vehicle : Vehicle
+            Receiving vehicle whose neighbor table is updated.
+        tx_vehicle : Vehicle
+            Transmitting vehicle (used for ground-truth signal direction in
+            the beamforming geometry).
+        delay_samples : int
+            Channel propagation delay in samples (informational).
+        """
+
+        sample_rate = self.sample_rate
+        num_samples = self.N
+        pulse_duration = self.pulse_duration
+
+        signal_direction = tx_vehicle.eta[0:2] - rx_vehicle.eta[0:2]
+
+        # Matched filter via correlation against the reference chirp
+        mf_result, cir_cmplx = self.matched_filter_complex_correlation(
+            s_rx, self.ref_chirp, cir_length=num_samples)
+
+        # Time axis for the correlation output (ms)
+        t_mf_length = 16000
+        lag_samples = np.arange(t_mf_length)
+        t_mf = lag_samples / sample_rate * 1000
+
+        # Peak detection on the correlation output
+        peaks, properties = find_peaks(
+            np.abs(mf_result),
+            height=0.9 * np.max(np.abs(mf_result)),
+            distance=100
+        )
+
+        peak_times = t_mf[peaks] if (len(peaks) > 0) else []
+        first_peak_time = peak_times[0] if (len(peak_times) > 0) else None
+
+        if (len(peak_times) >= 2):
+            last_peak_interval = peak_times[-1] - peak_times[-2]
+        else:
+            # Not enough peaks decoded; skip this reception
+            return None
+
+        # Skip updates when this transmitter is not in the receiver's
+        # neighbor map
+        neighbor_data = rx_vehicle.neighbors.get(tx_vehicle.id)
+        if (neighbor_data is None):
+            return None
+
+        # Decode range from time of arrival, concentration from the encoded
+        # pulse gap (23 ms = 20 ms pulse + 3 ms base gap offset)
+        neighbor_data['range'] = ((first_peak_time + pulse_duration * 1000)
+                                  * self.c / 1000)
+        neighbor_data['concentration'] = last_peak_interval - 23
+
+        # Isolate the first pulse for beamforming
+        signal_energy = np.abs(s_rx)**2
+        threshold = 0.1 * np.max(signal_energy)
+        pulse_start = np.where(signal_energy > threshold)[0][0]
+        pulse_duration_samples = int(0.002 * self.sample_rate)
+        signal_for_beamforming = s_rx[pulse_start:
+                                      pulse_start + pulse_duration_samples]
+
+        # Receiver array orientation: vehicle velocity direction, falling
+        # back to the heading vector when nearly stationary
+        array1_direction = np.asarray(rx_vehicle.velocity[0:2], dtype=float)
+        if (np.linalg.norm(array1_direction) < 1e-6):
+            psi = float(rx_vehicle.eta[5])
+            array1_direction = np.array([np.cos(psi), np.sin(psi)])
+
+        # Estimate relative position direction via beamforming
+        neighbor_data['rel_pos'] = self.beam_forming(
+            signal_for_beamforming,
+            signal_direction,
+            array1_direction
+        )
+
+    #--------------------------------------------------------------------------
+    def receive_direct(self, rx_vehicle:Vehicle, tx_vehicle:Vehicle)->None:
+        """
+        Update neighbor data from ground truth, bypassing signal processing.
+
+        Same result as transmit/receive through an ideal channel: exact
+        range, exact relative direction, and the transmitter's current
+        concentration are written into
+        ``rx_vehicle.neighbors[tx_vehicle.id]``.
+
+
+        Parameters
+        ----------
+        rx_vehicle : Vehicle
+            Receiving vehicle whose neighbor data will be updated.
+        tx_vehicle : Vehicle
+            Transmitting vehicle whose info is written into the neighbor
+            entry.
+        """
+
+        neighbor_data = rx_vehicle.neighbors.get(tx_vehicle.id)
+        if (neighbor_data is None):
+            return
+
+        rel_vec = tx_vehicle.eta[0:2] - rx_vehicle.eta[0:2]
+        dist = float(np.linalg.norm(rel_vec))
+
+        neighbor_data['range'] = dist
+        neighbor_data['concentration'] = float(
+            getattr(tx_vehicle, 'concentration', 0.0))
+        if (dist > 1e-9):
+            neighbor_data['rel_pos'] = tuple(rel_vec / dist)
+
+    #--------------------------------------------------------------------------
+    def beam_forming(self,
+                     delayed_signal:NPFltArr,
+                     signal_direction:NPFltArr,
+                     array1_direction:NPFltArr,
+                     aoa_error:float=None,
+                     )->NPFltArr:
+        """
+        Estimate the relative position direction of a transmitter.
+
+        Simulates two orthogonal uniform linear receiver arrays and sweeps
+        candidate steering angles to find the angle of arrival on each. The
+        two estimates are combined into a 2-D direction vector, with uniform
+        AOA error injected.
+
+
+        Parameters
+        ----------
+        delayed_signal : ndarray
+            Received signal segment used for the response power estimate.
+        signal_direction : ndarray, shape (2,)
+            Ground-truth direction from receiver to transmitter (sets the
+            true arrival angles on the arrays).
+        array1_direction : ndarray, shape (2,)
+            Orientation of the first receiver array (typically the vehicle
+            velocity direction). Must be nonzero.
+        aoa_error : float, optional
+            Angle-of-arrival error bound in radians. Each estimated angle
+            samples a random value uniformly from [-aoa_error, aoa_error].
+            Defaults to self.AOA_error.
+
+
+        Returns
+        -------
+        ndarray, shape (2,)
+            Estimated relative position direction vector (not normalized).
+        """
+
+        # Second array is orthogonal to the first
+        rotation_90 = np.array([[0, 1], [-1, 0]])
+        array2_direction = array1_direction @ rotation_90
+
+        norm_signal_direction = np.linalg.norm(signal_direction)
+        norm_array1_direction = np.linalg.norm(array1_direction)
+        norm_array2_direction = np.linalg.norm(array2_direction)
+
+        dot_sig_arr1 = np.dot(signal_direction, array1_direction)
+        dot_sig_arr2 = np.dot(signal_direction, array2_direction)
+
+        d = 0.5                     # half wavelength element spacing
+        Nr1 = 6                     # array 1 element count
+        Nr2 = 4                     # array 2 element count
+
+        # True arrival angles on each array
+        theta1 = np.arccos(dot_sig_arr1 /
+                           (norm_signal_direction * norm_array1_direction))
+        theta2 = np.arccos(dot_sig_arr2 /
+                           (norm_signal_direction * norm_array2_direction))
+        if (theta1 > np.pi / 2):
+            theta1 -= np.pi
+        if (theta2 > np.pi / 2):
+            theta2 -= np.pi
+
+        # True steering vectors for the incoming signal angle
+        n1 = np.arange(Nr1, dtype=float)
+        n2 = np.arange(Nr2, dtype=float)
+        v1 = np.exp(-2j * np.pi * d * n1 * np.sin(theta1))
+        v2 = np.exp(-2j * np.pi * d * n2 * np.sin(theta2))
+
+        # Vectorized angle search:
+        #   y(a) = signal * c(a), c(a) = v_true @ conj(w(a)) / Nr
+        #   var(y(a)) = |c(a)|^2 * var(signal)
+        thetas     = np.arange(-90, 90.1, 0.5)
+        thetas_rad = np.radians(thetas)
+
+        W_1 = np.exp(-2j * np.pi * d * n1[None, :]
+                     * np.sin(thetas_rad[:, None]))
+        W_2 = np.exp(-2j * np.pi * d * n2[None, :]
+                     * np.sin(thetas_rad[:, None]))
+
+        c1 = (W_1 @ v1.conj()) / Nr1
+        c2 = (W_2 @ v2.conj()) / Nr2
+
+        var_sig = float(np.var(delayed_signal))
+        eps     = float(np.finfo(float).eps)
+
+        responses_1 = 10 * np.log10(np.abs(c1) ** 2 * var_sig + eps)
+        responses_2 = 10 * np.log10(np.abs(c2) ** 2 * var_sig + eps)
+        responses_1 = responses_1 - np.max(responses_1)
+        responses_2 = responses_2 - np.max(responses_2)
+
+        # Angles of maximum response
+        aoa_1 = thetas[np.argmax(responses_1)]
+        if (aoa_1 < 0):
+            aoa_1 += 180
+        aoa_2 = thetas[np.argmax(responses_2)]
+        if (aoa_2 < 0):
+            aoa_2 += 180
+
+        # Convert to radians and inject uniform AOA error
+        if (aoa_error is None):
+            aoa_error = self.AOA_error
+        aoa_error = abs(float(aoa_error))
+        aoa_1_rad = np.radians(aoa_1) + np.random.uniform(-aoa_error,
+                                                          aoa_error)
+        aoa_2_rad = np.radians(aoa_2) + np.random.uniform(-aoa_error,
+                                                          aoa_error)
+
+        # Candidate directions: array orientations rotated by +/- each AOA;
+        # pick the rotation pair that agrees best between the two arrays
+        c1r, s1r = np.cos(aoa_1_rad), np.sin(aoa_1_rad)
+        c2r, s2r = np.cos(aoa_2_rad), np.sin(aoa_2_rad)
+
+        R1 = np.array([[ c1r, -s1r], [ s1r, c1r]])
+        R2 = np.array([[ c1r,  s1r], [-s1r, c1r]])
+        R3 = np.array([[ c2r, -s2r], [ s2r, c2r]])
+        R4 = np.array([[ c2r,  s2r], [-s2r, c2r]])
+
+        rot1_1 = R1 @ array1_direction
+        rot1_2 = R2 @ array1_direction
+        rot2_1 = R3 @ array2_direction
+        rot2_2 = R4 @ array2_direction
+
+        min_dist_1 = min(np.linalg.norm(rot1_1 - rot2_1),
+                         np.linalg.norm(rot1_1 - rot2_2))
+        min_dist_2 = min(np.linalg.norm(rot1_2 - rot2_1),
+                         np.linalg.norm(rot1_2 - rot2_2))
+
+        return rot1_1 if (min_dist_1 < min_dist_2) else rot1_2
 
 ###############################################################################
 

@@ -38,15 +38,19 @@ https://github.com/cybergalactic/PythonVehicleSimulator
 
 from typing import List, Optional, Tuple
 from numpy.typing import NDArray
+from pathlib import Path
+import csv
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.artist import Artist
+from matplotlib.colors import ListedColormap
 from matplotlib.offsetbox import AnchoredText
 import mpl_toolkits.mplot3d.axes3d as p3
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as np
 import math
+from scipy.interpolate import make_interp_spline
 from munetauvsim.environment import Ocean
 from munetauvsim.vehicles import Vehicle
 from munetauvsim.gnc import ssa
@@ -811,5 +815,392 @@ def plot3D(simData:NPFltArr,
     log.info('Saving animation...')
     ani.save(filename, writer=animation.PillowWriter(fps=FPS))
     log.info('Done saving animation.')
+
+###############################################################################
+
+def _pollutionExtent(ocean:Ocean)->Tuple[float,float,float,float]:
+    """
+    Plotting extent (xmin, xmax, ymin, ymax) of the ocean pollution domain.
+
+    Derived from the ocean origin and size so 2-D pollution plots always
+    frame the simulated domain regardless of scenario scale.
+    """
+    x0, y0 = ocean.origin
+    return (float(x0), float(x0 + ocean.size),
+            float(y0), float(y0 + ocean.size))
+
+#------------------------------------------------------------------------------
+def plot2Dtrajectory(simData:NPFltArr,
+                     ocean:Ocean,
+                     numDataPoints:int,
+                     filename:str,
+                     vehicles:List[Vehicle],
+                     figNo:int,
+                     traj:bool=True,
+                     pos:bool=True,
+                     smooth_factor:int=3,
+                     skip_ratio:float=0.1,
+                     )->None:
+    """
+    Plot vehicle (x, y) trajectories over the pollution concentration field.
+
+    Draws smoothed 2-D trajectories for every vehicle on top of labeled
+    concentration contour lines, marks start positions, final positions,
+    waypoints, and the pollution source (field maximum), and exports the
+    full state history to a CSV file alongside the figure.
+
+
+    Parameters
+    ----------
+    simData : ndarray, (n_vehicles, N, [eta, nu, u_control, u_actual])
+        Array of simulation data for all vehicles.
+    ocean : Ocean
+        Ocean environment carrying the pollution field to plot.
+    numDataPoints : int
+        Number of data points per trajectory. Trajectories longer than this
+        are downsampled evenly; pass 0 to plot every sample.
+    filename : str
+        Output figure path. Given no suffix, '.png' is appended. The CSV
+        export shares the same base path with a '.csv' suffix.
+    vehicles : list of Vehicle
+        Vehicle objects in order corresponding to simData.
+    figNo : int
+        Figure number for the plot window.
+    traj : bool
+        Set True to plot lines showing vehicle trajectories.
+    pos : bool
+        Set True to plot a point at each vehicle's final position.
+    smooth_factor : int
+        Spline interpolation density multiplier for trajectory smoothing.
+    skip_ratio : float
+        Fraction of trajectory points kept as spline knots (0.01 - 1.0).
+
+
+    //GQ 11/2024 (ported to munetauvsim 07/2026)
+    """
+
+    # Create figure and axes
+    fig = plt.figure(figNo,
+                     figsize=(cm2inch(figSize1[0]),cm2inch(figSize1[1])),
+                     dpi=dpiValue)
+    ax = fig.add_subplot(111)
+
+    # Pollution concentration contour lines over the ocean domain
+    xmin, xmax, ymin, ymax = _pollutionExtent(ocean)
+    resolution = 100
+    x = np.linspace(xmin, xmax, resolution)
+    y = np.linspace(ymin, ymax, resolution)
+    X, Y = np.meshgrid(x, y)
+    Z = np.zeros_like(X)                    # surface level slice
+    C = ocean.pollution(X, Y, Z)
+
+    contour_lines = ax.contour(X, Y, C, levels=10, colors='black',
+                               alpha=0.5, linewidths=1)
+    ax.clabel(contour_lines, inline=True, fontsize=16)
+
+    # Axes labels
+    ax.set_xlabel('X / East (m)', fontsize=16)
+    ax.set_ylabel('Y / North (m)', fontsize=16)
+
+    # Extract position data
+    positions = simData[:, :, 0:2]
+    n_vehicles = positions.shape[0]
+
+    # Per-vehicle trajectories: trim trailing zeros, downsample, smooth
+    trajectories = []
+    cmap = plt.get_cmap('tab10')
+    for v_idx in range(n_vehicles):
+        v_color = cmap(v_idx % 10)
+        v_pos = positions[v_idx, :, :]
+
+        # Last valid (non-zero) sample for this vehicle
+        v_nonzero = np.any(np.abs(v_pos) > 1e-12, axis=1)
+        if (not np.any(v_nonzero)):
+            continue
+        v_valid_end = np.where(v_nonzero)[0][-1] + 1
+        v_valid_data = v_pos[:v_valid_end, :]
+
+        # Downsample to numDataPoints
+        if (numDataPoints > 0) and (len(v_valid_data) > numDataPoints):
+            indices = np.linspace(0, len(v_valid_data) - 1, numDataPoints,
+                                  dtype=int)
+            sampled_v_data = v_valid_data[indices]
+        else:
+            sampled_v_data = v_valid_data
+
+        x = sampled_v_data[:, 0]
+        y = sampled_v_data[:, 1]
+        n_points = len(x)
+
+        # Mark the starting position with a triangle
+        if (n_points > 0):
+            label = 'Start Position' if (v_idx == 0) else "_nolegend_"
+            ax.plot(x[0], y[0], marker='^', markersize=8, color=v_color,
+                    linestyle='None', label=label)
+
+        # Smoothed trajectory line
+        line = None
+        if (traj and n_points > 1):
+            x_smooth, y_smooth = x, y
+            if (n_points >= 4):
+                ratio = np.clip(skip_ratio, 0.01, 1.0)
+                n_keep = max(4, int(n_points * ratio))
+                skip = max(1, n_points // n_keep)
+                idx_s = list(range(0, n_points, skip))
+                if (idx_s[-1] != n_points - 1):
+                    idx_s.append(n_points - 1)
+
+                xs, ys = x[idx_s], y[idx_s]
+                if (len(xs) >= 4):
+                    try:
+                        t = np.arange(len(xs))
+                        t_new = np.linspace(0, len(xs)-1,
+                                            len(xs) * smooth_factor)
+                        x_smooth = make_interp_spline(t, xs, k=3)(t_new)
+                        y_smooth = make_interp_spline(t, ys, k=3)(t_new)
+                    except Exception:
+                        pass
+
+            line, = ax.plot(x_smooth, y_smooth, lw=1.5, color=v_color)
+            trajectories.append((line, x[-1], y[-1]))
+
+    # Final position markers
+    if (pos):
+        for line, last_x, last_y in trajectories:
+            ax.plot(last_x, last_y,
+                    marker='.',
+                    markersize=8,
+                    color=line.get_color(),
+                    markeredgecolor='white',
+                    markeredgewidth=0.8)
+
+    # Waypoints (skip vehicles with only the default origin waypoint)
+    for vehicle in vehicles:
+        if (len(vehicle.wpt) > 1 or
+            (len(vehicle.wpt) == 1 and
+             (abs(vehicle.wpt.pos.x[0]) > 1e-6 or
+              abs(vehicle.wpt.pos.y[0]) > 1e-6))):
+            ax.plot(vehicle.wpt.pos.x,
+                    vehicle.wpt.pos.y,
+                    '^',
+                    alpha=0.5)
+
+    # Pollution source (field concentration maximum)
+    if (getattr(ocean, 'pollution', None) is not None):
+        source_x, source_y = ocean.pollution.source_pos
+        ax.scatter(source_x, source_y, color='red', s=300, marker='*',
+                   label='Pollution Source', edgecolors='white',
+                   linewidths=1.5, zorder=10)
+
+    # Legend and fixed axes over the ocean domain
+    ax.legend(loc='upper left', fontsize=15)
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+    ax.set_xticks([xmin, (xmin + xmax) / 2, xmax])
+    ax.set_yticks([ymin, (ymin + ymax) / 2, ymax])
+    ax.tick_params(axis='both', labelsize=16)
+    ax.set_aspect('equal')
+
+    plt.tight_layout()
+
+    # Save figure and CSV state export sharing the same base path
+    n_veh, n_steps, n_cols = simData.shape
+    csv_path = None
+    if (filename):
+        output_path = Path(filename)
+        if (not output_path.suffix):
+            output_path = output_path.with_suffix(".png")
+        if (output_path.parent != Path()):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(output_path)
+        csv_path = output_path.with_suffix(".csv")
+    else:
+        csv_path = Path("vehicles_data.csv")
+
+    plt.close()
+
+    if (csv_path is not None) and (n_veh > 0) and (n_steps > 0):
+        # Columns: eta (x,y,z,phi,theta,psi), nu (u,v,w,p,q,r)
+        state_cols = min(12, n_cols)
+        header = ["vehicle_id", "time_step", "x", "y", "z", "phi", "theta",
+                  "psi", "u", "v", "w", "p", "q", "r"][: 2 + state_cols]
+        with open(csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            for v_idx in range(n_veh):
+                for t in range(n_steps):
+                    row = [v_idx, t] + [float(simData[v_idx, t, k])
+                                        for k in range(state_cols)]
+                    w.writerow(row)
+        log.info(f"Vehicles data saved to {csv_path}")
+
+#------------------------------------------------------------------------------
+def plot2DSnapshots(simData:NPFltArr,
+                    ocean:Ocean,
+                    filename:str,
+                    vehicles:List[Vehicle],
+                    figNo:int,
+                    num_snapshots:int=5,
+                    )->None:
+    """
+    Plot vehicle positions at multiple time snapshots over the pollution
+    field.
+
+    Creates one figure per snapshot, evenly spaced across the valid portion
+    of the simulation, showing every vehicle's position as a red dot on the
+    pollution concentration color map. Each snapshot is saved as
+    ``<filename stem>_t<step>.png``.
+
+
+    Parameters
+    ----------
+    simData : ndarray, (n_vehicles, N, [eta, nu, u_control, u_actual])
+        Array of simulation data for all vehicles.
+    ocean : Ocean
+        Ocean environment with pollution field.
+    filename : str
+        Base output path; snapshots append '_t<step>' to its stem.
+    vehicles : list of Vehicle
+        Vehicle objects in order corresponding to simData.
+    figNo : int
+        Base figure number (one figure per snapshot).
+    num_snapshots : int
+        Number of time snapshots to plot.
+
+
+    //Added 02/2026 (ported to munetauvsim 07/2026)
+    """
+
+    positions = simData[:, :, 0:2]
+    total_time_slices = positions.shape[1]
+    n_vehicles = positions.shape[0]
+
+    if (total_time_slices == 0):
+        log.warning("plot2DSnapshots: No simulation data available.")
+        return
+
+    # Valid data length (trailing zeros indicate an early-terminated run)
+    nonzero_mask = np.any(np.abs(positions) > 1e-12, axis=(0, 2))
+    if (np.any(nonzero_mask)):
+        valid_length = np.where(nonzero_mask)[0][-1] + 1
+    else:
+        valid_length = 1
+
+    log.info(f"Detected valid simulation length: "
+             f"{valid_length}/{total_time_slices} time steps")
+    log.info(f"Plotting {n_vehicles} vehicles")
+
+    valid_positions = positions[:, :valid_length, :]
+
+    # Snapshot time indices, evenly spaced across the valid data
+    if (valid_length < num_snapshots):
+        time_indices = list(range(valid_length))
+    else:
+        time_indices = [int(i * (valid_length - 1) / (num_snapshots - 1))
+                        for i in range(num_snapshots)]
+
+    # Pre-compute the pollution field (shared across snapshots)
+    xmin, xmax, ymin, ymax = _pollutionExtent(ocean)
+    resolution = 100
+    x = np.linspace(xmin, xmax, resolution)
+    y = np.linspace(ymin, ymax, resolution)
+    X, Y = np.meshgrid(x, y)
+    Z = np.zeros_like(X)
+    C = ocean.pollution(X, Y, Z)
+
+    # Color map with transparency ramp at low concentrations
+    cmap = plt.cm.viridis_r
+    cmap_a = cmap(np.arange(cmap.N))
+    split = int(cmap.N * 0.2)
+    a = np.linspace(0.2, 1, split)
+    cmap_a[:split,-1] = a**1.6
+    cmap_custom = ListedColormap(cmap_a)
+    norm = plt.Normalize(vmin=0, vmax=C.max())
+
+    all_red = (1.0, 0.0, 0.0, 1.0)
+    saved_files = []
+
+    # One independent figure per snapshot
+    for idx, time_idx in enumerate(time_indices):
+        fig = plt.figure(figNo + idx,
+                         figsize=(cm2inch(figSize1[0]),cm2inch(figSize1[1])),
+                         dpi=dpiValue)
+        ax = fig.add_subplot(111)
+
+        # Concentration field background
+        im = ax.pcolormesh(X, Y, C, cmap=cmap_custom, norm=norm,
+                           shading='auto')
+        ax.contour(X, Y, C, levels=10, colors='black', alpha=0.3,
+                   linewidths=0.5)
+
+        vehicles_plotted = 0
+        for vehicle_idx in range(n_vehicles):
+            x_pos = valid_positions[vehicle_idx, time_idx, 0]
+            y_pos = valid_positions[vehicle_idx, time_idx, 1]
+
+            # Fall back to the last recorded position on zero samples
+            if (x_pos == 0.0) and (y_pos == 0.0) and (time_idx > 0):
+                for prev_time in range(time_idx - 1, -1, -1):
+                    prev_x = valid_positions[vehicle_idx, prev_time, 0]
+                    prev_y = valid_positions[vehicle_idx, prev_time, 1]
+                    if (not (prev_x == 0.0 and prev_y == 0.0)):
+                        x_pos = prev_x
+                        y_pos = prev_y
+                        break
+
+            if (not (x_pos == 0.0 and y_pos == 0.0)):
+                ax.plot(x_pos, y_pos,
+                        marker='o',
+                        markersize=6,
+                        color=all_red,
+                        markeredgecolor='white',
+                        markeredgewidth=0.5,
+                        linestyle='None',
+                        label=f'Vehicle {vehicle_idx+1}')
+                vehicles_plotted += 1
+
+        if (idx == 0):
+            log.info(f"Snapshot at time {time_idx}: plotted "
+                     f"{vehicles_plotted}/{n_vehicles} vehicles")
+
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        ax.set_aspect('equal')
+        ax.set_xlabel('X / East (m)', fontsize=9)
+        ax.set_ylabel('Y / North (m)', fontsize=9)
+        progress_pct = (time_idx / valid_length) * 100
+        ax.set_title(f'Time Step: {time_idx} ({progress_pct:.1f}%)',
+                     fontsize=10)
+
+        # Legend per figure; compact when many vehicles
+        if (n_vehicles <= 6):
+            ax.legend(loc='upper left', fontsize=6, ncol=1)
+        else:
+            ax.legend(loc='upper left', fontsize=5, ncol=2,
+                      columnspacing=0.5)
+
+        cbar = fig.colorbar(im, ax=ax)
+        cbar.set_label('Pollution Concentration (g/m³)', fontsize=11,
+                       fontweight='bold')
+
+        fig.tight_layout()
+
+        # Save one file per snapshot
+        if (filename):
+            output_path = Path(filename)
+            if (not output_path.suffix):
+                output_path = output_path.with_suffix(".png")
+            snapshot_name = (f"{output_path.stem}_t{time_idx:05d}"
+                             f"{output_path.suffix}")
+            snapshot_path = output_path.parent / snapshot_name
+            if (snapshot_path.parent != Path()):
+                snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(snapshot_path, bbox_inches='tight')
+            saved_files.append(snapshot_path)
+            log.info(f"Snapshot saved: {snapshot_path}")
+        plt.close(fig)
+
+    if (filename and saved_files):
+        log.info(f"Saved {len(saved_files)} snapshot figures.")
 
 ###############################################################################
